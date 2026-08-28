@@ -15,6 +15,9 @@ type fakeAnimeService struct {
 	signedIn  bool
 	loggedIn  bool
 	loggedOut bool
+	list      []anime.ListItem
+	status    string
+	opened    int
 }
 
 func (f *fakeAnimeService) SignedIn() bool { return f.signedIn }
@@ -44,6 +47,20 @@ func (f *fakeAnimeService) ContinueWatching(context.Context, int) ([]anime.Resum
 
 func (f *fakeAnimeService) ResumeMedia(_ context.Context, mediaID int) error {
 	f.resumed = mediaID
+	return nil
+}
+
+func (f *fakeAnimeService) List(context.Context, string) ([]anime.ListItem, error) {
+	return f.list, nil
+}
+
+func (f *fakeAnimeService) SetListStatus(_ context.Context, _ int, status string) error {
+	f.status = status
+	return nil
+}
+
+func (f *fakeAnimeService) OpenMedia(_ context.Context, mediaID int) error {
+	f.opened = mediaID
 	return nil
 }
 
@@ -126,11 +143,49 @@ func TestPluginSearchExposesResumeAction(t *testing.T) {
 	if payload.Results[0].Actions[0].Name != "resume" {
 		t.Fatalf("actions = %#v", payload.Results[0].Actions)
 	}
+	if payload.Results[0].Actions[len(payload.Results[0].Actions)-1].Name != "open" {
+		t.Fatalf("actions = %#v", payload.Results[0].Actions)
+	}
 	success, _ := plugin.Select(t.Context(), Message{
 		QueryID: "search-query", ResultID: "media:154587", Action: "resume", Plugin: "anime",
 	})
 	if !success || service.resumed != 154587 {
 		t.Fatalf("Select() = %v, resumed %d", success, service.resumed)
+	}
+}
+
+func TestPluginAuthenticatedMediaActions(t *testing.T) {
+	service := &fakeAnimeService{signedIn: true}
+	plugin := NewPlugin(service, "anime", "anime", "@", log.New(io.Discard, "", 0))
+	payload := plugin.Request(t.Context(), "search-query", "frieren")
+	if len(payload.Results[0].Actions) != 6 {
+		t.Fatalf("actions = %#v", payload.Results[0].Actions)
+	}
+	for _, action := range []string{"watching", "planning", "completed", "open"} {
+		success, _ := plugin.Select(t.Context(), Message{
+			QueryID: "search-query", ResultID: "media:154587", Action: action, Plugin: "anime",
+		})
+		if !success {
+			t.Fatalf("%s action failed", action)
+		}
+	}
+	if service.status != "COMPLETED" || service.opened != 154587 {
+		t.Fatalf("status=%q opened=%d", service.status, service.opened)
+	}
+}
+
+func TestPluginListQuery(t *testing.T) {
+	service := &fakeAnimeService{
+		signedIn: true,
+		list: []anime.ListItem{{
+			Media:  anime.Media{ID: 154587, Title: "Frieren", Episodes: 28},
+			Status: "CURRENT", Progress: 4,
+		}},
+	}
+	plugin := NewPlugin(service, "anime", "anime", "@", log.New(io.Discard, "", 0))
+	payload := plugin.Request(t.Context(), "list-query", "list watching")
+	if len(payload.Results) != 1 || payload.Results[0].Description != "watching | episode 4 of 28" {
+		t.Fatalf("list payload = %#v", payload.Results)
 	}
 }
 

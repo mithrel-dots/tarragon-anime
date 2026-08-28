@@ -14,13 +14,15 @@ const (
 	CommandPlay
 	CommandLogin
 	CommandLogout
+	CommandList
 )
 
 type Query struct {
-	Command Command
-	Text    string
-	MediaID int
-	Episode int
+	Command    Command
+	Text       string
+	MediaID    int
+	Episode    int
+	ListStatus string
 }
 
 func ParseQuery(input string) (Query, error) {
@@ -40,6 +42,20 @@ func ParseQuery(input string) (Query, error) {
 		return Query{Command: CommandLogin}, nil
 	case "logout":
 		return Query{Command: CommandLogout}, nil
+	case "watching", "planning", "completed":
+		if len(fields) != 1 {
+			return Query{}, fmt.Errorf("%s does not accept arguments", fields[0])
+		}
+		return Query{Command: CommandList, ListStatus: listStatus(fields[0])}, nil
+	case "list":
+		if len(fields) != 2 {
+			return Query{}, fmt.Errorf("usage: list <watching|planning|completed>")
+		}
+		status := listStatus(fields[1])
+		if status == "" {
+			return Query{}, fmt.Errorf("list status must be watching, planning, or completed")
+		}
+		return Query{Command: CommandList, ListStatus: status}, nil
 	case "episodes":
 		if len(fields) != 2 {
 			return Query{}, fmt.Errorf("usage: episodes <anilist-id>")
@@ -64,6 +80,19 @@ func ParseQuery(input string) (Query, error) {
 		return Query{Command: CommandPlay, MediaID: mediaID, Episode: episode}, nil
 	default:
 		return Query{Command: CommandSearch, Text: input}, nil
+	}
+}
+
+func listStatus(value string) string {
+	switch strings.ToLower(value) {
+	case "watching":
+		return "CURRENT"
+	case "planning":
+		return "PLANNING"
+	case "completed":
+		return "COMPLETED"
+	default:
+		return ""
 	}
 }
 

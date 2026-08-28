@@ -83,3 +83,39 @@ func TestAuthenticatedProgressOperations(t *testing.T) {
 		t.Fatalf("SaveProgress() = %#v, requests = %d", entry, requests)
 	}
 }
+
+func TestAuthenticatedListOperations(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var request struct {
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if requests == 1 {
+			if request.Variables["status"] != "CURRENT" {
+				t.Fatalf("status variable = %#v", request.Variables["status"])
+			}
+			_, _ = w.Write([]byte(`{"data":{"MediaListCollection":{"lists":[{"entries":[{"status":"CURRENT","progress":4,"media":{"_id":154587,"title":{"english":"Frieren"},"format":"TV","episodes":28,"coverImage":{"large":"https://img.test/cover.jpg"}}}]}]}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"SaveMediaListEntry":{"id":9}}}`))
+	}))
+	defer server.Close()
+	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, func() (string, error) { return "test-token", nil })
+	items, err := client.List(t.Context(), "CURRENT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Media.ID != 154587 || items[0].Progress != 4 {
+		t.Fatalf("List() = %#v", items)
+	}
+	if err := client.SetStatus(t.Context(), 154587, "COMPLETED"); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,4 +1,5 @@
 id = "anime"
+version = "0.1.0"
 name = "Anime"
 description = "Search and watch anime"
 enabled = true

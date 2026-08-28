@@ -48,6 +48,8 @@ type stateStore interface {
 type syncClient interface {
 	ListEntry(context.Context, int) (anilist.ListEntry, bool, error)
 	SaveProgress(context.Context, int, int, string) (anilist.ListEntry, error)
+	List(context.Context, string) ([]anilist.ListItem, error)
+	SetStatus(context.Context, int, string) error
 	Viewer(context.Context) (anilist.Viewer, error)
 }
 
@@ -197,6 +199,42 @@ func (s *Service) Logout(context.Context) error {
 	return nil
 }
 
+func (s *Service) List(ctx context.Context, status string) ([]ListItem, error) {
+	if s.sync == nil {
+		return nil, fmt.Errorf("AniList list access is unavailable")
+	}
+	items, err := s.sync.List(ctx, status)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]ListItem, 0, len(items))
+	for _, item := range items {
+		media := s.cacheMedia(ctx, item.Media)
+		result = append(result, ListItem{Media: media, Status: item.Status, Progress: item.Progress})
+	}
+	return result, nil
+}
+
+func (s *Service) SetListStatus(ctx context.Context, mediaID int, status string) error {
+	if s.sync == nil {
+		return fmt.Errorf("AniList list access is unavailable")
+	}
+	if err := s.sync.SetStatus(ctx, mediaID, status); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) OpenMedia(_ context.Context, mediaID int) error {
+	if s.browser == nil {
+		return fmt.Errorf("AniList page opening is unavailable")
+	}
+	if err := s.browser.Open(fmt.Sprintf("https://anilist.co/anime/%d", mediaID)); err != nil {
+		return fmt.Errorf("open AniList page: %w", err)
+	}
+	return nil
+}
+
 func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
@@ -206,32 +244,33 @@ func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
 		return nil, err
 	}
 	result := make([]Media, 0, len(items))
-	s.cacheMu.Lock()
 	for _, item := range items {
-		s.media[item.ID] = item
-		media := mediaFromAniList(item)
-		if s.preview != nil && item.CoverURL != "" {
-			path, err := s.preview.Get(ctx, item.ID, item.CoverURL)
-			if err != nil {
-				s.logger.Printf("cache preview media_id=%d: %v", item.ID, err)
-			} else {
-				media.CoverURL = path
-			}
-		}
-		result = append(result, media)
-	}
-	s.cacheMu.Unlock()
-	// Media metadata is persisted so continue-watching results survive restarts.
-	if s.state != nil {
-		for _, media := range result {
-			if err := s.state.SaveMedia(ctx, store.MediaInfo{
-				ID: media.ID, Title: media.Title, PreviewPath: media.CoverURL, Episodes: media.Episodes,
-			}); err != nil {
-				s.logger.Printf("save media media_id=%d: %v", media.ID, err)
-			}
-		}
+		result = append(result, s.cacheMedia(ctx, item))
 	}
 	return result, nil
+}
+
+func (s *Service) cacheMedia(ctx context.Context, item anilist.Media) Media {
+	s.cacheMu.Lock()
+	s.media[item.ID] = item
+	s.cacheMu.Unlock()
+	media := mediaFromAniList(item)
+	if s.preview != nil && item.CoverURL != "" {
+		path, err := s.preview.Get(ctx, item.ID, item.CoverURL)
+		if err != nil {
+			s.logger.Printf("cache preview media_id=%d: %v", item.ID, err)
+		} else {
+			media.CoverURL = path
+		}
+	}
+	if s.state != nil {
+		if err := s.state.SaveMedia(ctx, store.MediaInfo{
+			ID: media.ID, Title: media.Title, PreviewPath: media.CoverURL, Episodes: media.Episodes,
+		}); err != nil {
+			s.logger.Printf("save media media_id=%d: %v", media.ID, err)
+		}
+	}
+	return media
 }
 
 // ContinueWatching lists recently played anime so the launcher can resume without a search.
@@ -400,11 +439,15 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 	switch event.Type {
 	case mpv.EventPosition:
 		active.position = event.Value
+		thresholdReached := active.duration > 0 &&
+			active.position/active.duration*100 >= s.config.Sync.ThresholdPercent
+		if !active.complete && thresholdReached {
+			s.saveProgress(active, true)
+		}
 		if !active.complete && time.Since(active.lastSaved) >= 10*time.Second {
 			s.saveProgress(active, false)
 		}
-		if s.config.Sync.Trigger == "threshold" && active.duration > 0 &&
-			active.position/active.duration*100 >= s.config.Sync.ThresholdPercent {
+		if s.config.Sync.Trigger == "threshold" && thresholdReached {
 			s.queueSync(active)
 		}
 	case mpv.EventDuration:
@@ -420,7 +463,7 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 			s.queueSync(active)
 		}
 	case mpv.EventEndFile:
-		complete := event.Reason == "eof"
+		complete := event.Reason == "eof" || active.complete
 		s.saveProgress(active, complete)
 		if complete && s.config.Sync.Trigger == "eof" {
 			s.queueSync(active)

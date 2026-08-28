@@ -17,6 +17,9 @@ type animeService interface {
 	PlayEpisode(context.Context, anime.Episode) error
 	ContinueWatching(context.Context, int) ([]anime.Resume, error)
 	ResumeMedia(context.Context, int) error
+	List(context.Context, string) ([]anime.ListItem, error)
+	SetListStatus(context.Context, int, string) error
+	OpenMedia(context.Context, int) error
 	SignedIn() bool
 	Account(context.Context) string
 	StartLogin(context.Context) error
@@ -86,10 +89,7 @@ func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
 				ID: resultID, Label: item.Title,
 				Description: description, Score: resultScore(index), Icon: "video-x-generic",
 				Category: "anime", PreviewPath: item.CoverURL,
-				Actions: []Action{
-					{Name: "resume"},
-					{Name: "Episodes", Type: "query_replace", Query: fmt.Sprintf("%s episodes %d", p.queryPrefix, item.ID)},
-				},
+				Actions: p.mediaActions(item.ID),
 			})
 		}
 		p.storeSelection(queryID, selections)
@@ -107,6 +107,28 @@ func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
 				ID: episode.ResultID(), Label: fmt.Sprintf("Episode %d", episode.Number),
 				Description: episode.Title, Score: resultScore(index), Icon: "media-playback-start",
 				Category: "anime", Actions: []Action{{Name: "play"}},
+			})
+		}
+		p.storeSelection(queryID, selections)
+		return Payload{Results: results}
+	case anime.CommandList:
+		if !p.service.SignedIn() {
+			return errorPayload(fmt.Errorf("sign in to AniList before viewing lists"))
+		}
+		items, err := p.service.List(ctx, query.ListStatus)
+		if err != nil {
+			return errorPayload(err)
+		}
+		selections := make(map[string]selection, len(items))
+		results := make([]Result, 0, len(items))
+		for index, item := range items {
+			resultID := fmt.Sprintf("media:%d", item.Media.ID)
+			selections[resultID] = selection{mediaID: item.Media.ID}
+			description := listDescription(item.Status, item.Progress, item.Media.Episodes)
+			results = append(results, Result{
+				ID: resultID, Label: item.Media.Title, Description: description,
+				Score: resultScore(index), Icon: "video-x-generic", Category: "anime",
+				PreviewPath: item.Media.CoverURL, Actions: p.mediaActions(item.Media.ID),
 			})
 		}
 		p.storeSelection(queryID, selections)
@@ -155,7 +177,7 @@ func (p *Plugin) Select(ctx context.Context, message Message) (bool, string) {
 			return false, err.Error()
 		}
 		return true, "Signed out of AniList"
-	case "play", "resume":
+	case "play", "resume", "watching", "planning", "completed", "open":
 	default:
 		return false, fmt.Sprintf("Unsupported action %q", message.Action)
 	}
@@ -165,6 +187,19 @@ func (p *Plugin) Select(ctx context.Context, message Message) (bool, string) {
 	p.mu.Unlock()
 	if !ok {
 		return false, "Selection is stale; search again"
+	}
+	if message.Action == "watching" || message.Action == "planning" || message.Action == "completed" {
+		status := animeStatus(message.Action)
+		if err := p.service.SetListStatus(ctx, target.mediaID, status); err != nil {
+			return false, err.Error()
+		}
+		return true, fmt.Sprintf("Moved to AniList %s list", message.Action)
+	}
+	if message.Action == "open" {
+		if err := p.service.OpenMedia(ctx, target.mediaID); err != nil {
+			return false, err.Error()
+		}
+		return true, "Opened AniList page"
 	}
 	if target.mediaID != 0 {
 		if err := p.service.ResumeMedia(ctx, target.mediaID); err != nil {
@@ -202,10 +237,7 @@ func (p *Plugin) continueWatching(ctx context.Context, queryID string) Payload {
 			ID: resultID, Label: entry.Title, Description: description,
 			Score: resultScore(index), Icon: "media-playback-start", Category: "anime",
 			PreviewPath: entry.PreviewPath,
-			Actions: []Action{
-				{Name: "resume"},
-				{Name: "Episodes", Type: "query_replace", Query: fmt.Sprintf("%s episodes %d", p.queryPrefix, entry.MediaID)},
-			},
+			Actions:     p.mediaActions(entry.MediaID),
 		})
 	}
 	// Surfacing account state here keeps progress synchronization discoverable
@@ -213,6 +245,42 @@ func (p *Plugin) continueWatching(ctx context.Context, queryID string) Payload {
 	results = append(results, p.accountResult(ctx, resultScore(len(results))))
 	p.storeSelection(queryID, selections)
 	return Payload{Results: results}
+}
+
+func (p *Plugin) mediaActions(mediaID int) []Action {
+	actions := []Action{
+		{Name: "resume"},
+		{Name: "Episodes", Type: "query_replace", Query: fmt.Sprintf("%s episodes %d", p.queryPrefix, mediaID)},
+	}
+	if p.service.SignedIn() {
+		actions = append(actions,
+			Action{Name: "watching"}, Action{Name: "planning"},
+			Action{Name: "completed"},
+		)
+	}
+	actions = append(actions, Action{Name: "open"})
+	return actions
+}
+
+func listDescription(status string, progress, total int) string {
+	label := strings.ToLower(status)
+	if label == "current" {
+		label = "watching"
+	}
+	if progress <= 0 {
+		return label
+	}
+	if total > 0 {
+		return fmt.Sprintf("%s | episode %d of %d", label, progress, total)
+	}
+	return fmt.Sprintf("%s | episode %d", label, progress)
+}
+
+func animeStatus(action string) string {
+	if action == "watching" {
+		return "CURRENT"
+	}
+	return strings.ToUpper(action)
 }
 
 // accountResult reports AniList sign-in state. When already signed in the

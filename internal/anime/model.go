@@ -11,6 +11,12 @@ type Media struct {
 	Aliases  []string
 }
 
+type ListItem struct {
+	Media    Media
+	Status   string
+	Progress int
+}
+
 type Episode struct {
 	MediaID    int
 	Number     int

@@ -39,6 +39,21 @@ func (f *fakeSync) SaveProgress(_ context.Context, _ int, progress int, status s
 	return anilist.ListEntry{Progress: progress, Status: status}, nil
 }
 
+func (f *fakeSync) List(context.Context, string) ([]anilist.ListItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail != nil {
+		return nil, f.fail
+	}
+	return []anilist.ListItem{{Media: anilist.Media{ID: 154587, Title: "Frieren", Episodes: 28}, Status: "CURRENT", Progress: 4}}, nil
+}
+
+func (f *fakeSync) SetStatus(context.Context, int, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fail
+}
+
 func (f *fakeSync) Viewer(context.Context) (anilist.Viewer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

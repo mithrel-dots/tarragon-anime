@@ -303,6 +303,32 @@ func TestPlaybackCanDisableAutoNextAndResume(t *testing.T) {
 	}
 }
 
+func TestPlaybackThresholdMarksEpisodeComplete(t *testing.T) {
+	client := &cachingAniList{}
+	session := newFakeSession()
+	player := &fakePlayer{session: session}
+	state := newMemoryState()
+	config := DefaultConfig()
+	config.AutoNext = false
+	config.Sync.ThresholdPercent = 90
+	service := NewService(client, navigationProvider{}, player, state, nil, nil, config, nil)
+	defer service.Close()
+
+	episodes, err := service.Episodes(t.Context(), 154587)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.PlayEpisode(t.Context(), episodes[0]); err != nil {
+		t.Fatal(err)
+	}
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 100}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 90}
+	waitFor(t, func() bool { return state.saved(154587, 1).Complete })
+	if progress := state.saved(154587, 1); progress.Position != 90 || progress.Duration != 100 {
+		t.Fatalf("threshold progress = %#v", progress)
+	}
+}
+
 func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

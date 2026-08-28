@@ -13,8 +13,12 @@ func TestParseQuery(t *testing.T) {
 		{name: "explicit search", input: " search  one piece ", want: Query{Command: CommandSearch, Text: "one piece"}},
 		{name: "episodes", input: "episodes 154587", want: Query{Command: CommandEpisodes, MediaID: 154587}},
 		{name: "play", input: "play 154587 4", want: Query{Command: CommandPlay, MediaID: 154587, Episode: 4}},
+		{name: "watching list", input: "watching", want: Query{Command: CommandList, ListStatus: "CURRENT"}},
+		{name: "planning list", input: "list planning", want: Query{Command: CommandList, ListStatus: "PLANNING"}},
+		{name: "completed list", input: "list completed", want: Query{Command: CommandList, ListStatus: "COMPLETED"}},
 		{name: "bad episodes", input: "episodes nope", err: true},
 		{name: "bad play", input: "play 1 0", err: true},
+		{name: "bad list", input: "list backlog", err: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

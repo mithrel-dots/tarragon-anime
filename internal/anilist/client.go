@@ -78,6 +78,12 @@ type ListEntry struct {
 	Progress int
 }
 
+type ListItem struct {
+	Media    Media
+	Status   string
+	Progress int
+}
+
 type Viewer struct {
 	ID   int
 	Name string
@@ -153,6 +159,43 @@ func (c *Client) SaveProgress(ctx context.Context, mediaID, progress int, status
 		return ListEntry{}, fmt.Errorf("save AniList progress for media %d: %w", mediaID, err)
 	}
 	return response.Entry, nil
+}
+
+func (c *Client) List(ctx context.Context, status string) ([]ListItem, error) {
+	const gql = `query ($status: MediaListStatus!) { MediaListCollection(type: ANIME, status: $status) { lists { entries { status progress media { ` + mediaFields + ` } } } } }`
+	var response struct {
+		Collection struct {
+			Lists []struct {
+				Entries []struct {
+					Status   string        `json:"status"`
+					Progress int           `json:"progress"`
+					Media    mediaResponse `json:"media"`
+				} `json:"entries"`
+			} `json:"lists"`
+		} `json:"MediaListCollection"`
+	}
+	if err := c.do(ctx, gql, map[string]any{"status": status}, &response); err != nil {
+		return nil, fmt.Errorf("list AniList media with status %s: %w", status, err)
+	}
+	var items []ListItem
+	for _, list := range response.Collection.Lists {
+		for _, entry := range list.Entries {
+			items = append(items, ListItem{Media: entry.Media.toMedia(), Status: entry.Status, Progress: entry.Progress})
+		}
+	}
+	return items, nil
+}
+
+func (c *Client) SetStatus(ctx context.Context, mediaID int, status string) error {
+	const gql = `mutation ($mediaId: Int!, $status: MediaListStatus!) { SaveMediaListEntry(mediaId: $mediaId, status: $status) { id } }`
+	if err := c.do(ctx, gql, map[string]any{"mediaId": mediaID, "status": status}, &struct {
+		Entry struct {
+			ID int `json:"id"`
+		} `json:"SaveMediaListEntry"`
+	}{}); err != nil {
+		return fmt.Errorf("set AniList status for media %d: %w", mediaID, err)
+	}
+	return nil
 }
 
 type mediaResponse struct {
