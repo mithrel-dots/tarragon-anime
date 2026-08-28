@@ -91,8 +91,11 @@ func TestPluginContinueWatchingIsDefaultForEmptyQuery(t *testing.T) {
 	service := &fakeAnimeService{}
 	plugin := NewPlugin(service, "anime", "anime", "@", log.New(io.Discard, "", 0))
 	payload := plugin.Request(t.Context(), "empty-query", "")
-	if len(payload.Results) != 1 {
+	if len(payload.Results) != 2 {
 		t.Fatalf("results = %#v", payload.Results)
+	}
+	if signIn := payload.Results[1]; signIn.ID != "auth:login" || signIn.Actions[0].Name != "login" {
+		t.Fatalf("sign-in result = %#v", signIn)
 	}
 	result := payload.Results[0]
 	if result.ID != "media:154587" || result.Description != "Next episode 5 of 28" {
@@ -152,5 +155,26 @@ func TestPluginLoginAndLogoutActions(t *testing.T) {
 	})
 	if !success || !service.loggedOut {
 		t.Fatalf("logout select = %v, signed out %v", success, service.loggedOut)
+	}
+}
+
+func TestPluginHidesSignInWhenAuthenticated(t *testing.T) {
+	service := &fakeAnimeService{signedIn: true}
+	plugin := NewPlugin(service, "anime", "anime", "@", log.New(io.Discard, "", 0))
+	payload := plugin.Request(t.Context(), "empty-query", "")
+	if len(payload.Results) != 1 || payload.Results[0].ID != "media:154587" {
+		t.Fatalf("results = %#v", payload.Results)
+	}
+}
+
+func TestPluginSignInFromEmptyQueryStartsLogin(t *testing.T) {
+	service := &fakeAnimeService{}
+	plugin := NewPlugin(service, "anime", "anime", "@", log.New(io.Discard, "", 0))
+	plugin.Request(t.Context(), "empty-query", "")
+	success, message := plugin.Select(t.Context(), Message{
+		QueryID: "empty-query", ResultID: "auth:login", Action: "login", Plugin: "anime",
+	})
+	if !success || message != "Opened AniList sign-in" || !service.loggedIn {
+		t.Fatalf("Select() = %v, %q, started %v", success, message, service.loggedIn)
 	}
 }

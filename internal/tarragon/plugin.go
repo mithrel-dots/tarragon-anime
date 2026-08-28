@@ -211,6 +211,16 @@ func (p *Plugin) continueWatching(ctx context.Context, queryID string) Payload {
 			},
 		})
 	}
+	// Surfacing sign-in here keeps progress synchronization discoverable
+	// without requiring the user to know the login command.
+	if !p.service.SignedIn() {
+		results = append(results, Result{
+			ID: "auth:login", Label: "Sign in to AniList",
+			Description: "Authorize progress synchronization in your browser",
+			Score:       resultScore(len(results)), Icon: "system-users", Category: "anime",
+			Actions: []Action{{Name: "login"}},
+		})
+	}
 	p.storeSelection(queryID, selections)
 	return Payload{Results: results}
 }
