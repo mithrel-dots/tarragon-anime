@@ -30,13 +30,13 @@ func (f *fakeAnimeService) PlayEpisode(_ context.Context, episode anime.Episode)
 
 func TestPluginQueryReplacementAndSelection(t *testing.T) {
 	service := &fakeAnimeService{}
-	plugin := NewPlugin(service, log.New(io.Discard, "", 0))
+	plugin := NewPlugin(service, "custom-plugin", "shows", "@", log.New(io.Discard, "", 0))
 	search := plugin.Request(t.Context(), "search-query", "frieren")
 	if len(search.Results) != 1 {
 		t.Fatalf("search results = %#v", search.Results)
 	}
 	action := search.Results[0].Actions[0]
-	if action.Type != "query_replace" || action.Query != "@anime episodes 154587" {
+	if action.Type != "query_replace" || action.Query != "@shows episodes 154587" {
 		t.Fatalf("episodes action = %#v", action)
 	}
 
@@ -45,7 +45,7 @@ func TestPluginQueryReplacementAndSelection(t *testing.T) {
 		t.Fatalf("episode results = %#v", episodes.Results)
 	}
 	success, message := plugin.Select(t.Context(), Message{
-		Type: "select", QueryID: "episodes-query", ResultID: "episode:154587:4", Action: "play", Plugin: "anime",
+		Type: "select", QueryID: "episodes-query", ResultID: "episode:154587:4", Action: "play", Plugin: "custom-plugin",
 	})
 	if !success || message != "Started playback" || service.played.Number != 4 {
 		t.Fatalf("Select() = %v, %q, played %#v", success, message, service.played)
@@ -53,7 +53,7 @@ func TestPluginQueryReplacementAndSelection(t *testing.T) {
 }
 
 func TestPluginRejectsStaleSelection(t *testing.T) {
-	plugin := NewPlugin(&fakeAnimeService{}, log.New(io.Discard, "", 0))
+	plugin := NewPlugin(&fakeAnimeService{}, "custom-plugin", "shows", "@", log.New(io.Discard, "", 0))
 	success, _ := plugin.Select(t.Context(), Message{QueryID: "old", ResultID: "episode:1:1", Action: "play"})
 	if success {
 		t.Fatal("Select() accepted stale selection")

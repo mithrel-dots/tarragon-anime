@@ -42,6 +42,8 @@ func run() error {
 	if name == "" {
 		name = "anime"
 	}
+	prefix := os.Getenv("TARRAGON_PLUGIN_PREFIX")
+	prefixSymbol := os.Getenv("TARRAGON_PREFIX_SYMBOL")
 	logger := log.New(os.Stderr, "[PLUGIN: "+name+"] INFO ", 0)
 	configPath, err := anime.ConfigPath()
 	if err != nil {
@@ -67,7 +69,7 @@ func run() error {
 	player := mpv.New(config.MPVArgs, logger)
 	service := anime.NewService(aniListClient, provider, player, state, config, logger)
 	defer service.Close()
-	plugin := tarragon.NewPlugin(service, logger)
+	plugin := tarragon.NewPlugin(service, name, prefix, prefixSymbol, logger)
 	daemon := tarragon.NewDaemon(endpoint, name, plugin, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

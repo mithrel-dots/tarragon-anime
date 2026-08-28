@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"tarragon-anime/internal/anime"
@@ -17,15 +18,32 @@ type animeService interface {
 }
 
 type Plugin struct {
-	service animeService
-	logger  *log.Logger
+	service     animeService
+	logger      *log.Logger
+	pluginID    string
+	queryPrefix string
 
 	mu         sync.Mutex
 	selections map[string]map[string]anime.Episode
 }
 
-func NewPlugin(service animeService, logger *log.Logger) *Plugin {
-	return &Plugin{service: service, logger: logger, selections: make(map[string]map[string]anime.Episode)}
+func NewPlugin(service animeService, pluginID, prefix, prefixSymbol string, logger *log.Logger) *Plugin {
+	if pluginID == "" {
+		pluginID = "anime"
+	}
+	if prefix == "" {
+		prefix = pluginID
+	}
+	if prefixSymbol == "" {
+		prefixSymbol = "@"
+	}
+	if !strings.HasPrefix(prefix, prefixSymbol) {
+		prefix = prefixSymbol + prefix
+	}
+	return &Plugin{
+		service: service, logger: logger, pluginID: pluginID, queryPrefix: prefix,
+		selections: make(map[string]map[string]anime.Episode),
+	}
 }
 
 func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
@@ -49,7 +67,7 @@ func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
 				ID: fmt.Sprintf("media:%d", item.ID), Label: item.Title,
 				Description: description, Score: resultScore(index), Icon: "video-x-generic",
 				Category: "anime", PreviewPath: item.CoverURL,
-				Actions: []Action{{Name: "Episodes", Type: "query_replace", Query: fmt.Sprintf("@anime episodes %d", item.ID)}},
+				Actions: []Action{{Name: "Episodes", Type: "query_replace", Query: fmt.Sprintf("%s episodes %d", p.queryPrefix, item.ID)}},
 			})
 		}
 		return Payload{Results: results}
@@ -81,7 +99,7 @@ func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
 }
 
 func (p *Plugin) Select(ctx context.Context, message Message) (bool, string) {
-	if message.Plugin != "" && message.Plugin != "anime" {
+	if message.Plugin != "" && message.Plugin != p.pluginID {
 		return false, "Selection was routed to the wrong plugin"
 	}
 	if message.Action != "play" {
