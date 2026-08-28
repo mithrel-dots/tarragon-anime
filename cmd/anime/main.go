@@ -34,7 +34,6 @@ func main() {
 }
 
 func run() error {
-	logger := log.New(os.Stderr, "tarragon-anime: ", log.LstdFlags|log.Lmsgprefix)
 	endpoint := os.Getenv("TARRAGON_PLUGINS_ENDPOINT")
 	if endpoint == "" {
 		return fmt.Errorf("TARRAGON_PLUGINS_ENDPOINT is not set")
@@ -43,6 +42,7 @@ func run() error {
 	if name == "" {
 		name = "anime"
 	}
+	logger := log.New(os.Stderr, "[PLUGIN: "+name+"] INFO ", 0)
 	configPath, err := anime.ConfigPath()
 	if err != nil {
 		return err

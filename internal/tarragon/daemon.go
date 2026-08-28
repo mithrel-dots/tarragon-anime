@@ -39,7 +39,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.write(conn, Message{Type: "hello", Name: d.name}); err != nil {
 		return fmt.Errorf("send Tarragon hello: %w", err)
 	}
-	d.logger.Printf("connected plugin=%s endpoint=%s", d.name, d.endpoint)
+	d.logger.Printf("connected to %s", d.endpoint)
 
 	go func() {
 		<-ctx.Done()
@@ -64,10 +64,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			requests.Add(1)
 			go func() {
 				defer requests.Done()
-				d.logger.Printf("request query_id=%s text=%q", message.QueryID, message.Text)
+				d.logger.Printf("request qid=%s: %s", message.QueryID, message.Text)
 				payload := d.handler.Request(ctx, message.QueryID, message.Text)
 				if err := d.write(conn, response{Type: "response", QueryID: message.QueryID, Data: payload}); err != nil && ctx.Err() == nil {
 					d.logger.Printf("write Tarragon response: %v", err)
+				} else if ctx.Err() == nil {
+					d.logger.Printf("response sent qid=%s", message.QueryID)
 				}
 			}()
 		case "select":
