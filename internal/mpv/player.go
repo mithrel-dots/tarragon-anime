@@ -25,16 +25,20 @@ type Stream struct {
 }
 
 type Player struct {
-	args    []string
-	logger  *log.Logger
-	timeout time.Duration
+	args      []string
+	configDir string
+	logger    *log.Logger
+	timeout   time.Duration
 }
 
 func New(args []string, logger *log.Logger) *Player {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Player{args: append([]string(nil), args...), logger: logger, timeout: 12 * time.Second}
+	return &Player{
+		args: append([]string(nil), args...), configDir: standardConfigDir(),
+		logger: logger, timeout: 12 * time.Second,
+	}
 }
 
 func (p *Player) Play(ctx context.Context, stream Stream, title string) error {
@@ -44,6 +48,8 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string) error {
 	}
 	args := append([]string(nil), p.args...)
 	args = append(args,
+		"--config=yes",
+		"--config-dir="+p.configDir,
 		"--no-terminal",
 		"--input-ipc-server="+socket,
 		"--force-media-title="+title,
@@ -71,7 +77,7 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start mpv: %w", err)
 	}
-	p.logger.Printf("mpv launched pid=%d title=%q", cmd.Process.Pid, title)
+	p.logger.Printf("mpv launched pid=%d config_dir=%q title=%q", cmd.Process.Pid, p.configDir, title)
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 
@@ -197,4 +203,14 @@ func socketPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(os.TempDir(), "tarragon-anime-mpv-"+hex.EncodeToString(random)+".sock"), nil
+}
+
+func standardConfigDir() string {
+	if configHome := os.Getenv("XDG_CONFIG_HOME"); configHome != "" {
+		return filepath.Join(configHome, "mpv")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".config", "mpv")
+	}
+	return ""
 }

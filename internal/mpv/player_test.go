@@ -15,6 +15,7 @@ import (
 
 func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 	dir := t.TempDir()
+	configHome := filepath.Join(dir, "config")
 	script := filepath.Join(dir, "mpv")
 	content := "#!/bin/sh\nexec \"$MPV_TEST_BINARY\" -test.run=TestMPVHelperProcess -- \"$@\"\n"
 	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
@@ -25,6 +26,7 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 	t.Setenv("MPV_TEST_BINARY", os.Args[0])
 	t.Setenv("MPV_HELPER", "1")
 	t.Setenv("MPV_ARGS_FILE", argsFile)
+	t.Setenv("XDG_CONFIG_HOME", configHome)
 
 	player := New([]string{"--profile=anime"}, log.New(io.Discard, "", 0))
 	player.timeout = 2 * time.Second
@@ -40,7 +42,15 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := string(args)
-	for _, expected := range []string{"--input-ipc-server=", "--http-header-fields=Referer: https://mkissa.to/", "--sub-file=https://sub.test/en.ass", "https://video.test/master.m3u8"} {
+	for _, expected := range []string{
+		"--config=yes",
+		"--config-dir=" + filepath.Join(configHome, "mpv"),
+		"--profile=anime",
+		"--input-ipc-server=",
+		"--http-header-fields=Referer: https://mkissa.to/",
+		"--sub-file=https://sub.test/en.ass",
+		"https://video.test/master.m3u8",
+	} {
 		if !strings.Contains(joined, expected) {
 			t.Errorf("mpv args %q do not contain %q", joined, expected)
 		}
