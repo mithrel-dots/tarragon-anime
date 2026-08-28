@@ -68,18 +68,41 @@ func run() error {
 		return err
 	}
 
+	tokenPath, err := anime.TokenPath()
+	if err != nil {
+		return err
+	}
+	token, err := anime.LoadToken(tokenPath)
+	if err != nil {
+		return fmt.Errorf("load AniList token %s: %w", tokenPath, err)
+	}
+
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	aniListClient := anilist.NewClient(httpClient)
 	provider := allanime.NewClient(httpClient)
 	player := mpv.New(config.MPVArgs, logger)
 	previews := preview.NewCache(httpClient, previewDir)
-	service := anime.NewService(aniListClient, provider, player, state, previews, config, logger)
+
+	// A typed nil client would satisfy the sync interface, so only build one
+	// when a token actually exists.
+	var service *anime.Service
+	if token != "" {
+		logger.Printf("AniList sync enabled conflict=%s trigger=%s", config.Sync.Conflict, config.Sync.Trigger)
+		service = anime.NewService(aniListClient, provider, player, state, previews,
+			anilist.NewAuthenticatedClient(httpClient, token), config, logger)
+	} else {
+		if config.Sync.Enabled {
+			logger.Printf("AniList sync idle: no token at %s", tokenPath)
+		}
+		service = anime.NewService(aniListClient, provider, player, state, previews, nil, config, logger)
+	}
 	defer service.Close()
 	plugin := tarragon.NewPlugin(service, name, prefix, prefixSymbol, logger)
 	daemon := tarragon.NewDaemon(endpoint, name, plugin, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go service.Run(ctx)
 	err = daemon.Run(ctx)
 	logger.Printf("shutdown")
 	return err

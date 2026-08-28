@@ -18,6 +18,14 @@ type Config struct {
 	Resume           bool
 	ResumeRewind     float64
 	MPVArgs          []string
+	Sync             SyncConfig
+}
+
+type SyncConfig struct {
+	Enabled          bool
+	Conflict         string
+	Trigger          string
+	ThresholdPercent float64
 }
 
 func DefaultConfig() Config {
@@ -28,6 +36,9 @@ func DefaultConfig() Config {
 		AutoNext:         true,
 		Resume:           true,
 		ResumeRewind:     5,
+		Sync: SyncConfig{
+			Enabled: true, Conflict: "highest", Trigger: "eof", ThresholdPercent: 90,
+		},
 	}
 }
 
@@ -85,6 +96,14 @@ func LoadConfig(path string) (Config, error) {
 			cfg.ResumeRewind, err = strconv.ParseFloat(value, 64)
 		case "mpv.args":
 			cfg.MPVArgs, err = parseStringArray(value)
+		case "sync.enabled":
+			cfg.Sync.Enabled, err = strconv.ParseBool(value)
+		case "sync.conflict":
+			cfg.Sync.Conflict, err = parseString(value)
+		case "sync.trigger":
+			cfg.Sync.Trigger, err = parseString(value)
+		case "sync.threshold_percent":
+			cfg.Sync.ThresholdPercent, err = strconv.ParseFloat(value, 64)
 		default:
 			continue
 		}
@@ -104,7 +123,50 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.ResumeRewind < 0 {
 		return Config{}, fmt.Errorf("resume_rewind_seconds must not be negative")
 	}
+	if cfg.Sync.Conflict != "highest" && cfg.Sync.Conflict != "local" && cfg.Sync.Conflict != "remote" {
+		return Config{}, fmt.Errorf("sync.conflict must be %q, %q, or %q", "highest", "local", "remote")
+	}
+	if cfg.Sync.Trigger != "eof" && cfg.Sync.Trigger != "threshold" && cfg.Sync.Trigger != "start" {
+		return Config{}, fmt.Errorf("sync.trigger must be %q, %q, or %q", "eof", "threshold", "start")
+	}
+	if cfg.Sync.ThresholdPercent <= 0 || cfg.Sync.ThresholdPercent > 100 {
+		return Config{}, fmt.Errorf("sync.threshold_percent must be greater than 0 and at most 100")
+	}
 	return cfg, nil
+}
+
+func TokenPath() (string, error) {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "tarragon", "anime", "token"), nil
+}
+
+func LoadToken(path string) (string, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("stat AniList token: %w", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("AniList token file %s must use permissions 0600", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read AniList token: %w", err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("AniList token file %s is empty", path)
+	}
+	return token, nil
 }
 
 func parseString(value string) (string, error) {

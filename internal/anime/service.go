@@ -35,6 +35,18 @@ type stateStore interface {
 	SaveProviderMapping(context.Context, int, string, string) error
 	Progress(context.Context, int, int) (store.Progress, bool, error)
 	SaveProgress(context.Context, store.Progress) error
+	SaveMedia(context.Context, store.MediaInfo) error
+	MediaProgress(context.Context, int) (store.Progress, bool, error)
+	ResumeEntries(context.Context, int) ([]store.ResumeEntry, error)
+	EnqueueSync(context.Context, int, int) error
+	PendingSyncs(context.Context, int) ([]store.SyncItem, error)
+	DeleteSync(context.Context, int64) error
+	RecordSyncFailure(context.Context, int64, string) error
+}
+
+type syncClient interface {
+	ListEntry(context.Context, int) (anilist.ListEntry, bool, error)
+	SaveProgress(context.Context, int, int, string) (anilist.ListEntry, error)
 }
 
 type previewCache interface {
@@ -47,6 +59,7 @@ type Service struct {
 	player   player
 	state    stateStore
 	preview  previewCache
+	sync     syncClient
 	config   Config
 	logger   *log.Logger
 
@@ -56,6 +69,8 @@ type Service struct {
 
 	playbackMu sync.Mutex
 	active     *activePlayback
+
+	syncMu sync.Mutex
 }
 
 type activePlayback struct {
@@ -71,16 +86,17 @@ type activePlayback struct {
 	lastSaved       time.Time
 	subtitlePending bool
 	complete        bool
+	synced          bool
 	closeOnce       sync.Once
 }
 
-func NewService(anilistClient aniListClient, provider providerClient, player player, state stateStore, previews previewCache, config Config, logger *log.Logger) *Service {
+func NewService(anilistClient aniListClient, provider providerClient, player player, state stateStore, previews previewCache, syncer syncClient, config Config, logger *log.Logger) *Service {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Service{
 		anilist: anilistClient, provider: provider, player: player, state: state, preview: previews,
-		config: config, logger: logger, media: make(map[int]anilist.Media),
+		sync: syncer, config: config, logger: logger, media: make(map[int]anilist.Media),
 		episodes: make(map[int][]Episode),
 	}
 }
@@ -109,7 +125,70 @@ func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
 		result = append(result, media)
 	}
 	s.cacheMu.Unlock()
+	// Media metadata is persisted so continue-watching results survive restarts.
+	if s.state != nil {
+		for _, media := range result {
+			if err := s.state.SaveMedia(ctx, store.MediaInfo{
+				ID: media.ID, Title: media.Title, PreviewPath: media.CoverURL, Episodes: media.Episodes,
+			}); err != nil {
+				s.logger.Printf("save media media_id=%d: %v", media.ID, err)
+			}
+		}
+	}
 	return result, nil
+}
+
+// ContinueWatching lists recently played anime so the launcher can resume without a search.
+func (s *Service) ContinueWatching(ctx context.Context, limit int) ([]Resume, error) {
+	if s.state == nil {
+		return nil, nil
+	}
+	entries, err := s.state.ResumeEntries(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]Resume, 0, len(entries))
+	for _, entry := range entries {
+		episode := entry.Episode
+		if entry.Complete && (entry.TotalEpisodes == 0 || episode < entry.TotalEpisodes) {
+			episode++
+		}
+		result = append(result, Resume{
+			MediaID: entry.MediaID, Title: entry.Title, PreviewPath: entry.PreviewPath,
+			Episode: episode, Position: entry.Position, TotalEpisodes: entry.TotalEpisodes,
+			Continues: !entry.Complete && entry.Position > 0,
+		})
+	}
+	return result, nil
+}
+
+// ResumeMedia continues an anime from the last watched episode.
+func (s *Service) ResumeMedia(ctx context.Context, mediaID int) error {
+	episodes, err := s.availableEpisodes(ctx, mediaID)
+	if err != nil {
+		return err
+	}
+	if len(episodes) == 0 {
+		return fmt.Errorf("no episodes are available for AniList %d", mediaID)
+	}
+	target := episodes[0]
+	if s.state != nil {
+		progress, found, err := s.state.MediaProgress(ctx, mediaID)
+		if err != nil {
+			s.logger.Printf("load media progress media_id=%d: %v", mediaID, err)
+		} else if found {
+			number := progress.Episode
+			if progress.Complete {
+				number++
+			}
+			if index := episodeIndex(episodes, number); index >= 0 {
+				target = episodes[index]
+			} else if index := episodeIndex(episodes, progress.Episode); index >= 0 {
+				target = episodes[index]
+			}
+		}
+	}
+	return s.PlayEpisode(ctx, target)
 }
 
 func (s *Service) Episodes(ctx context.Context, mediaID int) ([]Episode, error) {
@@ -228,6 +307,10 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 		if !active.complete && time.Since(active.lastSaved) >= 10*time.Second {
 			s.saveProgress(active, false)
 		}
+		if s.config.Sync.Trigger == "threshold" && active.duration > 0 &&
+			active.position/active.duration*100 >= s.config.Sync.ThresholdPercent {
+			s.queueSync(active)
+		}
 	case mpv.EventDuration:
 		active.duration = event.Value
 	case mpv.EventFileLoaded:
@@ -237,9 +320,15 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 			}
 		}
 		active.subtitlePending = false
+		if s.config.Sync.Trigger == "start" {
+			s.queueSync(active)
+		}
 	case mpv.EventEndFile:
 		complete := event.Reason == "eof"
 		s.saveProgress(active, complete)
+		if complete && s.config.Sync.Trigger == "eof" {
+			s.queueSync(active)
+		}
 		if complete {
 			if s.config.AutoNext && active.index+1 < len(active.episodes) {
 				s.navigate(active, 1, false)
@@ -254,6 +343,127 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 	case mpv.EventShutdown:
 		active.cancel()
 	}
+}
+
+// Run flushes queued AniList updates until the plugin shuts down, so progress
+// recorded while offline is not lost.
+func (s *Service) Run(ctx context.Context) {
+	if !s.syncEnabled() {
+		return
+	}
+	s.FlushSync(ctx)
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.FlushSync(ctx)
+		}
+	}
+}
+
+func (s *Service) syncEnabled() bool {
+	return s.config.Sync.Enabled && s.sync != nil && s.state != nil
+}
+
+func (s *Service) queueSync(active *activePlayback) {
+	if !s.syncEnabled() || active.synced || active.index < 0 || active.index >= len(active.episodes) {
+		return
+	}
+	active.synced = true
+	episode := active.episodes[active.index]
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.state.EnqueueSync(ctx, episode.MediaID, episode.Number); err != nil {
+		s.logger.Printf("queue AniList sync media_id=%d episode=%d: %v", episode.MediaID, episode.Number, err)
+		return
+	}
+	s.logger.Printf("queued AniList sync media_id=%d episode=%d", episode.MediaID, episode.Number)
+	go func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		s.FlushSync(flushCtx)
+	}()
+}
+
+func (s *Service) FlushSync(ctx context.Context) {
+	if !s.syncEnabled() {
+		return
+	}
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	items, err := s.state.PendingSyncs(ctx, 32)
+	if err != nil {
+		s.logger.Printf("read AniList sync queue: %v", err)
+		return
+	}
+	for _, item := range items {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := s.pushSync(ctx, item); err != nil {
+			s.logger.Printf("sync AniList media_id=%d episode=%d: %v", item.MediaID, item.Episode, err)
+			if err := s.state.RecordSyncFailure(ctx, item.ID, err.Error()); err != nil {
+				s.logger.Printf("record AniList sync failure: %v", err)
+			}
+			continue
+		}
+		if err := s.state.DeleteSync(ctx, item.ID); err != nil {
+			s.logger.Printf("clear AniList sync item: %v", err)
+		}
+	}
+}
+
+func (s *Service) pushSync(ctx context.Context, item store.SyncItem) error {
+	remote, found, err := s.sync.ListEntry(ctx, item.MediaID)
+	if err != nil {
+		return err
+	}
+	target := item.Episode
+	switch s.config.Sync.Conflict {
+	case "highest":
+		if found && remote.Progress > target {
+			target = remote.Progress
+		}
+	case "remote":
+		if found && remote.Progress >= item.Episode {
+			s.logger.Printf("AniList progress kept media_id=%d remote=%d local=%d", item.MediaID, remote.Progress, item.Episode)
+			return nil
+		}
+	}
+	if found && remote.Progress == target {
+		return nil
+	}
+	status := "CURRENT"
+	if total := s.totalEpisodes(ctx, item.MediaID); total > 0 && target >= total {
+		status = "COMPLETED"
+	}
+	entry, err := s.sync.SaveProgress(ctx, item.MediaID, target, status)
+	if err != nil {
+		return err
+	}
+	s.logger.Printf("AniList progress synced media_id=%d episode=%d status=%s", item.MediaID, entry.Progress, entry.Status)
+	return nil
+}
+
+func (s *Service) totalEpisodes(ctx context.Context, mediaID int) int {
+	s.cacheMu.RLock()
+	media, ok := s.media[mediaID]
+	s.cacheMu.RUnlock()
+	if ok {
+		return media.Episodes
+	}
+	media, err := s.anilist.Get(ctx, mediaID)
+	if err != nil {
+		s.logger.Printf("look up media %d for sync status: %v", mediaID, err)
+		return 0
+	}
+	s.cacheMu.Lock()
+	s.media[mediaID] = media
+	s.cacheMu.Unlock()
+	return media.Episodes
 }
 
 func (p *activePlayback) stop() {
@@ -292,6 +502,7 @@ func (s *Service) navigate(active *activePlayback, delta int, saveCurrent bool) 
 	active.lastSaved = time.Now()
 	active.subtitlePending = stream.Subtitle != ""
 	active.complete = false
+	active.synced = false
 	s.logger.Printf("playback navigated media_id=%d episode=%d", episode.MediaID, episode.Number)
 	_ = active.session.ShowText(active.ctx, fmt.Sprintf("Episode %d", episode.Number))
 }

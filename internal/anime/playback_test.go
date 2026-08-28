@@ -105,10 +105,96 @@ type memoryState struct {
 	mu       sync.Mutex
 	mapping  string
 	progress map[[2]int]store.Progress
+	media    map[int]store.MediaInfo
+	queue    []store.SyncItem
+	nextID   int64
+	failures []string
 }
 
 func newMemoryState() *memoryState {
-	return &memoryState{progress: make(map[[2]int]store.Progress)}
+	return &memoryState{
+		progress: make(map[[2]int]store.Progress),
+		media:    make(map[int]store.MediaInfo),
+	}
+}
+
+func (s *memoryState) SaveMedia(_ context.Context, media store.MediaInfo) error {
+	s.mu.Lock()
+	s.media[media.ID] = media
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *memoryState) MediaProgress(_ context.Context, mediaID int) (store.Progress, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var latest store.Progress
+	found := false
+	for key, progress := range s.progress {
+		if key[0] == mediaID && (!found || progress.Episode > latest.Episode) {
+			latest, found = progress, true
+		}
+	}
+	return latest, found, nil
+}
+
+func (s *memoryState) ResumeEntries(_ context.Context, _ int) ([]store.ResumeEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var entries []store.ResumeEntry
+	for key, progress := range s.progress {
+		media := s.media[key[0]]
+		entries = append(entries, store.ResumeEntry{
+			MediaID: key[0], Title: media.Title, TotalEpisodes: media.Episodes,
+			Episode: progress.Episode, Position: progress.Position, Complete: progress.Complete,
+		})
+	}
+	return entries, nil
+}
+
+func (s *memoryState) EnqueueSync(_ context.Context, mediaID, episode int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, item := range s.queue {
+		if item.MediaID == mediaID && item.Episode == episode {
+			return nil
+		}
+	}
+	s.nextID++
+	s.queue = append(s.queue, store.SyncItem{ID: s.nextID, MediaID: mediaID, Episode: episode})
+	return nil
+}
+
+func (s *memoryState) PendingSyncs(_ context.Context, _ int) ([]store.SyncItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]store.SyncItem(nil), s.queue...), nil
+}
+
+func (s *memoryState) DeleteSync(_ context.Context, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	remaining := s.queue[:0]
+	for _, item := range s.queue {
+		if item.ID != id {
+			remaining = append(remaining, item)
+		}
+	}
+	s.queue = remaining
+	return nil
+}
+
+func (s *memoryState) RecordSyncFailure(_ context.Context, _ int64, reason string) error {
+	s.mu.Lock()
+	s.failures = append(s.failures, reason)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *memoryState) pendingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.queue)
 }
 
 func (s *memoryState) ProviderMapping(context.Context, int, string) (string, bool, error) {
@@ -152,7 +238,7 @@ func TestPlaybackAutoNextAndPrevious(t *testing.T) {
 	state.progress[[2]int{154587, 1}] = store.Progress{MediaID: 154587, Episode: 1, Position: 42}
 	config := DefaultConfig()
 	config.ResumeRewind = 5
-	service := NewService(client, navigationProvider{}, player, state, nil, config, nil)
+	service := NewService(client, navigationProvider{}, player, state, nil, nil, config, nil)
 	defer service.Close()
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
 		t.Fatal(err)
@@ -195,7 +281,7 @@ func TestPlaybackCanDisableAutoNextAndResume(t *testing.T) {
 	config := DefaultConfig()
 	config.AutoNext = false
 	config.Resume = false
-	service := NewService(client, navigationProvider{}, player, state, nil, config, nil)
+	service := NewService(client, navigationProvider{}, player, state, nil, nil, config, nil)
 	defer service.Close()
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
 		t.Fatal(err)

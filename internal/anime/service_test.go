@@ -50,7 +50,7 @@ func (fakePreviewCache) Get(context.Context, int, string) (string, error) {
 
 func TestEpisodesUsesMediaCachedBySearch(t *testing.T) {
 	client := &cachingAniList{}
-	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, nil, DefaultConfig(), nil)
+	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, nil, nil, DefaultConfig(), nil)
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestEpisodesUsesMediaCachedBySearch(t *testing.T) {
 
 func TestSearchUsesLocalPreviewPath(t *testing.T) {
 	client := &cachingAniList{}
-	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, fakePreviewCache{}, DefaultConfig(), nil)
+	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, fakePreviewCache{}, nil, DefaultConfig(), nil)
 	results, err := service.Search(t.Context(), "frieren")
 	if err != nil {
 		t.Fatal(err)
