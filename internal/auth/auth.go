@@ -34,9 +34,11 @@ func AuthorizeURL(clientID string) (string, error) {
 	if clientID == "" {
 		return "", errors.New("no AniList client ID is configured")
 	}
+	// AniList's implicit grant accepts only these parameters and takes the
+	// redirect from the application settings; sending redirect_uri here is
+	// rejected with unsupported_grant_type.
 	query := url.Values{
 		"client_id":     {clientID},
-		"redirect_uri":  {RedirectURI},
 		"response_type": {"token"},
 	}
 	return authorizeEndpoint + "?" + query.Encode(), nil

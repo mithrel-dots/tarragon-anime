@@ -17,10 +17,12 @@ func TestAuthorizeURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := parsed.Query()
-	if query.Get("client_id") != DefaultClientID ||
-		query.Get("response_type") != "token" ||
-		query.Get("redirect_uri") != RedirectURI {
+	if query.Get("client_id") != DefaultClientID || query.Get("response_type") != "token" {
 		t.Fatalf("authorize query = %#v", query)
+	}
+	// AniList rejects the request when a redirect is supplied explicitly.
+	if _, ok := query["redirect_uri"]; ok {
+		t.Fatalf("authorize query included redirect_uri: %#v", query)
 	}
 	if _, err := AuthorizeURL(" "); err == nil {
 		t.Fatal("AuthorizeURL() accepted an empty client ID")
