@@ -39,6 +39,15 @@ func (f *fakeSync) SaveProgress(_ context.Context, _ int, progress int, status s
 	return anilist.ListEntry{Progress: progress, Status: status}, nil
 }
 
+func (f *fakeSync) Viewer(context.Context) (anilist.Viewer, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail != nil {
+		return anilist.Viewer{}, f.fail
+	}
+	return anilist.Viewer{ID: 1, Name: "mithrel"}, nil
+}
+
 func (f *fakeSync) savedProgress() []int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

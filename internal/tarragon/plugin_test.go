@@ -19,6 +19,13 @@ type fakeAnimeService struct {
 
 func (f *fakeAnimeService) SignedIn() bool { return f.signedIn }
 
+func (f *fakeAnimeService) Account(context.Context) string {
+	if f.signedIn {
+		return "mithrel"
+	}
+	return ""
+}
+
 func (f *fakeAnimeService) StartLogin(context.Context) error {
 	f.loggedIn = true
 	return nil
@@ -162,8 +169,21 @@ func TestPluginHidesSignInWhenAuthenticated(t *testing.T) {
 	service := &fakeAnimeService{signedIn: true}
 	plugin := NewPlugin(service, "anime", "anime", "@", log.New(io.Discard, "", 0))
 	payload := plugin.Request(t.Context(), "empty-query", "")
-	if len(payload.Results) != 1 || payload.Results[0].ID != "media:154587" {
+	if len(payload.Results) != 2 || payload.Results[0].ID != "media:154587" {
 		t.Fatalf("results = %#v", payload.Results)
+	}
+	status := payload.Results[1]
+	if status.ID != "auth:status" || len(status.Actions) != 0 || status.Description != "Signed in as mithrel" {
+		t.Fatalf("status result = %#v", status)
+	}
+	success, message := plugin.Select(t.Context(), Message{
+		QueryID: "empty-query", ResultID: "auth:status", Action: "", Plugin: "anime",
+	})
+	if !success || message != "Already signed in to AniList" {
+		t.Fatalf("Select() = %v, %q", success, message)
+	}
+	if service.loggedIn || service.loggedOut {
+		t.Fatal("status selection changed authentication state")
 	}
 }
 

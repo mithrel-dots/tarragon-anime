@@ -48,6 +48,7 @@ type stateStore interface {
 type syncClient interface {
 	ListEntry(context.Context, int) (anilist.ListEntry, bool, error)
 	SaveProgress(context.Context, int, int, string) (anilist.ListEntry, error)
+	Viewer(context.Context) (anilist.Viewer, error)
 }
 
 type previewCache interface {
@@ -87,6 +88,10 @@ type Service struct {
 	active     *activePlayback
 
 	syncMu sync.Mutex
+
+	accountMu    sync.Mutex
+	accountToken string
+	accountName  string
 }
 
 type activePlayback struct {
@@ -153,6 +158,30 @@ func (s *Service) StartLogin(context.Context) error {
 	return nil
 }
 
+// Account returns the signed-in AniList username, caching it per token so the
+// launcher does not query AniList on every keystroke.
+func (s *Service) Account(ctx context.Context) string {
+	if s.tokens == nil || s.sync == nil {
+		return ""
+	}
+	token, err := s.tokens.Token()
+	if err != nil || token == "" {
+		return ""
+	}
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if s.accountToken == token {
+		return s.accountName
+	}
+	viewer, err := s.sync.Viewer(ctx)
+	if err != nil {
+		s.logger.Printf("look up AniList account: %v", err)
+		return ""
+	}
+	s.accountToken, s.accountName = token, viewer.Name
+	return s.accountName
+}
+
 // Logout removes the stored AniList token.
 func (s *Service) Logout(context.Context) error {
 	if s.tokens == nil {
@@ -161,6 +190,9 @@ func (s *Service) Logout(context.Context) error {
 	if err := s.tokens.Delete(); err != nil {
 		return err
 	}
+	s.accountMu.Lock()
+	s.accountToken, s.accountName = "", ""
+	s.accountMu.Unlock()
 	s.logger.Printf("AniList signed out")
 	return nil
 }

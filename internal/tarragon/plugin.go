@@ -18,6 +18,7 @@ type animeService interface {
 	ContinueWatching(context.Context, int) ([]anime.Resume, error)
 	ResumeMedia(context.Context, int) error
 	SignedIn() bool
+	Account(context.Context) string
 	StartLogin(context.Context) error
 	Logout(context.Context) error
 }
@@ -111,14 +112,7 @@ func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
 		p.storeSelection(queryID, selections)
 		return Payload{Results: results}
 	case anime.CommandLogin:
-		label, description := "Sign in to AniList", "Authorize progress synchronization in your browser"
-		if p.service.SignedIn() {
-			description = "Already signed in; run again to reauthorize"
-		}
-		return Payload{Results: []Result{{
-			ID: "auth:login", Label: label, Description: description, Score: 1,
-			Icon: "system-users", Category: "anime", Actions: []Action{{Name: "login"}},
-		}}}
+		return Payload{Results: []Result{p.accountResult(ctx, 1)}}
 	case anime.CommandLogout:
 		if !p.service.SignedIn() {
 			return Payload{Results: []Result{{
@@ -144,6 +138,9 @@ func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
 func (p *Plugin) Select(ctx context.Context, message Message) (bool, string) {
 	if message.Plugin != "" && message.Plugin != p.pluginID {
 		return false, "Selection was routed to the wrong plugin"
+	}
+	if message.ResultID == "auth:status" {
+		return true, "Already signed in to AniList"
 	}
 	switch message.Action {
 	case "login":
@@ -211,18 +208,32 @@ func (p *Plugin) continueWatching(ctx context.Context, queryID string) Payload {
 			},
 		})
 	}
-	// Surfacing sign-in here keeps progress synchronization discoverable
+	// Surfacing account state here keeps progress synchronization discoverable
 	// without requiring the user to know the login command.
-	if !p.service.SignedIn() {
-		results = append(results, Result{
-			ID: "auth:login", Label: "Sign in to AniList",
-			Description: "Authorize progress synchronization in your browser",
-			Score:       resultScore(len(results)), Icon: "system-users", Category: "anime",
-			Actions: []Action{{Name: "login"}},
-		})
-	}
+	results = append(results, p.accountResult(ctx, resultScore(len(results))))
 	p.storeSelection(queryID, selections)
 	return Payload{Results: results}
+}
+
+// accountResult reports AniList sign-in state. When already signed in the
+// result is informational and exposes no actions.
+func (p *Plugin) accountResult(ctx context.Context, score float64) Result {
+	if !p.service.SignedIn() {
+		return Result{
+			ID: "auth:login", Label: "Sign in to AniList",
+			Description: "Authorize progress synchronization in your browser",
+			Score:       score, Icon: "system-users", Category: "anime",
+			Actions: []Action{{Name: "login"}},
+		}
+	}
+	description := "Progress synchronization is active"
+	if name := p.service.Account(ctx); name != "" {
+		description = fmt.Sprintf("Signed in as %s", name)
+	}
+	return Result{
+		ID: "auth:status", Label: "AniList connected", Description: description,
+		Score: score, Icon: "system-users", Category: "anime",
+	}
 }
 
 func (p *Plugin) storeSelection(queryID string, selection map[string]selection) {
