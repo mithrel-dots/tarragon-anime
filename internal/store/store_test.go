@@ -43,6 +43,71 @@ func TestStorePersistsMappingsAndProgress(t *testing.T) {
 	}
 }
 
+func TestStoreResumeEntriesAndSyncQueue(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "anime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if err := state.SaveMedia(t.Context(), MediaInfo{ID: 1, Title: "Frieren", PreviewPath: "/tmp/1.jpg", Episodes: 28}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveProgress(t.Context(), Progress{MediaID: 1, Episode: 3, Position: 120, Duration: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.SaveProgress(t.Context(), Progress{MediaID: 1, Episode: 4, Position: 30, Duration: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := state.ResumeEntries(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Episode != 4 || entries[0].Title != "Frieren" || entries[0].TotalEpisodes != 28 {
+		t.Fatalf("ResumeEntries() = %#v", entries)
+	}
+	progress, found, err := state.MediaProgress(t.Context(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || progress.Episode != 4 {
+		t.Fatalf("MediaProgress() = %#v, %v", progress, found)
+	}
+
+	if err := state.EnqueueSync(t.Context(), 1, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.EnqueueSync(t.Context(), 1, 4); err != nil {
+		t.Fatal(err)
+	}
+	items, err := state.PendingSyncs(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Episode != 4 {
+		t.Fatalf("PendingSyncs() = %#v", items)
+	}
+	if err := state.RecordSyncFailure(t.Context(), items[0].ID, "offline"); err != nil {
+		t.Fatal(err)
+	}
+	items, err = state.PendingSyncs(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Attempts != 1 {
+		t.Fatalf("PendingSyncs() after failure = %#v", items)
+	}
+	if err := state.DeleteSync(t.Context(), items[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	items, err = state.PendingSyncs(t.Context(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("PendingSyncs() after delete = %#v", items)
+	}
+}
+
 func TestStoreUpdatesProgress(t *testing.T) {
 	state, err := Open(filepath.Join(t.TempDir(), "anime.db"))
 	if err != nil {
