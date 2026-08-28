@@ -161,8 +161,8 @@ func (c *Client) SaveProgress(ctx context.Context, mediaID, progress int, status
 	return response.Entry, nil
 }
 
-func (c *Client) List(ctx context.Context, status string) ([]ListItem, error) {
-	const gql = `query ($status: MediaListStatus!) { MediaListCollection(type: ANIME, status: $status) { lists { entries { status progress media { ` + mediaFields + ` } } } } }`
+func (c *Client) List(ctx context.Context, userID int, status string) ([]ListItem, error) {
+	const gql = `query ($userId: Int!, $status: MediaListStatus!) { MediaListCollection(userId: $userId, type: ANIME, status: $status) { lists { entries { status progress media { ` + mediaFields + ` } } } } }`
 	var response struct {
 		Collection struct {
 			Lists []struct {
@@ -174,7 +174,7 @@ func (c *Client) List(ctx context.Context, status string) ([]ListItem, error) {
 			} `json:"lists"`
 		} `json:"MediaListCollection"`
 	}
-	if err := c.do(ctx, gql, map[string]any{"status": status}, &response); err != nil {
+	if err := c.do(ctx, gql, map[string]any{"userId": userID, "status": status}, &response); err != nil {
 		return nil, fmt.Errorf("list AniList media with status %s: %w", status, err)
 	}
 	var items []ListItem

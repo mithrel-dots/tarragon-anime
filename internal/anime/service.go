@@ -48,7 +48,7 @@ type stateStore interface {
 type syncClient interface {
 	ListEntry(context.Context, int) (anilist.ListEntry, bool, error)
 	SaveProgress(context.Context, int, int, string) (anilist.ListEntry, error)
-	List(context.Context, string) ([]anilist.ListItem, error)
+	List(context.Context, int, string) ([]anilist.ListItem, error)
 	SetStatus(context.Context, int, string) error
 	Viewer(context.Context) (anilist.Viewer, error)
 }
@@ -203,7 +203,11 @@ func (s *Service) List(ctx context.Context, status string) ([]ListItem, error) {
 	if s.sync == nil {
 		return nil, fmt.Errorf("AniList list access is unavailable")
 	}
-	items, err := s.sync.List(ctx, status)
+	viewer, err := s.sync.Viewer(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get AniList viewer for list: %w", err)
+	}
+	items, err := s.sync.List(ctx, viewer.ID, status)
 	if err != nil {
 		return nil, err
 	}

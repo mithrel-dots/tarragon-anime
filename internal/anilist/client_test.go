@@ -98,6 +98,9 @@ func TestAuthenticatedListOperations(t *testing.T) {
 			t.Fatal(err)
 		}
 		if requests == 1 {
+			if request.Variables["userId"] != float64(1) {
+				t.Fatalf("userId variable = %#v", request.Variables["userId"])
+			}
 			if request.Variables["status"] != "CURRENT" {
 				t.Fatalf("status variable = %#v", request.Variables["status"])
 			}
@@ -108,7 +111,7 @@ func TestAuthenticatedListOperations(t *testing.T) {
 	}))
 	defer server.Close()
 	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, func() (string, error) { return "test-token", nil })
-	items, err := client.List(t.Context(), "CURRENT")
+	items, err := client.List(t.Context(), 1, "CURRENT")
 	if err != nil {
 		t.Fatal(err)
 	}
