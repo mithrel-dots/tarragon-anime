@@ -45,3 +45,41 @@ func TestGraphQLError(t *testing.T) {
 		t.Fatal("Search() error = nil")
 	}
 }
+
+func TestAuthenticatedProgressOperations(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+		}
+		var request struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.Variables["progress"] != nil {
+			_, _ = w.Write([]byte(`{"data":{"SaveMediaListEntry":{"id":9,"status":"CURRENT","progress":4}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"Media":{"mediaListEntry":{"id":9,"status":"CURRENT","progress":3}}}}`))
+	}))
+	defer server.Close()
+	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, "test-token")
+	entry, found, err := client.ListEntry(t.Context(), 154587)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || entry.Progress != 3 {
+		t.Fatalf("ListEntry() = %#v, %v", entry, found)
+	}
+	entry, err = client.SaveProgress(t.Context(), 154587, 4, "CURRENT")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Progress != 4 || requests != 2 {
+		t.Fatalf("SaveProgress() = %#v, requests = %d", entry, requests)
+	}
+}

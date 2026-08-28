@@ -13,6 +13,7 @@ const defaultEndpoint = "https://graphql.anilist.co"
 type Client struct {
 	endpoint string
 	http     *http.Client
+	token    string
 }
 
 type Media struct {
@@ -38,6 +39,29 @@ func NewClientWithEndpoint(httpClient *http.Client, endpoint string) *Client {
 	c := NewClient(httpClient)
 	c.endpoint = endpoint
 	return c
+}
+
+func NewAuthenticatedClient(httpClient *http.Client, token string) *Client {
+	c := NewClient(httpClient)
+	c.token = token
+	return c
+}
+
+func NewAuthenticatedClientWithEndpoint(httpClient *http.Client, endpoint, token string) *Client {
+	c := NewClientWithEndpoint(httpClient, endpoint)
+	c.token = token
+	return c
+}
+
+type ListEntry struct {
+	ID       int
+	Status   string
+	Progress int
+}
+
+type Viewer struct {
+	ID   int
+	Name string
 }
 
 const mediaFields = `_id: id title { romaji english native } synonyms format episodes coverImage { large }`
@@ -71,6 +95,54 @@ func (c *Client) Get(ctx context.Context, id int) (Media, error) {
 		return Media{}, fmt.Errorf("get AniList media %d: not found", id)
 	}
 	return response.Media.toMedia(), nil
+}
+
+func (c *Client) Viewer(ctx context.Context) (Viewer, error) {
+	if c.token == "" {
+		return Viewer{}, fmt.Errorf("AniList authentication is not configured")
+	}
+	const gql = `query { Viewer { id name } }`
+	var response struct {
+		Viewer Viewer `json:"Viewer"`
+	}
+	if err := c.do(ctx, gql, nil, &response); err != nil {
+		return Viewer{}, fmt.Errorf("get AniList viewer: %w", err)
+	}
+	return response.Viewer, nil
+}
+
+func (c *Client) ListEntry(ctx context.Context, mediaID int) (ListEntry, bool, error) {
+	if c.token == "" {
+		return ListEntry{}, false, fmt.Errorf("AniList authentication is not configured")
+	}
+	const gql = `query ($id: Int!) { Media(id: $id, type: ANIME) { mediaListEntry { id status progress } } }`
+	var response struct {
+		Media struct {
+			Entry *ListEntry `json:"mediaListEntry"`
+		} `json:"Media"`
+	}
+	if err := c.do(ctx, gql, map[string]any{"id": mediaID}, &response); err != nil {
+		return ListEntry{}, false, fmt.Errorf("get AniList progress for media %d: %w", mediaID, err)
+	}
+	if response.Media.Entry == nil {
+		return ListEntry{}, false, nil
+	}
+	return *response.Media.Entry, true, nil
+}
+
+func (c *Client) SaveProgress(ctx context.Context, mediaID, progress int, status string) (ListEntry, error) {
+	if c.token == "" {
+		return ListEntry{}, fmt.Errorf("AniList authentication is not configured")
+	}
+	const gql = `mutation ($mediaId: Int!, $progress: Int!, $status: MediaListStatus) { SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status) { id status progress } }`
+	variables := map[string]any{"mediaId": mediaID, "progress": progress, "status": status}
+	var response struct {
+		Entry ListEntry `json:"SaveMediaListEntry"`
+	}
+	if err := c.do(ctx, gql, variables, &response); err != nil {
+		return ListEntry{}, fmt.Errorf("save AniList progress for media %d: %w", mediaID, err)
+	}
+	return response.Entry, nil
 }
 
 type mediaResponse struct {
@@ -114,6 +186,9 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
