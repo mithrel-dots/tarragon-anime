@@ -14,12 +14,12 @@ type cachingAniList struct {
 }
 
 func (c *cachingAniList) Search(context.Context, string) ([]anilist.Media, error) {
-	return []anilist.Media{{ID: 154587, Title: "Frieren", English: "Frieren", Episodes: 28}}, nil
+	return []anilist.Media{{ID: 154587, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}}, nil
 }
 
 func (c *cachingAniList) Get(context.Context, int) (anilist.Media, error) {
 	c.getCalls++
-	return anilist.Media{ID: 154587, Title: "Frieren", English: "Frieren", Episodes: 28}, nil
+	return anilist.Media{ID: 154587, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}, nil
 }
 
 type cachingProvider struct{}
@@ -42,9 +42,15 @@ func (unusedPlayer) Play(context.Context, mpv.Stream, string, float64) (mpv.Sess
 	return nil, nil
 }
 
+type fakePreviewCache struct{}
+
+func (fakePreviewCache) Get(context.Context, int, string) (string, error) {
+	return "/tmp/tarragon-anime-cover.jpg", nil
+}
+
 func TestEpisodesUsesMediaCachedBySearch(t *testing.T) {
 	client := &cachingAniList{}
-	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, DefaultConfig(), nil)
+	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, nil, DefaultConfig(), nil)
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
 		t.Fatal(err)
 	}
@@ -53,5 +59,17 @@ func TestEpisodesUsesMediaCachedBySearch(t *testing.T) {
 	}
 	if client.getCalls != 0 {
 		t.Fatalf("AniList Get() calls = %d, want 0", client.getCalls)
+	}
+}
+
+func TestSearchUsesLocalPreviewPath(t *testing.T) {
+	client := &cachingAniList{}
+	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, fakePreviewCache{}, DefaultConfig(), nil)
+	results, err := service.Search(t.Context(), "frieren")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].CoverURL != "/tmp/tarragon-anime-cover.jpg" {
+		t.Fatalf("Search() = %#v", results)
 	}
 }

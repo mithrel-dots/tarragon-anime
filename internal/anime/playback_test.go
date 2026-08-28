@@ -152,7 +152,7 @@ func TestPlaybackAutoNextAndPrevious(t *testing.T) {
 	state.progress[[2]int{154587, 1}] = store.Progress{MediaID: 154587, Episode: 1, Position: 42}
 	config := DefaultConfig()
 	config.ResumeRewind = 5
-	service := NewService(client, navigationProvider{}, player, state, config, nil)
+	service := NewService(client, navigationProvider{}, player, state, nil, config, nil)
 	defer service.Close()
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
 		t.Fatal(err)
@@ -195,7 +195,7 @@ func TestPlaybackCanDisableAutoNextAndResume(t *testing.T) {
 	config := DefaultConfig()
 	config.AutoNext = false
 	config.Resume = false
-	service := NewService(client, navigationProvider{}, player, state, config, nil)
+	service := NewService(client, navigationProvider{}, player, state, nil, config, nil)
 	defer service.Close()
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
 		t.Fatal(err)

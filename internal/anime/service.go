@@ -37,11 +37,16 @@ type stateStore interface {
 	SaveProgress(context.Context, store.Progress) error
 }
 
+type previewCache interface {
+	Get(context.Context, int, string) (string, error)
+}
+
 type Service struct {
 	anilist  aniListClient
 	provider providerClient
 	player   player
 	state    stateStore
+	preview  previewCache
 	config   Config
 	logger   *log.Logger
 
@@ -69,12 +74,12 @@ type activePlayback struct {
 	closeOnce       sync.Once
 }
 
-func NewService(anilistClient aniListClient, provider providerClient, player player, state stateStore, config Config, logger *log.Logger) *Service {
+func NewService(anilistClient aniListClient, provider providerClient, player player, state stateStore, previews previewCache, config Config, logger *log.Logger) *Service {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Service{
-		anilist: anilistClient, provider: provider, player: player, state: state,
+		anilist: anilistClient, provider: provider, player: player, state: state, preview: previews,
 		config: config, logger: logger, media: make(map[int]anilist.Media),
 		episodes: make(map[int][]Episode),
 	}
@@ -92,7 +97,16 @@ func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
 	s.cacheMu.Lock()
 	for _, item := range items {
 		s.media[item.ID] = item
-		result = append(result, mediaFromAniList(item))
+		media := mediaFromAniList(item)
+		if s.preview != nil && item.CoverURL != "" {
+			path, err := s.preview.Get(ctx, item.ID, item.CoverURL)
+			if err != nil {
+				s.logger.Printf("cache preview media_id=%d: %v", item.ID, err)
+			} else {
+				media.CoverURL = path
+			}
+		}
+		result = append(result, media)
 	}
 	s.cacheMu.Unlock()
 	return result, nil

@@ -13,6 +13,7 @@ import (
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/anime"
 	"tarragon-anime/internal/mpv"
+	"tarragon-anime/internal/preview"
 	"tarragon-anime/internal/provider/allanime"
 	"tarragon-anime/internal/store"
 	"tarragon-anime/internal/tarragon"
@@ -62,12 +63,17 @@ func run() error {
 		return fmt.Errorf("open state %s: %w", statePath, err)
 	}
 	defer state.Close()
+	previewDir, err := preview.DefaultDir()
+	if err != nil {
+		return err
+	}
 
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	aniListClient := anilist.NewClient(httpClient)
 	provider := allanime.NewClient(httpClient)
 	player := mpv.New(config.MPVArgs, logger)
-	service := anime.NewService(aniListClient, provider, player, state, config, logger)
+	previews := preview.NewCache(httpClient, previewDir)
+	service := anime.NewService(aniListClient, provider, player, state, previews, config, logger)
 	defer service.Close()
 	plugin := tarragon.NewPlugin(service, name, prefix, prefixSymbol, logger)
 	daemon := tarragon.NewDaemon(endpoint, name, plugin, logger)
