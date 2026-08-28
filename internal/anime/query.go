@@ -12,6 +12,8 @@ const (
 	CommandSearch Command = iota
 	CommandEpisodes
 	CommandPlay
+	CommandLogin
+	CommandLogout
 )
 
 type Query struct {
@@ -34,6 +36,10 @@ func ParseQuery(input string) (Query, error) {
 			return Query{}, fmt.Errorf("search requires a title")
 		}
 		return Query{Command: CommandSearch, Text: strings.Join(fields[1:], " ")}, nil
+	case "login":
+		return Query{Command: CommandLogin}, nil
+	case "logout":
+		return Query{Command: CommandLogout}, nil
 	case "episodes":
 		if len(fields) != 2 {
 			return Query{}, fmt.Errorf("usage: episodes <anilist-id>")

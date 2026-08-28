@@ -1,5 +1,7 @@
 PREFIX ?= $(HOME)/.local
 PLUGIN_DIR ?= $(PREFIX)/lib/tarragon/plugins/anime
+DESKTOP_DIR ?= $(PREFIX)/share/applications
+DESKTOP_FILE ?= $(DESKTOP_DIR)/tarragon-anime.desktop
 
 .PHONY: check-deps install uninstall run
 
@@ -8,12 +10,26 @@ check-deps:
 	@command -v mpv >/dev/null || { printf '%s\n' 'mpv is required' >&2; exit 1; }
 
 install: check-deps
-	install -d "$(PLUGIN_DIR)"
+	install -d "$(PLUGIN_DIR)" "$(DESKTOP_DIR)"
 	go build -o "$(PLUGIN_DIR)/tarragon-anime" ./cmd/anime
 	install -m 0644 plugin.toml "$(PLUGIN_DIR)/plugin.toml"
+	printf '%s\n' \
+		'[Desktop Entry]' \
+		'Type=Application' \
+		'Name=Tarragon Anime AniList Login' \
+		'Comment=Receives the AniList OAuth callback' \
+		'Exec=$(PLUGIN_DIR)/tarragon-anime auth %u' \
+		'Terminal=false' \
+		'NoDisplay=true' \
+		'MimeType=x-scheme-handler/tarragon-anime;' \
+		> "$(DESKTOP_FILE)"
+	@command -v update-desktop-database >/dev/null && update-desktop-database "$(DESKTOP_DIR)" || true
+	@command -v xdg-mime >/dev/null && xdg-mime default tarragon-anime.desktop x-scheme-handler/tarragon-anime || true
 
 uninstall:
 	rm -rf "$(PLUGIN_DIR)"
+	rm -f "$(DESKTOP_FILE)"
+	@command -v update-desktop-database >/dev/null && update-desktop-database "$(DESKTOP_DIR)" || true
 
 run: check-deps
 	go run ./cmd/anime

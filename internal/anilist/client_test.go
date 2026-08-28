@@ -67,7 +67,7 @@ func TestAuthenticatedProgressOperations(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":{"Media":{"mediaListEntry":{"id":9,"status":"CURRENT","progress":3}}}}`))
 	}))
 	defer server.Close()
-	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, "test-token")
+	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, func() (string, error) { return "test-token", nil })
 	entry, found, err := client.ListEntry(t.Context(), 154587)
 	if err != nil {
 		t.Fatal(err)

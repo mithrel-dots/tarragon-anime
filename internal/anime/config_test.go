@@ -56,23 +56,3 @@ func TestLoadConfigMissingUsesDefaults(t *testing.T) {
 		t.Fatalf("Sync = %#v", got.Sync)
 	}
 }
-
-func TestLoadTokenRequiresPrivatePermissions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(path, []byte("secret\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadToken(path); err == nil {
-		t.Fatal("LoadToken() accepted public permissions")
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	token, err := LoadToken(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if token != "secret" {
-		t.Fatalf("LoadToken() = %q", token)
-	}
-}

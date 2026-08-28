@@ -10,10 +10,14 @@ import (
 
 const defaultEndpoint = "https://graphql.anilist.co"
 
+// TokenSource returns the current AniList access token, or an empty string
+// when the user is signed out.
+type TokenSource func() (string, error)
+
 type Client struct {
 	endpoint string
 	http     *http.Client
-	token    string
+	token    TokenSource
 }
 
 type Media struct {
@@ -41,16 +45,31 @@ func NewClientWithEndpoint(httpClient *http.Client, endpoint string) *Client {
 	return c
 }
 
-func NewAuthenticatedClient(httpClient *http.Client, token string) *Client {
+func NewAuthenticatedClient(httpClient *http.Client, token TokenSource) *Client {
 	c := NewClient(httpClient)
 	c.token = token
 	return c
 }
 
-func NewAuthenticatedClientWithEndpoint(httpClient *http.Client, endpoint, token string) *Client {
+func NewAuthenticatedClientWithEndpoint(httpClient *http.Client, endpoint string, token TokenSource) *Client {
 	c := NewClientWithEndpoint(httpClient, endpoint)
 	c.token = token
 	return c
+}
+
+// accessToken reports the current token, requiring the user to be signed in.
+func (c *Client) accessToken() (string, error) {
+	if c.token == nil {
+		return "", fmt.Errorf("AniList authentication is not configured")
+	}
+	token, err := c.token()
+	if err != nil {
+		return "", err
+	}
+	if token == "" {
+		return "", fmt.Errorf("not signed in to AniList")
+	}
+	return token, nil
 }
 
 type ListEntry struct {
@@ -98,9 +117,6 @@ func (c *Client) Get(ctx context.Context, id int) (Media, error) {
 }
 
 func (c *Client) Viewer(ctx context.Context) (Viewer, error) {
-	if c.token == "" {
-		return Viewer{}, fmt.Errorf("AniList authentication is not configured")
-	}
 	const gql = `query { Viewer { id name } }`
 	var response struct {
 		Viewer Viewer `json:"Viewer"`
@@ -112,9 +128,6 @@ func (c *Client) Viewer(ctx context.Context) (Viewer, error) {
 }
 
 func (c *Client) ListEntry(ctx context.Context, mediaID int) (ListEntry, bool, error) {
-	if c.token == "" {
-		return ListEntry{}, false, fmt.Errorf("AniList authentication is not configured")
-	}
 	const gql = `query ($id: Int!) { Media(id: $id, type: ANIME) { mediaListEntry { id status progress } } }`
 	var response struct {
 		Media struct {
@@ -131,9 +144,6 @@ func (c *Client) ListEntry(ctx context.Context, mediaID int) (ListEntry, bool, e
 }
 
 func (c *Client) SaveProgress(ctx context.Context, mediaID, progress int, status string) (ListEntry, error) {
-	if c.token == "" {
-		return ListEntry{}, fmt.Errorf("AniList authentication is not configured")
-	}
 	const gql = `mutation ($mediaId: Int!, $progress: Int!, $status: MediaListStatus) { SaveMediaListEntry(mediaId: $mediaId, progress: $progress, status: $status) { id status progress } }`
 	variables := map[string]any{"mediaId": mediaID, "progress": progress, "status": status}
 	var response struct {
@@ -186,8 +196,12 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != nil {
+		token, err := c.accessToken()
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.http.Do(req)

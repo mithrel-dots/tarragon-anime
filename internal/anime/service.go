@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"tarragon-anime/internal/anilist"
+	"tarragon-anime/internal/auth"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/provider/allanime"
 	"tarragon-anime/internal/store"
@@ -53,6 +54,19 @@ type previewCache interface {
 	Get(context.Context, int, string) (string, error)
 }
 
+// tokenStore exposes AniList sign-in state so sync activates as soon as a
+// token is saved, without restarting the plugin.
+type tokenStore interface {
+	Token() (string, error)
+	Save(string) error
+	Delete() error
+}
+
+// browser opens the AniList consent page in the user's default browser.
+type browser interface {
+	Open(string) error
+}
+
 type Service struct {
 	anilist  aniListClient
 	provider providerClient
@@ -60,6 +74,8 @@ type Service struct {
 	state    stateStore
 	preview  previewCache
 	sync     syncClient
+	tokens   tokenStore
+	browser  browser
 	config   Config
 	logger   *log.Logger
 
@@ -99,6 +115,54 @@ func NewService(anilistClient aniListClient, provider providerClient, player pla
 		sync: syncer, config: config, logger: logger, media: make(map[int]anilist.Media),
 		episodes: make(map[int][]Episode),
 	}
+}
+
+// WithAuth enables the AniList sign-in commands.
+func (s *Service) WithAuth(tokens tokenStore, opener browser) *Service {
+	s.tokens = tokens
+	s.browser = opener
+	return s
+}
+
+// SignedIn reports whether an AniList token is currently stored.
+func (s *Service) SignedIn() bool {
+	if s.tokens == nil {
+		return false
+	}
+	token, err := s.tokens.Token()
+	if err != nil {
+		s.logger.Printf("read AniList token: %v", err)
+		return false
+	}
+	return token != ""
+}
+
+// StartLogin opens the AniList consent page for the implicit grant.
+func (s *Service) StartLogin(context.Context) error {
+	if s.browser == nil {
+		return fmt.Errorf("AniList sign-in is unavailable")
+	}
+	url, err := auth.AuthorizeURL(s.config.ClientID)
+	if err != nil {
+		return err
+	}
+	if err := s.browser.Open(url); err != nil {
+		return fmt.Errorf("open AniList sign-in: %w", err)
+	}
+	s.logger.Printf("AniList sign-in started")
+	return nil
+}
+
+// Logout removes the stored AniList token.
+func (s *Service) Logout(context.Context) error {
+	if s.tokens == nil {
+		return fmt.Errorf("AniList sign-in is unavailable")
+	}
+	if err := s.tokens.Delete(); err != nil {
+		return err
+	}
+	s.logger.Printf("AniList signed out")
+	return nil
 }
 
 func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
@@ -365,7 +429,11 @@ func (s *Service) Run(ctx context.Context) {
 }
 
 func (s *Service) syncEnabled() bool {
-	return s.config.Sync.Enabled && s.sync != nil && s.state != nil
+	if !s.config.Sync.Enabled || s.sync == nil || s.state == nil {
+		return false
+	}
+	// Queued updates are retained until the user signs in.
+	return s.tokens == nil || s.SignedIn()
 }
 
 func (s *Service) queueSync(active *activePlayback) {

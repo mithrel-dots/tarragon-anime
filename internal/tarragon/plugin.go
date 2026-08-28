@@ -17,6 +17,9 @@ type animeService interface {
 	PlayEpisode(context.Context, anime.Episode) error
 	ContinueWatching(context.Context, int) ([]anime.Resume, error)
 	ResumeMedia(context.Context, int) error
+	SignedIn() bool
+	StartLogin(context.Context) error
+	Logout(context.Context) error
 }
 
 // selection records what an atomic action should act on, because Tarragon only
@@ -107,6 +110,27 @@ func (p *Plugin) Request(ctx context.Context, queryID, text string) Payload {
 		}
 		p.storeSelection(queryID, selections)
 		return Payload{Results: results}
+	case anime.CommandLogin:
+		label, description := "Sign in to AniList", "Authorize progress synchronization in your browser"
+		if p.service.SignedIn() {
+			description = "Already signed in; run again to reauthorize"
+		}
+		return Payload{Results: []Result{{
+			ID: "auth:login", Label: label, Description: description, Score: 1,
+			Icon: "system-users", Category: "anime", Actions: []Action{{Name: "login"}},
+		}}}
+	case anime.CommandLogout:
+		if !p.service.SignedIn() {
+			return Payload{Results: []Result{{
+				ID: "auth:logout", Label: "Not signed in to AniList",
+				Score: 1, Icon: "system-users", Category: "anime",
+			}}}
+		}
+		return Payload{Results: []Result{{
+			ID: "auth:logout", Label: "Sign out of AniList",
+			Description: "Remove the stored access token", Score: 1,
+			Icon: "system-users", Category: "anime", Actions: []Action{{Name: "logout"}},
+		}}}
 	case anime.CommandPlay:
 		if err := p.service.Play(ctx, query.MediaID, query.Episode); err != nil {
 			return errorPayload(err)
@@ -121,7 +145,21 @@ func (p *Plugin) Select(ctx context.Context, message Message) (bool, string) {
 	if message.Plugin != "" && message.Plugin != p.pluginID {
 		return false, "Selection was routed to the wrong plugin"
 	}
-	if message.Action != "play" && message.Action != "resume" {
+	switch message.Action {
+	case "login":
+		if err := p.service.StartLogin(ctx); err != nil {
+			p.logger.Printf("AniList sign-in failed: %v", err)
+			return false, err.Error()
+		}
+		return true, "Opened AniList sign-in"
+	case "logout":
+		if err := p.service.Logout(ctx); err != nil {
+			p.logger.Printf("AniList sign-out failed: %v", err)
+			return false, err.Error()
+		}
+		return true, "Signed out of AniList"
+	case "play", "resume":
+	default:
 		return false, fmt.Sprintf("Unsupported action %q", message.Action)
 	}
 	p.mu.Lock()

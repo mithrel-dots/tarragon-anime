@@ -10,8 +10,23 @@ import (
 )
 
 type fakeAnimeService struct {
-	played  anime.Episode
-	resumed int
+	played    anime.Episode
+	resumed   int
+	signedIn  bool
+	loggedIn  bool
+	loggedOut bool
+}
+
+func (f *fakeAnimeService) SignedIn() bool { return f.signedIn }
+
+func (f *fakeAnimeService) StartLogin(context.Context) error {
+	f.loggedIn = true
+	return nil
+}
+
+func (f *fakeAnimeService) Logout(context.Context) error {
+	f.loggedOut = true
+	return nil
 }
 
 func (f *fakeAnimeService) ContinueWatching(context.Context, int) ([]anime.Resume, error) {
@@ -106,5 +121,36 @@ func TestPluginSearchExposesResumeAction(t *testing.T) {
 	})
 	if !success || service.resumed != 154587 {
 		t.Fatalf("Select() = %v, resumed %d", success, service.resumed)
+	}
+}
+
+func TestPluginLoginAndLogoutActions(t *testing.T) {
+	service := &fakeAnimeService{}
+	plugin := NewPlugin(service, "anime", "anime", "@", log.New(io.Discard, "", 0))
+
+	login := plugin.Request(t.Context(), "login-query", "login")
+	if login.Results[0].ID != "auth:login" || login.Results[0].Actions[0].Name != "login" {
+		t.Fatalf("login payload = %#v", login.Results)
+	}
+	success, message := plugin.Select(t.Context(), Message{
+		QueryID: "login-query", ResultID: "auth:login", Action: "login", Plugin: "anime",
+	})
+	if !success || message != "Opened AniList sign-in" || !service.loggedIn {
+		t.Fatalf("login select = %v, %q, started %v", success, message, service.loggedIn)
+	}
+
+	if payload := plugin.Request(t.Context(), "logout-query", "logout"); len(payload.Results[0].Actions) != 0 {
+		t.Fatalf("signed-out logout payload = %#v", payload.Results)
+	}
+	service.signedIn = true
+	logout := plugin.Request(t.Context(), "logout-query", "logout")
+	if logout.Results[0].Actions[0].Name != "logout" {
+		t.Fatalf("logout payload = %#v", logout.Results)
+	}
+	success, _ = plugin.Select(t.Context(), Message{
+		QueryID: "logout-query", ResultID: "auth:logout", Action: "logout", Plugin: "anime",
+	})
+	if !success || !service.loggedOut {
+		t.Fatalf("logout select = %v, signed out %v", success, service.loggedOut)
 	}
 }

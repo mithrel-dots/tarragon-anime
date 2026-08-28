@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"tarragon-anime/internal/auth"
 )
 
 type Config struct {
@@ -17,6 +19,7 @@ type Config struct {
 	AutoNext         bool
 	Resume           bool
 	ResumeRewind     float64
+	ClientID         string
 	MPVArgs          []string
 	Sync             SyncConfig
 }
@@ -36,6 +39,7 @@ func DefaultConfig() Config {
 		AutoNext:         true,
 		Resume:           true,
 		ResumeRewind:     5,
+		ClientID:         auth.DefaultClientID,
 		Sync: SyncConfig{
 			Enabled: true, Conflict: "highest", Trigger: "eof", ThresholdPercent: 90,
 		},
@@ -94,6 +98,8 @@ func LoadConfig(path string) (Config, error) {
 			cfg.Resume, err = strconv.ParseBool(value)
 		case ".resume_rewind_seconds":
 			cfg.ResumeRewind, err = strconv.ParseFloat(value, 64)
+		case "anilist.client_id":
+			cfg.ClientID, err = parseString(value)
 		case "mpv.args":
 			cfg.MPVArgs, err = parseStringArray(value)
 		case "sync.enabled":
@@ -145,28 +151,6 @@ func TokenPath() (string, error) {
 		base = filepath.Join(home, ".config")
 	}
 	return filepath.Join(base, "tarragon", "anime", "token"), nil
-}
-
-func LoadToken(path string) (string, error) {
-	info, err := os.Stat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("stat AniList token: %w", err)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return "", fmt.Errorf("AniList token file %s must use permissions 0600", path)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read AniList token: %w", err)
-	}
-	token := strings.TrimSpace(string(data))
-	if token == "" {
-		return "", fmt.Errorf("AniList token file %s is empty", path)
-	}
-	return token, nil
 }
 
 func parseString(value string) (string, error) {

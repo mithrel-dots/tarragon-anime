@@ -6,12 +6,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/anime"
+	"tarragon-anime/internal/auth"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/preview"
 	"tarragon-anime/internal/provider/allanime"
@@ -20,18 +22,100 @@ import (
 )
 
 func main() {
-	if len(os.Args) == 2 && os.Args[1] == "manifest" {
-		fmt.Print(tarragon.Manifest)
+	if len(os.Args) > 1 {
+		if err := command(os.Args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "tarragon-anime: %v\n", err)
+			os.Exit(1)
+		}
 		return
-	}
-	if len(os.Args) != 1 {
-		fmt.Fprintf(os.Stderr, "usage: %s [manifest]\n", os.Args[0])
-		os.Exit(2)
 	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tarragon-anime: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// command handles the non-daemon entry points, including the OAuth callback
+// invoked through the registered URI scheme handler.
+func command(args []string) error {
+	switch args[0] {
+	case "manifest":
+		fmt.Print(tarragon.Manifest)
+		return nil
+	case "login":
+		config, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		url, err := auth.AuthorizeURL(config.ClientID)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Opening AniList sign-in:\n%s\n", url)
+		return openBrowser{}.Open(url)
+	case "auth":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: tarragon-anime auth <callback-uri>")
+		}
+		token, err := auth.ParseCallback(args[1])
+		if err != nil {
+			return err
+		}
+		store, err := tokenStore()
+		if err != nil {
+			return err
+		}
+		if err := store.Save(token); err != nil {
+			return err
+		}
+		fmt.Printf("AniList sign-in complete; token stored at %s\n", store.Path())
+		return nil
+	case "logout":
+		store, err := tokenStore()
+		if err != nil {
+			return err
+		}
+		if err := store.Delete(); err != nil {
+			return err
+		}
+		fmt.Println("Signed out of AniList")
+		return nil
+	default:
+		return fmt.Errorf("usage: %s [manifest|login|auth <uri>|logout]", os.Args[0])
+	}
+}
+
+func loadConfig() (anime.Config, error) {
+	path, err := anime.ConfigPath()
+	if err != nil {
+		return anime.Config{}, err
+	}
+	config, err := anime.LoadConfig(path)
+	if err != nil {
+		return anime.Config{}, fmt.Errorf("load config %s: %w", path, err)
+	}
+	return config, nil
+}
+
+func tokenStore() (*auth.Store, error) {
+	path, err := anime.TokenPath()
+	if err != nil {
+		return nil, err
+	}
+	return auth.NewStore(path), nil
+}
+
+// openBrowser launches the system browser for the OAuth consent page.
+type openBrowser struct{}
+
+func (openBrowser) Open(url string) error {
+	cmd := exec.Command("xdg-open", url)
+	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("run xdg-open: %w", err)
+	}
+	go cmd.Wait()
+	return nil
 }
 
 func run() error {
@@ -68,13 +152,9 @@ func run() error {
 		return err
 	}
 
-	tokenPath, err := anime.TokenPath()
+	tokens, err := tokenStore()
 	if err != nil {
 		return err
-	}
-	token, err := anime.LoadToken(tokenPath)
-	if err != nil {
-		return fmt.Errorf("load AniList token %s: %w", tokenPath, err)
 	}
 
 	httpClient := &http.Client{Timeout: 20 * time.Second}
@@ -83,18 +163,15 @@ func run() error {
 	player := mpv.New(config.MPVArgs, logger)
 	previews := preview.NewCache(httpClient, previewDir)
 
-	// A typed nil client would satisfy the sync interface, so only build one
-	// when a token actually exists.
-	var service *anime.Service
-	if token != "" {
-		logger.Printf("AniList sync enabled conflict=%s trigger=%s", config.Sync.Conflict, config.Sync.Trigger)
-		service = anime.NewService(aniListClient, provider, player, state, previews,
-			anilist.NewAuthenticatedClient(httpClient, token), config, logger)
-	} else {
-		if config.Sync.Enabled {
-			logger.Printf("AniList sync idle: no token at %s", tokenPath)
+	syncClient := anilist.NewAuthenticatedClient(httpClient, tokens.Token)
+	service := anime.NewService(aniListClient, provider, player, state, previews,
+		syncClient, config, logger).WithAuth(tokens, openBrowser{})
+	if config.Sync.Enabled {
+		if service.SignedIn() {
+			logger.Printf("AniList sync enabled conflict=%s trigger=%s", config.Sync.Conflict, config.Sync.Trigger)
+		} else {
+			logger.Printf("AniList sync idle: sign in with the login command")
 		}
-		service = anime.NewService(aniListClient, provider, player, state, previews, nil, config, logger)
 	}
 	defer service.Close()
 	plugin := tarragon.NewPlugin(service, name, prefix, prefixSymbol, logger)
