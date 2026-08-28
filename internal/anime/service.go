@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/mpv"
@@ -33,13 +34,19 @@ type Service struct {
 	player   player
 	config   Config
 	logger   *log.Logger
+
+	mediaMu sync.RWMutex
+	media   map[int]anilist.Media
 }
 
 func NewService(anilistClient aniListClient, provider providerClient, player player, config Config, logger *log.Logger) *Service {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Service{anilist: anilistClient, provider: provider, player: player, config: config, logger: logger}
+	return &Service{
+		anilist: anilistClient, provider: provider, player: player, config: config,
+		logger: logger, media: make(map[int]anilist.Media),
+	}
 }
 
 func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
@@ -51,9 +58,12 @@ func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
 		return nil, err
 	}
 	result := make([]Media, 0, len(items))
+	s.mediaMu.Lock()
 	for _, item := range items {
+		s.media[item.ID] = item
 		result = append(result, mediaFromAniList(item))
 	}
+	s.mediaMu.Unlock()
 	return result, nil
 }
 
@@ -113,9 +123,18 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 }
 
 func (s *Service) resolveProvider(ctx context.Context, mediaID int) (anilist.Media, allanime.Anime, error) {
-	media, err := s.anilist.Get(ctx, mediaID)
-	if err != nil {
-		return anilist.Media{}, allanime.Anime{}, err
+	s.mediaMu.RLock()
+	media, ok := s.media[mediaID]
+	s.mediaMu.RUnlock()
+	if !ok {
+		var err error
+		media, err = s.anilist.Get(ctx, mediaID)
+		if err != nil {
+			return anilist.Media{}, allanime.Anime{}, err
+		}
+		s.mediaMu.Lock()
+		s.media[mediaID] = media
+		s.mediaMu.Unlock()
 	}
 	aliases := []string{media.English, media.Romaji, media.Native, media.Title}
 	aliases = append(aliases, media.Synonyms...)

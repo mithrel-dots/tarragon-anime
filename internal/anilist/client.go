@@ -121,6 +121,12 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := resp.Header.Get("Retry-After")
+			if retryAfter != "" {
+				return fmt.Errorf("GraphQL HTTP status %s; retry after %s", resp.Status, retryAfter)
+			}
+		}
 		return fmt.Errorf("GraphQL HTTP status %s", resp.Status)
 	}
 	var envelope struct {
