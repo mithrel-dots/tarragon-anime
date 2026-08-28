@@ -14,6 +14,9 @@ type Config struct {
 	Provider         string
 	PreferredQuality string
 	Translation      string
+	AutoNext         bool
+	Resume           bool
+	ResumeRewind     float64
 	MPVArgs          []string
 }
 
@@ -22,6 +25,9 @@ func DefaultConfig() Config {
 		Provider:         "allanime",
 		PreferredQuality: "best",
 		Translation:      "sub",
+		AutoNext:         true,
+		Resume:           true,
+		ResumeRewind:     5,
 	}
 }
 
@@ -71,6 +77,12 @@ func LoadConfig(path string) (Config, error) {
 			cfg.PreferredQuality, err = parseString(value)
 		case ".translation":
 			cfg.Translation, err = parseString(value)
+		case ".auto_next":
+			cfg.AutoNext, err = strconv.ParseBool(value)
+		case ".resume":
+			cfg.Resume, err = strconv.ParseBool(value)
+		case ".resume_rewind_seconds":
+			cfg.ResumeRewind, err = strconv.ParseFloat(value, 64)
 		case "mpv.args":
 			cfg.MPVArgs, err = parseStringArray(value)
 		default:
@@ -88,6 +100,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Translation != "sub" && cfg.Translation != "dub" {
 		return Config{}, fmt.Errorf("translation must be %q or %q", "sub", "dub")
+	}
+	if cfg.ResumeRewind < 0 {
+		return Config{}, fmt.Errorf("resume_rewind_seconds must not be negative")
 	}
 	return cfg, nil
 }

@@ -38,11 +38,13 @@ func (cachingProvider) Streams(context.Context, allanime.Episode, string, string
 
 type unusedPlayer struct{}
 
-func (unusedPlayer) Play(context.Context, mpv.Stream, string) error { return nil }
+func (unusedPlayer) Play(context.Context, mpv.Stream, string, float64) (mpv.SessionController, error) {
+	return nil, nil
+}
 
 func TestEpisodesUsesMediaCachedBySearch(t *testing.T) {
 	client := &cachingAniList{}
-	service := NewService(client, cachingProvider{}, unusedPlayer{}, DefaultConfig(), nil)
+	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, DefaultConfig(), nil)
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
 		t.Fatal(err)
 	}

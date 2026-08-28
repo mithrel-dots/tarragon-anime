@@ -12,6 +12,9 @@ func TestLoadConfig(t *testing.T) {
 	content := `provider = "allanime"
 preferred_quality = "worst"
 translation = "dub"
+auto_next = false
+resume = true
+resume_rewind_seconds = 12.5
 
 [mpv]
 args = ["--profile=anime,fast", "--script-opts=value#part"] # comment
@@ -23,7 +26,7 @@ args = ["--profile=anime,fast", "--script-opts=value#part"] # comment
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Provider != "allanime" || got.PreferredQuality != "worst" || got.Translation != "dub" {
+	if got.Provider != "allanime" || got.PreferredQuality != "worst" || got.Translation != "dub" || got.AutoNext || !got.Resume || got.ResumeRewind != 12.5 {
 		t.Fatalf("LoadConfig() = %#v", got)
 	}
 	wantArgs := []string{"--profile=anime,fast", "--script-opts=value#part"}
@@ -37,7 +40,7 @@ func TestLoadConfigMissingUsesDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Provider != "allanime" || got.PreferredQuality != "best" || got.Translation != "sub" || len(got.MPVArgs) != 0 {
+	if got.Provider != "allanime" || got.PreferredQuality != "best" || got.Translation != "sub" || !got.AutoNext || !got.Resume || got.ResumeRewind != 5 || len(got.MPVArgs) != 0 {
 		t.Fatalf("LoadConfig() = %#v", got)
 	}
 }
