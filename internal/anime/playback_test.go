@@ -31,6 +31,61 @@ func (navigationProvider) Streams(_ context.Context, episode allanime.Episode, _
 	return []allanime.Stream{{URL: fmt.Sprintf("https://video.test/%d.m3u8", episode.Number)}}, nil
 }
 
+type autoNextProvider struct {
+	mu          sync.Mutex
+	episodes    []int
+	streamCalls []int
+	errors      map[int]error
+	blockFirst  chan struct{}
+	started     chan struct{}
+}
+
+func (p *autoNextProvider) Match(_ context.Context, id int, _ []string, _ string) (allanime.Anime, error) {
+	return allanime.Anime{ID: "show", Name: "Frieren", AniListID: id}, nil
+}
+
+func (p *autoNextProvider) Episodes(context.Context, allanime.Anime, string) ([]allanime.Episode, error) {
+	result := make([]allanime.Episode, 0, len(p.episodes))
+	for _, number := range p.episodes {
+		result = append(result, allanime.Episode{ShowID: "show", Number: number, Value: fmt.Sprint(number)})
+	}
+	return result, nil
+}
+
+func (p *autoNextProvider) Streams(ctx context.Context, episode allanime.Episode, _, _ string) ([]allanime.Stream, error) {
+	p.mu.Lock()
+	p.streamCalls = append(p.streamCalls, episode.Number)
+	firstBlocked := episode.Number == 2 && len(p.streamCalls) == 2 && p.blockFirst != nil
+	p.mu.Unlock()
+	if firstBlocked {
+		close(p.started)
+		select {
+		case <-p.blockFirst:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if err := p.errors[episode.Number]; err != nil {
+		return nil, err
+	}
+	return []allanime.Stream{{
+		URL:      fmt.Sprintf("https://video.test/%d.m3u8", episode.Number),
+		Subtitle: fmt.Sprintf("https://sub.test/%d.ass", episode.Number),
+	}}, nil
+}
+
+func (p *autoNextProvider) callsFor(number int) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	count := 0
+	for _, call := range p.streamCalls {
+		if call == number {
+			count++
+		}
+	}
+	return count
+}
+
 type loadCall struct {
 	stream mpv.Stream
 	title  string
@@ -112,6 +167,24 @@ func (s *fakeSession) lastSeek() float64 {
 	return s.seeks[len(s.seeks)-1]
 }
 
+func (s *fakeSession) messagesCopy() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.messages...)
+}
+
+func (s *fakeSession) subtitleCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.subtitles)
+}
+
+func (s *fakeSession) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
 type fakeSkipClient struct {
 	times []aniskip.SkipTime
 }
@@ -123,10 +196,12 @@ func (c fakeSkipClient) SkipTimes(context.Context, int, int, float64) ([]aniskip
 type fakePlayer struct {
 	session *fakeSession
 	start   float64
+	plays   int
 }
 
 func (p *fakePlayer) Play(_ context.Context, _ mpv.Stream, _ string, start float64) (mpv.SessionController, error) {
 	p.start = start
+	p.plays++
 	return p.session, nil
 }
 
@@ -392,6 +467,139 @@ func TestPlaybackAutomaticallySkipsIntroAndManualSkipsOutro(t *testing.T) {
 	waitFor(t, func() bool { return session.seekCount() == 2 })
 	if got := session.lastSeek(); got != 100 {
 		t.Fatalf("manual outro seek = %v, want 100", got)
+	}
+}
+
+func TestPlaybackAutoNextPrefetchesAndReusesSession(t *testing.T) {
+	client := &cachingAniList{}
+	session := newFakeSession()
+	player := &fakePlayer{session: session}
+	provider := &autoNextProvider{episodes: []int{1, 2, 3}}
+	config := DefaultConfig()
+	config.AutoNextThresholdPercent = 80
+	service := NewService(client, provider, player, nil, nil, nil, config, nil)
+	defer service.Close()
+
+	if _, err := service.Search(t.Context(), "frieren"); err != nil {
+		t.Fatal(err)
+	}
+	episodes, err := service.Episodes(t.Context(), 154587)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.PlayEpisode(t.Context(), episodes[0]); err != nil {
+		t.Fatal(err)
+	}
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 100}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 80}
+	waitFor(t, func() bool { return provider.callsFor(2) == 1 })
+	if session.loadCount() != 0 {
+		t.Fatalf("load count before current episode ends = %d, want 0", session.loadCount())
+	}
+	session.events <- mpv.Event{Type: mpv.EventEndFile, Reason: "eof"}
+	waitFor(t, func() bool { return session.loadCount() == 1 })
+	if player.plays != 1 {
+		t.Fatalf("mpv Play calls = %d, want 1", player.plays)
+	}
+	call := session.lastLoad()
+	if call.stream.URL != "https://video.test/2.m3u8" || call.title != "Frieren - Episode 2" || call.start != 0 {
+		t.Fatalf("auto-next load = %#v", call)
+	}
+	session.events <- mpv.Event{Type: mpv.EventFileLoaded}
+	waitFor(t, func() bool { return session.subtitleCount() == 1 })
+	if provider.callsFor(2) != 1 || session.isClosed() {
+		t.Fatalf("provider calls for episode 2 = %d, closed = %v", provider.callsFor(2), session.isClosed())
+	}
+}
+
+func TestPlaybackAutoNextFailureLeavesMPVOpen(t *testing.T) {
+	client := &cachingAniList{}
+	session := newFakeSession()
+	provider := &autoNextProvider{
+		episodes: []int{1, 2},
+		errors:   map[int]error{2: fmt.Errorf("stream unavailable")},
+	}
+	config := DefaultConfig()
+	config.AutoNextThresholdPercent = 80
+	service := NewService(client, provider, &fakePlayer{session: session}, nil, nil, nil, config, nil)
+	defer service.Close()
+	startTestPlayback(t, service)
+
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 100}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 80}
+	waitFor(t, func() bool { return len(session.messagesCopy()) > 0 })
+	if got := session.messagesCopy()[0]; got != "Could not prepare next episode" {
+		t.Fatalf("failure message = %q", got)
+	}
+	if session.loadCount() != 0 || session.isClosed() || provider.callsFor(2) != 1 {
+		t.Fatalf("loads = %d, closed = %v, provider calls for episode 2 = %d", session.loadCount(), session.isClosed(), provider.callsFor(2))
+	}
+}
+
+func TestPlaybackAutoNextLastEpisodeLeavesMPVOpen(t *testing.T) {
+	client := &cachingAniList{}
+	session := newFakeSession()
+	provider := &autoNextProvider{episodes: []int{1}}
+	config := DefaultConfig()
+	config.AutoNextThresholdPercent = 80
+	service := NewService(client, provider, &fakePlayer{session: session}, nil, nil, nil, config, nil)
+	defer service.Close()
+	startTestPlayback(t, service)
+
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 100}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 80}
+	waitFor(t, func() bool { return len(session.messagesCopy()) > 0 })
+	if got := session.messagesCopy()[0]; got != "No next episode available" {
+		t.Fatalf("last episode message = %q", got)
+	}
+	if session.loadCount() != 0 || session.isClosed() {
+		t.Fatalf("loads = %d, closed = %v", session.loadCount(), session.isClosed())
+	}
+}
+
+func TestPlaybackManualNavigationCancelsAutoNextPrefetch(t *testing.T) {
+	client := &cachingAniList{}
+	session := newFakeSession()
+	provider := &autoNextProvider{
+		episodes:   []int{1, 2, 3},
+		blockFirst: make(chan struct{}),
+		started:    make(chan struct{}),
+	}
+	config := DefaultConfig()
+	config.AutoNextThresholdPercent = 80
+	service := NewService(client, provider, &fakePlayer{session: session}, nil, nil, nil, config, nil)
+	defer service.Close()
+	startTestPlayback(t, service)
+
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 100}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 80}
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("auto-next prefetch did not start")
+	}
+	session.events <- mpv.Event{Type: mpv.EventNext}
+	waitFor(t, func() bool { return session.loadCount() == 1 })
+	call := session.lastLoad()
+	if call.stream.URL != "https://video.test/2.m3u8" {
+		t.Fatalf("manual navigation load = %#v", call)
+	}
+	if provider.callsFor(2) != 2 || session.isClosed() {
+		t.Fatalf("provider calls for episode 2 = %d, closed = %v", provider.callsFor(2), session.isClosed())
+	}
+}
+
+func startTestPlayback(t *testing.T, service *Service) {
+	t.Helper()
+	if _, err := service.Search(t.Context(), "frieren"); err != nil {
+		t.Fatal(err)
+	}
+	episodes, err := service.Episodes(t.Context(), 154587)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.PlayEpisode(t.Context(), episodes[0]); err != nil {
+		t.Fatal(err)
 	}
 }
 

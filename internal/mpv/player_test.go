@@ -59,6 +59,7 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 		"--config-dir=" + filepath.Join(configHome, "mpv"),
 		"--profile=anime",
 		"--idle=yes",
+		"--force-window=yes",
 		"--start=15.000",
 		"--input-ipc-server=",
 		"--http-header-fields=Referer: https://mkissa.to/",

@@ -80,6 +80,7 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string, start fl
 		"--config-dir="+p.configDir,
 		"--no-terminal",
 		"--idle=yes",
+		"--force-window=yes",
 		"--input-ipc-server="+socket,
 		"--force-media-title="+title,
 	)

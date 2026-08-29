@@ -13,16 +13,17 @@ import (
 )
 
 type Config struct {
-	Provider         string
-	PreferredQuality string
-	Translation      string
-	AutoNext         bool
-	Resume           bool
-	ResumeRewind     float64
-	ClientID         string
-	MPVArgs          []string
-	Skip             SkipConfig
-	Sync             SyncConfig
+	Provider                 string
+	PreferredQuality         string
+	Translation              string
+	AutoNext                 bool
+	AutoNextThresholdPercent float64
+	Resume                   bool
+	ResumeRewind             float64
+	ClientID                 string
+	MPVArgs                  []string
+	Skip                     SkipConfig
+	Sync                     SyncConfig
 }
 
 type SkipConfig struct {
@@ -51,7 +52,8 @@ func DefaultConfig() Config {
 		Sync: SyncConfig{
 			Enabled: true, Conflict: "highest", Trigger: "eof", ThresholdPercent: 90,
 		},
-		Skip: SkipConfig{Enabled: true, Intro: true, Outro: true},
+		AutoNextThresholdPercent: 80,
+		Skip:                     SkipConfig{Enabled: true, Intro: true, Outro: true},
 	}
 }
 
@@ -103,6 +105,8 @@ func LoadConfig(path string) (Config, error) {
 			cfg.Translation, err = parseString(value)
 		case ".auto_next":
 			cfg.AutoNext, err = strconv.ParseBool(value)
+		case ".auto_next_threshold_percent":
+			cfg.AutoNextThresholdPercent, err = strconv.ParseFloat(value, 64)
 		case ".resume":
 			cfg.Resume, err = strconv.ParseBool(value)
 		case ".resume_rewind_seconds":
@@ -145,6 +149,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.ResumeRewind < 0 {
 		return Config{}, fmt.Errorf("resume_rewind_seconds must not be negative")
+	}
+	if cfg.AutoNextThresholdPercent <= 0 || cfg.AutoNextThresholdPercent > 100 {
+		return Config{}, fmt.Errorf("auto_next_threshold_percent must be greater than 0 and at most 100")
 	}
 	if cfg.Skip.MarginSeconds < 0 {
 		return Config{}, fmt.Errorf("skip.margin_seconds must not be negative")

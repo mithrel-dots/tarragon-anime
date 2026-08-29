@@ -121,7 +121,25 @@ type activePlayback struct {
 	skipTimes       []aniskip.SkipTime
 	skipLoaded      bool
 	skipped         map[int]bool
+	nextResults     chan nextResult
+	nextPrefetch    *nextPrefetch
+	nextReady       *nextResult
+	nextGeneration  uint64
+	nextTriggered   bool
+	ended           bool
 	closeOnce       sync.Once
+}
+
+type nextPrefetch struct {
+	generation uint64
+	cancel     context.CancelFunc
+}
+
+type nextResult struct {
+	generation uint64
+	episode    Episode
+	stream     mpv.Stream
+	err        error
 }
 
 func NewService(anilistClient aniListClient, provider providerClient, player player, state stateStore, previews previewCache, syncer syncClient, config Config, logger *log.Logger) *Service {
@@ -412,8 +430,9 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 		ctx: playbackCtx, cancel: cancel, session: session,
 		episodes: episodes, index: index, stream: stream,
 		position: start, lastSaved: time.Now(),
-		skipped: make(map[int]bool),
-		malID:   malID,
+		skipped:     make(map[int]bool),
+		malID:       malID,
+		nextResults: make(chan nextResult, 1),
 	}
 
 	s.playbackMu.Lock()
@@ -456,6 +475,8 @@ func (s *Service) controlPlayback(active *activePlayback) {
 				return
 			}
 			s.handlePlaybackEvent(active, event)
+		case result := <-active.nextResults:
+			s.handleNextResult(active, result)
 		}
 	}
 }
@@ -467,8 +488,13 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 		s.autoSkip(active)
 		thresholdReached := active.duration > 0 &&
 			active.position/active.duration*100 >= s.config.Sync.ThresholdPercent
-		if !active.complete && thresholdReached {
+		autoNextReached := active.duration > 0 &&
+			active.position/active.duration*100 >= s.config.AutoNextThresholdPercent
+		if !active.complete && (thresholdReached || (s.config.AutoNext && autoNextReached)) {
 			s.saveProgress(active, true)
+		}
+		if autoNextReached {
+			s.startNextPrefetch(active)
 		}
 		if !active.complete && time.Since(active.lastSaved) >= 10*time.Second {
 			s.saveProgress(active, false)
@@ -500,21 +526,90 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 			s.queueSync(active)
 		}
 		if complete {
-			if s.config.AutoNext && active.index+1 < len(active.episodes) {
-				s.navigate(active, 1, false)
+			if s.config.AutoNext {
+				active.ended = true
+				s.startNextPrefetch(active)
+				s.loadPreparedNext(active)
 			} else {
 				active.stop()
 			}
 		}
 	case mpv.EventNext:
+		s.cancelNextPrefetch(active)
 		s.navigate(active, 1, true)
 	case mpv.EventPrevious:
+		s.cancelNextPrefetch(active)
 		s.navigate(active, -1, true)
 	case mpv.EventSkip:
 		s.manualSkip(active)
 	case mpv.EventShutdown:
 		active.cancel()
 	}
+}
+
+func (s *Service) startNextPrefetch(active *activePlayback) {
+	if !s.config.AutoNext || active.nextTriggered {
+		return
+	}
+	active.nextTriggered = true
+	targetIndex := active.index + 1
+	if targetIndex >= len(active.episodes) {
+		_ = active.session.ShowText(active.ctx, "No next episode available")
+		return
+	}
+	target := active.episodes[targetIndex]
+	active.nextGeneration++
+	generation := active.nextGeneration
+	ctx, cancel := context.WithCancel(active.ctx)
+	active.nextPrefetch = &nextPrefetch{generation: generation, cancel: cancel}
+	go func() {
+		stream, err := s.resolveStream(ctx, target)
+		select {
+		case active.nextResults <- nextResult{generation: generation, episode: target, stream: stream, err: err}:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+func (s *Service) handleNextResult(active *activePlayback, result nextResult) {
+	prefetch := active.nextPrefetch
+	if prefetch == nil || result.generation != prefetch.generation {
+		return
+	}
+	active.nextPrefetch = nil
+	prefetch.cancel()
+	if result.err != nil {
+		s.logger.Printf("prefetch next episode %d: %v", result.episode.Number, result.err)
+		_ = active.session.ShowText(active.ctx, "Could not prepare next episode")
+		return
+	}
+	active.nextReady = &result
+	if active.ended {
+		s.loadPreparedNext(active)
+	}
+}
+
+func (s *Service) loadPreparedNext(active *activePlayback) {
+	if active.nextReady == nil {
+		return
+	}
+	result := active.nextReady
+	active.nextReady = nil
+	start := s.resumePosition(active.ctx, result.episode)
+	malID := s.mediaMALID(active.ctx, result.episode)
+	if err := s.loadEpisode(active, result.episode, result.stream, start, malID); err != nil {
+		s.logger.Printf("load next episode %d: %v", result.episode.Number, err)
+		_ = active.session.ShowText(active.ctx, "Could not load next episode")
+	}
+}
+
+func (s *Service) cancelNextPrefetch(active *activePlayback) {
+	if active.nextPrefetch != nil {
+		active.nextPrefetch.cancel()
+		active.nextPrefetch = nil
+	}
+	active.nextReady = nil
+	active.nextGeneration++
 }
 
 // Run flushes queued AniList updates until the plugin shuts down, so progress
@@ -667,12 +762,20 @@ func (s *Service) navigate(active *activePlayback, delta int, saveCurrent bool) 
 	}
 	malID := s.mediaMALID(active.ctx, episode)
 	start := s.resumePosition(active.ctx, episode)
-	if err := active.session.Load(active.ctx, stream, episode.Title, start); err != nil {
+	if err := s.loadEpisode(active, episode, stream, start, malID); err != nil {
 		s.logger.Printf("load episode %d: %v", episode.Number, err)
 		_ = active.session.ShowText(active.ctx, "Could not load episode "+fmt.Sprint(episode.Number))
 		return
 	}
-	active.index = target
+	s.logger.Printf("playback navigated media_id=%d episode=%d", episode.MediaID, episode.Number)
+	_ = active.session.ShowText(active.ctx, fmt.Sprintf("Episode %d", episode.Number))
+}
+
+func (s *Service) loadEpisode(active *activePlayback, episode Episode, stream mpv.Stream, start float64, malID int) error {
+	if err := active.session.Load(active.ctx, stream, episode.Title, start); err != nil {
+		return err
+	}
+	active.index = episodeIndex(active.episodes, episode.Number)
 	active.stream = stream
 	active.position = start
 	active.duration = 0
@@ -685,8 +788,10 @@ func (s *Service) navigate(active *activePlayback, delta int, saveCurrent bool) 
 	active.skipped = make(map[int]bool)
 	active.complete = false
 	active.synced = false
-	s.logger.Printf("playback navigated media_id=%d episode=%d", episode.MediaID, episode.Number)
-	_ = active.session.ShowText(active.ctx, fmt.Sprintf("Episode %d", episode.Number))
+	active.nextTriggered = false
+	active.ended = false
+	active.nextGeneration++
+	return nil
 }
 
 func (s *Service) mediaMALID(ctx context.Context, episode Episode) int {
