@@ -254,8 +254,9 @@ func (p *Plugin) mediaActions(mediaID int) []Action {
 	}
 	if p.service.SignedIn() {
 		actions = append(actions,
-			Action{Name: "watching"}, Action{Name: "planning"},
-			Action{Name: "completed"},
+			Action{Name: "watching", Type: "keep_open"},
+			Action{Name: "planning", Type: "keep_open"},
+			Action{Name: "completed", Type: "keep_open"},
 		)
 	}
 	actions = append(actions, Action{Name: "open"})

@@ -161,6 +161,12 @@ func TestPluginAuthenticatedMediaActions(t *testing.T) {
 	if len(payload.Results[0].Actions) != 6 {
 		t.Fatalf("actions = %#v", payload.Results[0].Actions)
 	}
+	for index, action := range []string{"watching", "planning", "completed"} {
+		resultAction := payload.Results[0].Actions[index+2]
+		if resultAction.Name != action || resultAction.Type != "keep_open" {
+			t.Fatalf("action = %#v, want %s keep_open", resultAction, action)
+		}
+	}
 	for _, action := range []string{"watching", "planning", "completed", "open"} {
 		success, _ := plugin.Select(t.Context(), Message{
 			QueryID: "search-query", ResultID: "media:154587", Action: action, Plugin: "anime",
