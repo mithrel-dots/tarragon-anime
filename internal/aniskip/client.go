@@ -73,11 +73,11 @@ func (c *Client) SkipTimes(ctx context.Context, malID, episode int, episodeLengt
 	}
 	var payload struct {
 		Results []struct {
-			Type string `json:"skipType"`
-			Time struct {
+			Type     string `json:"skipType"`
+			Interval struct {
 				Start float64 `json:"startTime"`
 				End   float64 `json:"endTime"`
-			} `json:"skipTime"`
+			} `json:"interval"`
 		} `json:"results"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload); err != nil {
@@ -85,10 +85,10 @@ func (c *Client) SkipTimes(ctx context.Context, malID, episode int, episodeLengt
 	}
 	result := make([]SkipTime, 0, len(payload.Results))
 	for _, item := range payload.Results {
-		if (item.Type != Opening && item.Type != Ending) || item.Time.Start < 0 || item.Time.End <= item.Time.Start {
+		if (item.Type != Opening && item.Type != Ending) || item.Interval.Start < 0 || item.Interval.End <= item.Interval.Start {
 			continue
 		}
-		result = append(result, SkipTime{Type: item.Type, Start: item.Time.Start, End: item.Time.End})
+		result = append(result, SkipTime{Type: item.Type, Start: item.Interval.Start, End: item.Interval.End})
 	}
 	sort.SliceStable(result, func(i, j int) bool { return result[i].Start < result[j].Start })
 	return result, nil

@@ -12,7 +12,7 @@ func TestSkipTimes(t *testing.T) {
 		if r.URL.Path != "/v2/skip-times/52991/4" || len(r.URL.Query()["types"]) != 2 || r.URL.Query().Get("episodeLength") != "1400.000" {
 			t.Fatalf("request = %s", r.URL.String())
 		}
-		_, _ = w.Write([]byte(`{"results":[{"skipType":"op","skipTime":{"startTime":0,"endTime":89.5}},{"skipType":"ed","skipTime":{"startTime":1380,"endTime":1400}},{"skipType":"mixed","skipTime":{"startTime":1,"endTime":2}},{"skipType":"op","skipTime":{"startTime":4,"endTime":3}}]}`))
+		_, _ = w.Write([]byte(`{"results":[{"skipType":"op","interval":{"startTime":0,"endTime":89.5}},{"skipType":"ed","interval":{"startTime":1380,"endTime":1400}},{"skipType":"mixed","interval":{"startTime":1,"endTime":2}},{"skipType":"op","interval":{"startTime":4,"endTime":3}}]}`))
 	}))
 	defer server.Close()
 
