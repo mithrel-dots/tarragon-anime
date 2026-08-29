@@ -62,17 +62,21 @@ type cryptoProfile struct {
 	EpochBucketMS int64
 	GraceMS       int64
 	BootPrefix    string
+	BootJoin      string
+	BootParts     []string
 	KeyGroup      string
 	Host          string
 }
 
 var currentProfile = cryptoProfile{
-	BuildID:       "144",
+	BuildID:       "148",
 	Lane:          "k7",
-	MaskHex:       "f4d7eef21667c2834c8146ad0e5ed053dea615d997f7c642639475d8ad4c3124",
+	MaskHex:       "5431adffc5cb1502e4817f2c007b2c3def93b91221aaf808d0b0fea4bf3d30bf",
 	EpochBucketMS: 604800000,
 	GraceMS:       86400000,
-	BootPrefix:    "8S22istW61:",
+	BootPrefix:    "sXKiyl:",
+	BootJoin:      "~",
+	BootParts:     []string{"epoch", "host", "buildId", "lane", "group"},
 	KeyGroup:      "mkissa",
 	Host:          "mkissa.to",
 }
@@ -84,6 +88,7 @@ type Client struct {
 	clockBase string
 	now       func() time.Time
 	profile   cryptoProfile
+	profileMu sync.RWMutex
 
 	mu        sync.Mutex
 	key       []byte
@@ -397,6 +402,7 @@ func (c *Client) graphQL(ctx context.Context, query string, variables, extension
 }
 
 func (c *Client) cryptoKey(ctx context.Context) ([]byte, int64, error) {
+	profile := c.profileSnapshot()
 	c.mu.Lock()
 	if len(c.key) == 32 && c.now().Before(c.keyExpiry) {
 		key := append([]byte(nil), c.key...)
@@ -406,23 +412,25 @@ func (c *Client) cryptoKey(ctx context.Context) ([]byte, int64, error) {
 	}
 	c.mu.Unlock()
 
-	nowMS := c.now().UnixMilli()
-	current := nowMS / c.profile.EpochBucketMS
-	adjusted := current
-	if nowMS-current*c.profile.EpochBucketMS < c.profile.GraceMS && current > 0 {
-		adjusted--
+	key, epoch, expiry, err := c.bootstrapKey(ctx, profile)
+	if err == nil {
+		c.mu.Lock()
+		c.key, c.epoch, c.keyExpiry = append([]byte(nil), key...), epoch, expiry
+		c.mu.Unlock()
+		return key, epoch, nil
 	}
-	epochs := []int64{adjusted}
-	if current != adjusted {
-		epochs = append(epochs, current)
+	lastErr := err
+	profiles, refreshErr := c.refreshProfiles(ctx)
+	if refreshErr != nil {
+		return nil, 0, fmt.Errorf("%w: bootstrap failed: %v; refresh profile: %v", ErrCryptoProfileRotated, lastErr, refreshErr)
 	}
-	var lastErr error
-	for _, epoch := range epochs {
-		key, expiry, err := c.bootstrap(ctx, epoch)
+	for _, profile := range profiles {
+		key, epoch, expiry, err := c.bootstrapKey(ctx, profile)
 		if err != nil {
 			lastErr = err
 			continue
 		}
+		c.setProfile(profile)
 		c.mu.Lock()
 		c.key, c.epoch, c.keyExpiry = append([]byte(nil), key...), epoch, expiry
 		c.mu.Unlock()
@@ -431,21 +439,55 @@ func (c *Client) cryptoKey(ctx context.Context) ([]byte, int64, error) {
 	return nil, 0, fmt.Errorf("%w: bootstrap failed: %v", ErrCryptoProfileRotated, lastErr)
 }
 
-func (c *Client) bootstrap(ctx context.Context, epoch int64) ([]byte, time.Time, error) {
-	mask, err := hex.DecodeString(c.profile.MaskHex)
+func (c *Client) bootstrapKey(ctx context.Context, profile cryptoProfile) ([]byte, int64, time.Time, error) {
+	nowMS := c.now().UnixMilli()
+	current := nowMS / profile.EpochBucketMS
+	adjusted := current
+	if nowMS-current*profile.EpochBucketMS < profile.GraceMS && current > 0 {
+		adjusted--
+	}
+	epochs := []int64{adjusted}
+	if current != adjusted {
+		epochs = append(epochs, current)
+	}
+	var lastErr error
+	for _, epoch := range epochs {
+		key, expiry, err := c.bootstrap(ctx, profile, epoch)
+		if err == nil {
+			return key, epoch, expiry, nil
+		}
+		lastErr = err
+	}
+	return nil, 0, time.Time{}, lastErr
+}
+
+func (c *Client) bootstrap(ctx context.Context, profile cryptoProfile, epoch int64) ([]byte, time.Time, error) {
+	mask, err := hex.DecodeString(profile.MaskHex)
 	if err != nil || len(mask) != 32 {
 		return nil, time.Time{}, fmt.Errorf("invalid crypto mask")
 	}
-	inner := hmacSHA256(mask, []byte(c.profile.BootPrefix+c.profile.BuildID))
-	message := fmt.Sprintf("%s/%s/%d/%s/%s", c.profile.Lane, c.profile.Host, epoch, c.profile.BuildID, c.profile.KeyGroup)
+	inner := hmacSHA256(mask, []byte(profile.BootPrefix+profile.BuildID))
+	values := map[string]string{
+		"epoch": fmt.Sprint(epoch), "host": profile.Host, "buildId": profile.BuildID,
+		"lane": profile.Lane, "group": profile.KeyGroup,
+	}
+	parts := make([]string, 0, len(profile.BootParts))
+	for _, part := range profile.BootParts {
+		value, ok := values[part]
+		if !ok {
+			return nil, time.Time{}, fmt.Errorf("invalid crypto boot part %q", part)
+		}
+		parts = append(parts, value)
+	}
+	message := strings.Join(parts, profile.BootJoin)
 	signature := hex.EncodeToString(hmacSHA256(inner, []byte(message)))
-	endpoint := strings.TrimSuffix(c.api, "/api") + "/client-crypto/v1/bootstrap?buildId=" + url.QueryEscape(c.profile.BuildID) + "&k=" + url.QueryEscape(c.profile.Lane)
+	endpoint := strings.TrimSuffix(c.api, "/api") + "/client-crypto/v1/bootstrap?buildId=" + url.QueryEscape(profile.BuildID) + "&k=" + url.QueryEscape(profile.Lane)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
 	c.webHeaders(req)
-	req.Header.Set("x-build-id", c.profile.BuildID)
+	req.Header.Set("x-build-id", profile.BuildID)
 	req.Header.Set("x-aa-boot", signature)
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -478,9 +520,24 @@ func (c *Client) bootstrap(ctx context.Context, epoch int64) ([]byte, time.Time,
 	return key, expiry, nil
 }
 
+func (c *Client) profileSnapshot() cryptoProfile {
+	c.profileMu.RLock()
+	defer c.profileMu.RUnlock()
+	profile := c.profile
+	profile.BootParts = append([]string(nil), profile.BootParts...)
+	return profile
+}
+
+func (c *Client) setProfile(profile cryptoProfile) {
+	c.profileMu.Lock()
+	c.profile = profile
+	c.profileMu.Unlock()
+}
+
 func (c *Client) aaRequestToken(key []byte, epoch int64) (string, error) {
+	profile := c.profileSnapshot()
 	ts := c.now().UnixMilli() / 300000 * 300000
-	ivInput := fmt.Sprintf("%d:%s:%s:%d:%s", epoch, c.profile.BuildID, sourceQueryHash, ts, c.profile.Lane)
+	ivInput := fmt.Sprintf("%d:%s:%s:%d:%s", epoch, profile.BuildID, sourceQueryHash, ts, profile.Lane)
 	digest := sha256.Sum256([]byte(ivInput))
 	plain, err := json.Marshal(struct {
 		Version int    `json:"v"`
@@ -489,7 +546,7 @@ func (c *Client) aaRequestToken(key []byte, epoch int64) (string, error) {
 		BuildID string `json:"buildId"`
 		Hash    string `json:"qh"`
 		Lane    string `json:"k"`
-	}{1, ts, epoch, c.profile.BuildID, sourceQueryHash, c.profile.Lane})
+	}{1, ts, epoch, profile.BuildID, sourceQueryHash, profile.Lane})
 	if err != nil {
 		return "", err
 	}

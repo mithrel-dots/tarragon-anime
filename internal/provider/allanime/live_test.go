@@ -31,3 +31,15 @@ func TestLiveVerticalProviderSlice(t *testing.T) {
 		t.Fatal("AllAnime returned no playable streams")
 	}
 }
+
+func TestLiveCryptoProfileRefresh(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	defer cancel()
+	profiles, err := NewClient(nil).refreshProfiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) == 0 || profiles[0].BuildID == "" || len(profiles[0].MaskHex) != 64 {
+		t.Fatalf("refreshed profiles = %#v", profiles)
+	}
+}
