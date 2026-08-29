@@ -13,6 +13,7 @@ import (
 
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/anime"
+	"tarragon-anime/internal/aniskip"
 	"tarragon-anime/internal/auth"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/preview"
@@ -165,7 +166,7 @@ func run() error {
 
 	syncClient := anilist.NewAuthenticatedClient(httpClient, tokens.Token)
 	service := anime.NewService(aniListClient, provider, player, state, previews,
-		syncClient, config, logger).WithAuth(tokens, openBrowser{})
+		syncClient, config, logger).WithAuth(tokens, openBrowser{}).WithSkip(aniskip.NewClient(httpClient))
 	if config.Sync.Enabled {
 		if service.SignedIn() {
 			logger.Printf("AniList sync enabled conflict=%s trigger=%s", config.Sync.Conflict, config.Sync.Trigger)

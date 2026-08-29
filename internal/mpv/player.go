@@ -35,6 +35,7 @@ const (
 	EventPrevious
 	EventPosition
 	EventDuration
+	EventSkip
 )
 
 type Event struct {
@@ -120,7 +121,7 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string, start fl
 	commands := [][]any{
 		{"observe_property", 1, "time-pos"},
 		{"observe_property", 2, "duration"},
-		{"define-section", "tarragon-anime", "Shift+N script-message tarragon-next\nShift+P script-message tarragon-previous", "force"},
+		{"define-section", "tarragon-anime", "Shift+N script-message tarragon-next\nShift+P script-message tarragon-previous\nShift+S script-message tarragon-skip", "force"},
 		{"enable-section", "tarragon-anime"},
 	}
 	for _, command := range commands {
@@ -218,6 +219,11 @@ func (s *Session) ShowText(ctx context.Context, message string) error {
 	return err
 }
 
+func (s *Session) Seek(ctx context.Context, position float64) error {
+	_, err := s.command(ctx, "seek", position, "absolute+exact")
+	return err
+}
+
 func (s *Session) Close() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -308,6 +314,8 @@ func (s *Session) handleEvent(event, name, reason string, args []string, data js
 			s.emit(Event{Type: EventNext})
 		case "tarragon-previous":
 			s.emit(Event{Type: EventPrevious})
+		case "tarragon-skip":
+			s.emit(Event{Type: EventSkip})
 		}
 	case "property-change":
 		var value float64

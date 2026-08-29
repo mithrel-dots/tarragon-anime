@@ -22,6 +22,7 @@ type Client struct {
 
 type Media struct {
 	ID       int
+	IDMal    int
 	Title    string
 	English  string
 	Romaji   string
@@ -89,7 +90,7 @@ type Viewer struct {
 	Name string
 }
 
-const mediaFields = `_id: id title { romaji english native } synonyms format episodes coverImage { large }`
+const mediaFields = `_id: id idMal title { romaji english native } synonyms format episodes coverImage { large }`
 
 func (c *Client) Search(ctx context.Context, query string) ([]Media, error) {
 	const gql = `query ($search: String!) { Page(page: 1, perPage: 20) { media(search: $search, type: ANIME, isAdult: false, sort: SEARCH_MATCH) { ` + mediaFields + ` } } }`
@@ -200,6 +201,7 @@ func (c *Client) SetStatus(ctx context.Context, mediaID int, status string) erro
 
 type mediaResponse struct {
 	ID    int `json:"_id"`
+	IDMal int `json:"idMal"`
 	Title struct {
 		Romaji  string `json:"romaji"`
 		English string `json:"english"`
@@ -222,7 +224,7 @@ func (m mediaResponse) toMedia() Media {
 		title = m.Title.Native
 	}
 	return Media{
-		ID: m.ID, Title: title, English: m.Title.English, Romaji: m.Title.Romaji,
+		ID: m.ID, IDMal: m.IDMal, Title: title, English: m.Title.English, Romaji: m.Title.Romaji,
 		Native: m.Title.Native, Synonyms: m.Synonyms, Format: m.Format,
 		Episodes: m.Episodes, CoverURL: m.Cover.Large,
 	}

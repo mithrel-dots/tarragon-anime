@@ -22,7 +22,7 @@ func TestSearchMapsGraphQLMedia(t *testing.T) {
 		if request.Variables["search"] != "frieren" {
 			t.Fatalf("search variable = %#v", request.Variables["search"])
 		}
-		_, _ = w.Write([]byte(`{"data":{"Page":{"media":[{"_id":154587,"title":{"romaji":"Sousou no Frieren","english":"Frieren: Beyond Journey's End","native":"葬送のフリーレン"},"synonyms":["Frieren"],"format":"TV","episodes":28,"coverImage":{"large":"https://img.test/cover.jpg"}}]}}}`))
+		_, _ = w.Write([]byte(`{"data":{"Page":{"media":[{"_id":154587,"idMal":52991,"title":{"romaji":"Sousou no Frieren","english":"Frieren: Beyond Journey's End","native":"葬送のフリーレン"},"synonyms":["Frieren"],"format":"TV","episodes":28,"coverImage":{"large":"https://img.test/cover.jpg"}}]}}}`))
 	}))
 	defer server.Close()
 
@@ -30,7 +30,7 @@ func TestSearchMapsGraphQLMedia(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(media) != 1 || media[0].ID != 154587 || media[0].Title != "Frieren: Beyond Journey's End" || media[0].Episodes != 28 {
+	if len(media) != 1 || media[0].ID != 154587 || media[0].IDMal != 52991 || media[0].Title != "Frieren: Beyond Journey's End" || media[0].Episodes != 28 {
 		t.Fatalf("Search() = %#v", media)
 	}
 }

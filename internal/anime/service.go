@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"tarragon-anime/internal/anilist"
+	"tarragon-anime/internal/aniskip"
 	"tarragon-anime/internal/auth"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/provider/allanime"
@@ -57,6 +58,10 @@ type previewCache interface {
 	Get(context.Context, int, string) (string, error)
 }
 
+type skipClient interface {
+	SkipTimes(context.Context, int, int, float64) ([]aniskip.SkipTime, error)
+}
+
 // tokenStore exposes AniList sign-in state so sync activates as soon as a
 // token is saved, without restarting the plugin.
 type tokenStore interface {
@@ -81,6 +86,7 @@ type Service struct {
 	browser  browser
 	config   Config
 	logger   *log.Logger
+	skips    skipClient
 
 	cacheMu  sync.RWMutex
 	media    map[int]anilist.Media
@@ -103,6 +109,8 @@ type activePlayback struct {
 	episodes []Episode
 	index    int
 	stream   mpv.Stream
+	loaded   bool
+	malID    int
 
 	position        float64
 	duration        float64
@@ -110,6 +118,9 @@ type activePlayback struct {
 	subtitlePending bool
 	complete        bool
 	synced          bool
+	skipTimes       []aniskip.SkipTime
+	skipLoaded      bool
+	skipped         map[int]bool
 	closeOnce       sync.Once
 }
 
@@ -128,6 +139,13 @@ func NewService(anilistClient aniListClient, provider providerClient, player pla
 func (s *Service) WithAuth(tokens tokenStore, opener browser) *Service {
 	s.tokens = tokens
 	s.browser = opener
+	return s
+}
+
+// WithSkip enables optional AniSkip metadata without making playback depend on
+// the external service being available.
+func (s *Service) WithSkip(client skipClient) *Service {
+	s.skips = client
 	return s
 }
 
@@ -383,6 +401,7 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 	if err != nil {
 		return err
 	}
+	malID := s.mediaMALID(ctx, episode)
 	start := s.resumePosition(ctx, episode)
 	session, err := s.player.Play(ctx, stream, episode.Title, start)
 	if err != nil {
@@ -393,6 +412,8 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 		ctx: playbackCtx, cancel: cancel, session: session,
 		episodes: episodes, index: index, stream: stream,
 		position: start, lastSaved: time.Now(),
+		skipped: make(map[int]bool),
+		malID:   malID,
 	}
 
 	s.playbackMu.Lock()
@@ -443,6 +464,7 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 	switch event.Type {
 	case mpv.EventPosition:
 		active.position = event.Value
+		s.autoSkip(active)
 		thresholdReached := active.duration > 0 &&
 			active.position/active.duration*100 >= s.config.Sync.ThresholdPercent
 		if !active.complete && thresholdReached {
@@ -456,7 +478,12 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 		}
 	case mpv.EventDuration:
 		active.duration = event.Value
+		if event.Value > 0 && !active.skipLoaded {
+			active.skipLoaded = true
+			active.skipTimes = s.fetchSkipTimes(active.ctx, active.malID, active.episodes[active.index], event.Value)
+		}
 	case mpv.EventFileLoaded:
+		active.loaded = true
 		if active.subtitlePending && active.stream.Subtitle != "" {
 			if err := active.session.AddSubtitle(active.ctx, active.stream.Subtitle); err != nil {
 				s.logger.Printf("add subtitle: %v", err)
@@ -483,6 +510,8 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 		s.navigate(active, 1, true)
 	case mpv.EventPrevious:
 		s.navigate(active, -1, true)
+	case mpv.EventSkip:
+		s.manualSkip(active)
 	case mpv.EventShutdown:
 		active.cancel()
 	}
@@ -636,6 +665,7 @@ func (s *Service) navigate(active *activePlayback, delta int, saveCurrent bool) 
 		_ = active.session.ShowText(active.ctx, "Could not resolve episode "+fmt.Sprint(episode.Number))
 		return
 	}
+	malID := s.mediaMALID(active.ctx, episode)
 	start := s.resumePosition(active.ctx, episode)
 	if err := active.session.Load(active.ctx, stream, episode.Title, start); err != nil {
 		s.logger.Printf("load episode %d: %v", episode.Number, err)
@@ -646,12 +676,125 @@ func (s *Service) navigate(active *activePlayback, delta int, saveCurrent bool) 
 	active.stream = stream
 	active.position = start
 	active.duration = 0
+	active.loaded = false
+	active.malID = malID
 	active.lastSaved = time.Now()
 	active.subtitlePending = stream.Subtitle != ""
+	active.skipTimes = nil
+	active.skipLoaded = false
+	active.skipped = make(map[int]bool)
 	active.complete = false
 	active.synced = false
 	s.logger.Printf("playback navigated media_id=%d episode=%d", episode.MediaID, episode.Number)
 	_ = active.session.ShowText(active.ctx, fmt.Sprintf("Episode %d", episode.Number))
+}
+
+func (s *Service) mediaMALID(ctx context.Context, episode Episode) int {
+	if !s.config.Skip.Enabled || s.skips == nil {
+		return 0
+	}
+	s.cacheMu.RLock()
+	media, found := s.media[episode.MediaID]
+	s.cacheMu.RUnlock()
+	if !found {
+		if s.anilist == nil {
+			return 0
+		}
+		var err error
+		media, err = s.anilist.Get(ctx, episode.MediaID)
+		if err != nil {
+			s.logger.Printf("load AniSkip media media_id=%d: %v", episode.MediaID, err)
+			return 0
+		}
+		s.cacheMu.Lock()
+		s.media[episode.MediaID] = media
+		s.cacheMu.Unlock()
+	}
+	return media.IDMal
+}
+
+func (s *Service) fetchSkipTimes(ctx context.Context, malID int, episode Episode, duration float64) []aniskip.SkipTime {
+	if malID <= 0 || duration <= 0 {
+		return nil
+	}
+	skipCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	times, err := s.skips.SkipTimes(skipCtx, malID, episode.Number, duration)
+	if err != nil {
+		s.logger.Printf("load AniSkip times media_id=%d episode=%d: %v", episode.MediaID, episode.Number, err)
+		return nil
+	}
+	return times
+}
+
+func (s *Service) autoSkip(active *activePlayback) {
+	if !active.loaded {
+		return
+	}
+	for index, skip := range active.skipTimes {
+		if active.skipped[index] || !s.skipTypeEnabled(skip.Type) {
+			continue
+		}
+		start := max(0, skip.Start-s.config.Skip.MarginSeconds)
+		if active.position < start || active.position >= skip.End {
+			continue
+		}
+		if s.seekSkip(active, index, skip) {
+			return
+		}
+	}
+}
+
+func (s *Service) manualSkip(active *activePlayback) {
+	for index, skip := range active.skipTimes {
+		if active.skipped[index] || !s.skipTypeEnabled(skip.Type) || active.position >= skip.End+s.config.Skip.MarginSeconds {
+			continue
+		}
+		if s.seekSkip(active, index, skip) {
+			return
+		}
+	}
+	_ = active.session.ShowText(active.ctx, "No intro or outro to skip")
+}
+
+func (s *Service) seekSkip(active *activePlayback, index int, skip aniskip.SkipTime) bool {
+	seeker, ok := active.session.(interface {
+		Seek(context.Context, float64) error
+	})
+	if !ok {
+		s.logger.Printf("skip unavailable: mpv session does not support seeking")
+		return false
+	}
+	target := skip.End + s.config.Skip.MarginSeconds
+	if err := seeker.Seek(active.ctx, target); err != nil {
+		s.logger.Printf("skip %s at %.3f: %v", skip.Type, target, err)
+		return false
+	}
+	if active.skipped == nil {
+		active.skipped = make(map[int]bool)
+	}
+	active.position = target
+	active.skipped[index] = true
+	_ = active.session.ShowText(active.ctx, "Skipped "+skipLabel(skip.Type))
+	return true
+}
+
+func (s *Service) skipTypeEnabled(kind string) bool {
+	switch kind {
+	case aniskip.Opening:
+		return s.config.Skip.Intro
+	case aniskip.Ending:
+		return s.config.Skip.Outro
+	default:
+		return false
+	}
+}
+
+func skipLabel(kind string) string {
+	if kind == aniskip.Ending {
+		return "outro"
+	}
+	return "intro"
 }
 
 func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Stream, error) {

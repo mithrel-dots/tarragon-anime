@@ -19,6 +19,12 @@ resume_rewind_seconds = 12.5
 [mpv]
 args = ["--profile=anime,fast", "--script-opts=value#part"] # comment
 
+[skip]
+enabled = true
+intro = false
+outro = true
+margin_seconds = 2.5
+
 [sync]
 enabled = true
 conflict = "local"
@@ -39,6 +45,9 @@ threshold_percent = 87.5
 	if !reflect.DeepEqual(got.MPVArgs, wantArgs) {
 		t.Fatalf("MPVArgs = %#v, want %#v", got.MPVArgs, wantArgs)
 	}
+	if !got.Skip.Enabled || got.Skip.Intro || !got.Skip.Outro || got.Skip.MarginSeconds != 2.5 {
+		t.Fatalf("Skip = %#v", got.Skip)
+	}
 	if !got.Sync.Enabled || got.Sync.Conflict != "local" || got.Sync.Trigger != "threshold" || got.Sync.ThresholdPercent != 87.5 {
 		t.Fatalf("Sync = %#v", got.Sync)
 	}
@@ -54,5 +63,8 @@ func TestLoadConfigMissingUsesDefaults(t *testing.T) {
 	}
 	if !got.Sync.Enabled || got.Sync.Conflict != "highest" || got.Sync.Trigger != "eof" || got.Sync.ThresholdPercent != 90 {
 		t.Fatalf("Sync = %#v", got.Sync)
+	}
+	if !got.Skip.Enabled || !got.Skip.Intro || !got.Skip.Outro || got.Skip.MarginSeconds != 0 {
+		t.Fatalf("Skip = %#v", got.Skip)
 	}
 }

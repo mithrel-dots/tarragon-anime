@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"tarragon-anime/internal/aniskip"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/provider/allanime"
 	"tarragon-anime/internal/store"
@@ -41,6 +42,7 @@ type fakeSession struct {
 
 	mu        sync.Mutex
 	loads     []loadCall
+	seeks     []float64
 	subtitles []string
 	messages  []string
 	closed    bool
@@ -63,6 +65,13 @@ func (s *fakeSession) AddSubtitle(_ context.Context, subtitle string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.subtitles = append(s.subtitles, subtitle)
+	return nil
+}
+
+func (s *fakeSession) Seek(_ context.Context, position float64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seeks = append(s.seeks, position)
 	return nil
 }
 
@@ -89,6 +98,26 @@ func (s *fakeSession) lastLoad() loadCall {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.loads[len(s.loads)-1]
+}
+
+func (s *fakeSession) seekCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.seeks)
+}
+
+func (s *fakeSession) lastSeek() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seeks[len(s.seeks)-1]
+}
+
+type fakeSkipClient struct {
+	times []aniskip.SkipTime
+}
+
+func (c fakeSkipClient) SkipTimes(context.Context, int, int, float64) ([]aniskip.SkipTime, error) {
+	return c.times, nil
 }
 
 type fakePlayer struct {
@@ -326,6 +355,43 @@ func TestPlaybackThresholdMarksEpisodeComplete(t *testing.T) {
 	waitFor(t, func() bool { return state.saved(154587, 1).Complete })
 	if progress := state.saved(154587, 1); progress.Position != 90 || progress.Duration != 100 {
 		t.Fatalf("threshold progress = %#v", progress)
+	}
+}
+
+func TestPlaybackAutomaticallySkipsIntroAndManualSkipsOutro(t *testing.T) {
+	client := &cachingAniList{}
+	session := newFakeSession()
+	player := &fakePlayer{session: session}
+	config := DefaultConfig()
+	config.AutoNext = false
+	service := NewService(client, navigationProvider{}, player, nil, nil, nil, config, nil).
+		WithSkip(fakeSkipClient{times: []aniskip.SkipTime{
+			{Type: aniskip.Opening, Start: 5, End: 20},
+			{Type: aniskip.Ending, Start: 80, End: 100},
+		}})
+	defer service.Close()
+	if _, err := service.Search(t.Context(), "frieren"); err != nil {
+		t.Fatal(err)
+	}
+	episodes, err := service.Episodes(t.Context(), 154587)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.PlayEpisode(t.Context(), episodes[0]); err != nil {
+		t.Fatal(err)
+	}
+	session.events <- mpv.Event{Type: mpv.EventFileLoaded}
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 140}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 6}
+	waitFor(t, func() bool { return session.seekCount() == 1 })
+	if got := session.lastSeek(); got != 20 {
+		t.Fatalf("automatic intro seek = %v, want 20", got)
+	}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 50}
+	session.events <- mpv.Event{Type: mpv.EventSkip}
+	waitFor(t, func() bool { return session.seekCount() == 2 })
+	if got := session.lastSeek(); got != 100 {
+		t.Fatalf("manual outro seek = %v, want 100", got)
 	}
 }
 

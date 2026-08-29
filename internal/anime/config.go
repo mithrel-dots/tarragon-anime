@@ -21,7 +21,15 @@ type Config struct {
 	ResumeRewind     float64
 	ClientID         string
 	MPVArgs          []string
+	Skip             SkipConfig
 	Sync             SyncConfig
+}
+
+type SkipConfig struct {
+	Enabled       bool
+	Intro         bool
+	Outro         bool
+	MarginSeconds float64
 }
 
 type SyncConfig struct {
@@ -43,6 +51,7 @@ func DefaultConfig() Config {
 		Sync: SyncConfig{
 			Enabled: true, Conflict: "highest", Trigger: "eof", ThresholdPercent: 90,
 		},
+		Skip: SkipConfig{Enabled: true, Intro: true, Outro: true},
 	}
 }
 
@@ -102,6 +111,14 @@ func LoadConfig(path string) (Config, error) {
 			cfg.ClientID, err = parseString(value)
 		case "mpv.args":
 			cfg.MPVArgs, err = parseStringArray(value)
+		case "skip.enabled":
+			cfg.Skip.Enabled, err = strconv.ParseBool(value)
+		case "skip.intro":
+			cfg.Skip.Intro, err = strconv.ParseBool(value)
+		case "skip.outro":
+			cfg.Skip.Outro, err = strconv.ParseBool(value)
+		case "skip.margin_seconds":
+			cfg.Skip.MarginSeconds, err = strconv.ParseFloat(value, 64)
 		case "sync.enabled":
 			cfg.Sync.Enabled, err = strconv.ParseBool(value)
 		case "sync.conflict":
@@ -128,6 +145,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.ResumeRewind < 0 {
 		return Config{}, fmt.Errorf("resume_rewind_seconds must not be negative")
+	}
+	if cfg.Skip.MarginSeconds < 0 {
+		return Config{}, fmt.Errorf("skip.margin_seconds must not be negative")
 	}
 	if cfg.Sync.Conflict != "highest" && cfg.Sync.Conflict != "local" && cfg.Sync.Conflict != "remote" {
 		return Config{}, fmt.Errorf("sync.conflict must be %q, %q, or %q", "highest", "local", "remote")

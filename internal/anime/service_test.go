@@ -14,12 +14,12 @@ type cachingAniList struct {
 }
 
 func (c *cachingAniList) Search(context.Context, string) ([]anilist.Media, error) {
-	return []anilist.Media{{ID: 154587, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}}, nil
+	return []anilist.Media{{ID: 154587, IDMal: 52991, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}}, nil
 }
 
 func (c *cachingAniList) Get(context.Context, int) (anilist.Media, error) {
 	c.getCalls++
-	return anilist.Media{ID: 154587, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}, nil
+	return anilist.Media{ID: 154587, IDMal: 52991, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}, nil
 }
 
 type cachingProvider struct{}
