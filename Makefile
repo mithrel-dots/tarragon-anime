@@ -3,7 +3,22 @@ PLUGIN_DIR ?= $(PREFIX)/lib/tarragon/plugins/anime
 DESKTOP_DIR ?= $(PREFIX)/share/applications
 DESKTOP_FILE ?= $(DESKTOP_DIR)/tarragon-anime.desktop
 
-.PHONY: check-deps install uninstall run
+.PHONY: check check-deps install uninstall run test-live test-race
+
+check:
+	@files="$$(gofmt -l .)"; if [ -n "$$files" ]; then printf '%s\n' "unformatted files:" "$$files" >&2; exit 1; fi
+	go mod tidy -diff
+	go mod verify
+	go build ./...
+	go vet ./...
+	go test ./...
+
+test-race:
+	go test -race ./...
+
+# Opt-in integration tests that require network access to AniList and AllAnime.
+test-live:
+	go test -tags=live ./internal/anilist ./internal/provider/allanime
 
 check-deps:
 	@command -v go >/dev/null || { printf '%s\n' 'go is required' >&2; exit 1; }
