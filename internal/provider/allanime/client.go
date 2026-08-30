@@ -68,6 +68,20 @@ type cryptoProfile struct {
 	Host          string
 }
 
+type cryptoSnapshot struct {
+	profile    cryptoProfile
+	key        []byte
+	epoch      int64
+	keyExpiry  time.Time
+	generation uint64
+}
+
+type cryptoFlight struct {
+	done     chan struct{}
+	snapshot cryptoSnapshot
+	err      error
+}
+
 var currentProfile = cryptoProfile{
 	BuildID:       "148",
 	Lane:          "k7",
@@ -87,13 +101,10 @@ type Client struct {
 	origin    string
 	clockBase string
 	now       func() time.Time
-	profile   cryptoProfile
-	profileMu sync.RWMutex
 
-	mu        sync.Mutex
-	key       []byte
-	epoch     int64
-	keyExpiry time.Time
+	mu     sync.Mutex
+	state  cryptoSnapshot
+	flight *cryptoFlight
 }
 
 func NewClient(httpClient *http.Client) *Client {
@@ -102,7 +113,8 @@ func NewClient(httpClient *http.Client) *Client {
 	}
 	return &Client{
 		http: httpClient, api: defaultAPI, origin: defaultOrigin,
-		clockBase: defaultClockBase, now: time.Now, profile: currentProfile,
+		clockBase: defaultClockBase, now: time.Now,
+		state: cryptoSnapshot{profile: currentProfile},
 	}
 }
 
@@ -127,7 +139,7 @@ func (c *Client) Search(ctx context.Context, query, translation string) ([]Anime
 			} `json:"edges"`
 		} `json:"shows"`
 	}
-	if err := c.graphQL(ctx, searchQuery, variables, nil, &data); err != nil {
+	if err := c.graphQL(ctx, c.profileSnapshot(), searchQuery, variables, nil, &data); err != nil {
 		return nil, fmt.Errorf("search AllAnime: %w", err)
 	}
 	result := make([]Anime, 0, len(data.Shows.Edges))
@@ -146,7 +158,7 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, translation string) 
 			Detail json.RawMessage `json:"availableEpisodesDetail"`
 		} `json:"show"`
 	}
-	if err := c.graphQL(ctx, episodesQuery, map[string]any{"showId": anime.ID}, nil, &data); err != nil {
+	if err := c.graphQL(ctx, c.profileSnapshot(), episodesQuery, map[string]any{"showId": anime.ID}, nil, &data); err != nil {
 		return nil, fmt.Errorf("list AllAnime episodes: %w", err)
 	}
 	values, err := episodeValues(data.Show.Detail, translation)
@@ -166,30 +178,30 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, translation string) 
 }
 
 func (c *Client) Streams(ctx context.Context, episode Episode, translation, quality string) ([]Stream, error) {
-	key, epoch, err := c.cryptoKey(ctx)
+	snapshot, err := c.cryptoState(ctx)
 	if err != nil {
 		return nil, err
 	}
-	token, err := c.aaRequestToken(key, epoch)
+	token, err := c.aaRequestToken(snapshot)
 	if err != nil {
 		return nil, fmt.Errorf("build AllAnime source token: %w", err)
 	}
 	extensions := map[string]any{
 		"persistedQuery": map[string]any{"version": 1, "sha256Hash": sourceQueryHash},
 		"aaReq":          token,
-		"k":              c.profile.Lane,
+		"k":              snapshot.profile.Lane,
 	}
 	var encrypted struct {
 		ToBeParsed string `json:"tobeparsed"`
 	}
-	err = c.graphQL(ctx, sourceQuery, map[string]any{
+	err = c.graphQL(ctx, snapshot.profile, sourceQuery, map[string]any{
 		"showId": episode.ShowID, "translationType": translation, "episodeString": episode.Value,
 	}, extensions, &encrypted)
 	if err != nil {
-		c.clearKey()
+		c.clearKey(snapshot)
 		return nil, fmt.Errorf("resolve AllAnime episode %d: %w", episode.Number, err)
 	}
-	plain, err := decryptEnvelope(key, encrypted.ToBeParsed)
+	plain, err := decryptEnvelope(snapshot.key, encrypted.ToBeParsed)
 	if err != nil {
 		return nil, fmt.Errorf("decode AllAnime stream: %w", err)
 	}
@@ -355,7 +367,7 @@ func resolutionScore(value string) int {
 	return n
 }
 
-func (c *Client) graphQL(ctx context.Context, query string, variables, extensions map[string]any, target any) error {
+func (c *Client) graphQL(ctx context.Context, profile cryptoProfile, query string, variables, extensions map[string]any, target any) error {
 	payload := map[string]any{"query": query, "variables": variables}
 	if extensions != nil {
 		payload["extensions"] = extensions
@@ -370,7 +382,7 @@ func (c *Client) graphQL(ctx context.Context, query string, variables, extension
 	}
 	c.webHeaders(req)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-build-id", c.profile.BuildID)
+	req.Header.Set("x-build-id", profile.BuildID)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
@@ -401,28 +413,50 @@ func (c *Client) graphQL(ctx context.Context, query string, variables, extension
 	return nil
 }
 
-func (c *Client) cryptoKey(ctx context.Context) ([]byte, int64, error) {
-	profile := c.profileSnapshot()
+func (c *Client) cryptoState(ctx context.Context) (cryptoSnapshot, error) {
 	c.mu.Lock()
-	if len(c.key) == 32 && c.now().Before(c.keyExpiry) {
-		key := append([]byte(nil), c.key...)
-		epoch := c.epoch
+	if len(c.state.key) == 32 && c.now().Before(c.state.keyExpiry) {
+		snapshot := c.state.clone()
 		c.mu.Unlock()
-		return key, epoch, nil
+		return snapshot, nil
 	}
+	if flight := c.flight; flight != nil {
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return cryptoSnapshot{}, ctx.Err()
+		case <-flight.done:
+			return flight.snapshot.clone(), flight.err
+		}
+	}
+	flight := &cryptoFlight{done: make(chan struct{})}
+	c.flight = flight
+	profile := c.state.clone().profile
 	c.mu.Unlock()
 
+	snapshot, err := c.loadCryptoState(ctx, profile)
+	c.mu.Lock()
+	if err == nil {
+		snapshot.generation = c.state.generation + 1
+		c.state = snapshot.clone()
+		flight.snapshot = c.state.clone()
+	}
+	flight.err = err
+	c.flight = nil
+	close(flight.done)
+	c.mu.Unlock()
+	return flight.snapshot.clone(), err
+}
+
+func (c *Client) loadCryptoState(ctx context.Context, profile cryptoProfile) (cryptoSnapshot, error) {
 	key, epoch, expiry, err := c.bootstrapKey(ctx, profile)
 	if err == nil {
-		c.mu.Lock()
-		c.key, c.epoch, c.keyExpiry = append([]byte(nil), key...), epoch, expiry
-		c.mu.Unlock()
-		return key, epoch, nil
+		return cryptoSnapshot{profile: profile, key: key, epoch: epoch, keyExpiry: expiry}, nil
 	}
 	lastErr := err
 	profiles, refreshErr := c.refreshProfiles(ctx)
 	if refreshErr != nil {
-		return nil, 0, fmt.Errorf("%w: bootstrap failed: %v; refresh profile: %v", ErrCryptoProfileRotated, lastErr, refreshErr)
+		return cryptoSnapshot{}, fmt.Errorf("%w: bootstrap failed: %v; refresh profile: %v", ErrCryptoProfileRotated, lastErr, refreshErr)
 	}
 	for _, profile := range profiles {
 		key, epoch, expiry, err := c.bootstrapKey(ctx, profile)
@@ -430,13 +464,9 @@ func (c *Client) cryptoKey(ctx context.Context) ([]byte, int64, error) {
 			lastErr = err
 			continue
 		}
-		c.setProfile(profile)
-		c.mu.Lock()
-		c.key, c.epoch, c.keyExpiry = append([]byte(nil), key...), epoch, expiry
-		c.mu.Unlock()
-		return key, epoch, nil
+		return cryptoSnapshot{profile: profile, key: key, epoch: epoch, keyExpiry: expiry}, nil
 	}
-	return nil, 0, fmt.Errorf("%w: bootstrap failed: %v", ErrCryptoProfileRotated, lastErr)
+	return cryptoSnapshot{}, fmt.Errorf("%w: bootstrap failed: %v", ErrCryptoProfileRotated, lastErr)
 }
 
 func (c *Client) bootstrapKey(ctx context.Context, profile cryptoProfile) ([]byte, int64, time.Time, error) {
@@ -521,23 +551,20 @@ func (c *Client) bootstrap(ctx context.Context, profile cryptoProfile, epoch int
 }
 
 func (c *Client) profileSnapshot() cryptoProfile {
-	c.profileMu.RLock()
-	defer c.profileMu.RUnlock()
-	profile := c.profile
-	profile.BootParts = append([]string(nil), profile.BootParts...)
-	return profile
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state.clone().profile
 }
 
-func (c *Client) setProfile(profile cryptoProfile) {
-	c.profileMu.Lock()
-	c.profile = profile
-	c.profileMu.Unlock()
+func (snapshot cryptoSnapshot) clone() cryptoSnapshot {
+	snapshot.profile.BootParts = append([]string(nil), snapshot.profile.BootParts...)
+	snapshot.key = append([]byte(nil), snapshot.key...)
+	return snapshot
 }
 
-func (c *Client) aaRequestToken(key []byte, epoch int64) (string, error) {
-	profile := c.profileSnapshot()
+func (c *Client) aaRequestToken(snapshot cryptoSnapshot) (string, error) {
 	ts := c.now().UnixMilli() / 300000 * 300000
-	ivInput := fmt.Sprintf("%d:%s:%s:%d:%s", epoch, profile.BuildID, sourceQueryHash, ts, profile.Lane)
+	ivInput := fmt.Sprintf("%d:%s:%s:%d:%s", snapshot.epoch, snapshot.profile.BuildID, sourceQueryHash, ts, snapshot.profile.Lane)
 	digest := sha256.Sum256([]byte(ivInput))
 	plain, err := json.Marshal(struct {
 		Version int    `json:"v"`
@@ -546,11 +573,11 @@ func (c *Client) aaRequestToken(key []byte, epoch int64) (string, error) {
 		BuildID string `json:"buildId"`
 		Hash    string `json:"qh"`
 		Lane    string `json:"k"`
-	}{1, ts, epoch, profile.BuildID, sourceQueryHash, profile.Lane})
+	}{1, ts, snapshot.epoch, snapshot.profile.BuildID, sourceQueryHash, snapshot.profile.Lane})
 	if err != nil {
 		return "", err
 	}
-	block, err := aes.NewCipher(key)
+	block, err := aes.NewCipher(snapshot.key)
 	if err != nil {
 		return "", err
 	}
@@ -584,9 +611,11 @@ func decryptEnvelope(key []byte, value string) ([]byte, error) {
 	return aead.Open(nil, iv, raw[1+aead.NonceSize():], nil)
 }
 
-func (c *Client) clearKey() {
+func (c *Client) clearKey(snapshot cryptoSnapshot) {
 	c.mu.Lock()
-	c.key, c.keyExpiry = nil, time.Time{}
+	if c.state.generation == snapshot.generation {
+		c.state.key, c.state.epoch, c.state.keyExpiry = nil, 0, time.Time{}
+	}
 	c.mu.Unlock()
 }
 

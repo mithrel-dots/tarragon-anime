@@ -47,7 +47,11 @@ var (
 )
 
 func (c *Client) refreshProfiles(ctx context.Context) ([]cryptoProfile, error) {
-	html, err := c.fetchBundleText(ctx, strings.TrimSuffix(c.origin, "/")+"/")
+	originURL, err := url.Parse(strings.TrimSuffix(c.origin, "/") + "/")
+	if err != nil {
+		return nil, fmt.Errorf("parse AllAnime origin: %w", err)
+	}
+	html, err := c.fetchBundleText(ctx, originURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("fetch AllAnime site bundle: %w", err)
 	}
@@ -55,10 +59,11 @@ func (c *Client) refreshProfiles(ctx context.Context) ([]cryptoProfile, error) {
 	if len(entry) != 2 {
 		return nil, fmt.Errorf("site bundle entry was not found")
 	}
-	appURL, err := url.Parse(entry[1])
+	appReference, err := url.Parse(entry[1])
 	if err != nil {
 		return nil, fmt.Errorf("parse site bundle entry: %w", err)
 	}
+	appURL := originURL.ResolveReference(appReference)
 	app, err := c.fetchBundleText(ctx, appURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("fetch AllAnime app bundle: %w", err)
