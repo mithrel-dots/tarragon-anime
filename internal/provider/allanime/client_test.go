@@ -187,6 +187,66 @@ func TestCryptoStateDeduplicatesConcurrentRefresh(t *testing.T) {
 	}
 }
 
+func TestCryptoStateRetriesAfterOwnerCancellation(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	key := bytes.Repeat([]byte{4}, 32)
+	partB := bootstrapPartB(currentProfile, key)
+	firstStarted := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/client-crypto/v1/bootstrap" {
+			http.NotFound(w, r)
+			return
+		}
+		if requests.Add(1) == 1 {
+			close(firstStarted)
+			<-r.Context().Done()
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"epoch": 1, "partB": partB, "switchAt": now.Add(time.Hour).UnixMilli(),
+		})
+	}))
+	defer server.Close()
+
+	client := NewClientWithEndpoints(server.Client(), server.URL+"/api", server.URL, server.URL)
+	client.now = func() time.Time { return now }
+	ownerCtx, cancelOwner := context.WithCancel(t.Context())
+	ownerResult := make(chan error, 1)
+	go func() {
+		_, err := client.cryptoState(ownerCtx)
+		ownerResult <- err
+	}()
+	<-firstStarted
+
+	waiterCtx := &signalingContext{Context: t.Context(), entered: make(chan struct{})}
+	type result struct {
+		snapshot cryptoSnapshot
+		err      error
+	}
+	waiterResult := make(chan result, 1)
+	go func() {
+		snapshot, err := client.cryptoState(waiterCtx)
+		waiterResult <- result{snapshot, err}
+	}()
+	<-waiterCtx.entered
+	cancelOwner()
+
+	if err := <-ownerResult; err == nil {
+		t.Fatal("owner cryptoState() succeeded after cancellation")
+	}
+	waiter := <-waiterResult
+	if waiter.err != nil {
+		t.Fatal(waiter.err)
+	}
+	if !bytes.Equal(waiter.snapshot.key, key) || waiter.snapshot.generation != 1 {
+		t.Fatalf("waiter snapshot = %#v", waiter.snapshot)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("bootstrap requests = %d, want 2", got)
+	}
+}
+
 func TestStaleSnapshotCannotInvalidateCurrentKey(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
 	var requests atomic.Int32

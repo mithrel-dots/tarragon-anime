@@ -80,6 +80,7 @@ type cryptoFlight struct {
 	done     chan struct{}
 	snapshot cryptoSnapshot
 	err      error
+	retry    bool
 }
 
 var currentProfile = cryptoProfile{
@@ -414,38 +415,48 @@ func (c *Client) graphQL(ctx context.Context, profile cryptoProfile, query strin
 }
 
 func (c *Client) cryptoState(ctx context.Context) (cryptoSnapshot, error) {
-	c.mu.Lock()
-	if len(c.state.key) == 32 && c.now().Before(c.state.keyExpiry) {
-		snapshot := c.state.clone()
-		c.mu.Unlock()
-		return snapshot, nil
-	}
-	if flight := c.flight; flight != nil {
-		c.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return cryptoSnapshot{}, ctx.Err()
-		case <-flight.done:
-			return flight.snapshot.clone(), flight.err
+	for {
+		c.mu.Lock()
+		if len(c.state.key) == 32 && c.now().Before(c.state.keyExpiry) {
+			snapshot := c.state.clone()
+			c.mu.Unlock()
+			return snapshot, nil
 		}
-	}
-	flight := &cryptoFlight{done: make(chan struct{})}
-	c.flight = flight
-	profile := c.state.clone().profile
-	c.mu.Unlock()
+		if flight := c.flight; flight != nil {
+			c.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return cryptoSnapshot{}, ctx.Err()
+			case <-flight.done:
+				if flight.retry {
+					continue
+				}
+				return flight.snapshot.clone(), flight.err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			c.mu.Unlock()
+			return cryptoSnapshot{}, err
+		}
+		flight := &cryptoFlight{done: make(chan struct{})}
+		c.flight = flight
+		profile := c.state.clone().profile
+		c.mu.Unlock()
 
-	snapshot, err := c.loadCryptoState(ctx, profile)
-	c.mu.Lock()
-	if err == nil {
-		snapshot.generation = c.state.generation + 1
-		c.state = snapshot.clone()
-		flight.snapshot = c.state.clone()
+		snapshot, err := c.loadCryptoState(ctx, profile)
+		c.mu.Lock()
+		if err == nil {
+			snapshot.generation = c.state.generation + 1
+			c.state = snapshot.clone()
+			flight.snapshot = c.state.clone()
+		}
+		flight.err = err
+		flight.retry = err != nil && ctx.Err() != nil
+		c.flight = nil
+		close(flight.done)
+		c.mu.Unlock()
+		return flight.snapshot.clone(), err
 	}
-	flight.err = err
-	c.flight = nil
-	close(flight.done)
-	c.mu.Unlock()
-	return flight.snapshot.clone(), err
 }
 
 func (c *Client) loadCryptoState(ctx context.Context, profile cryptoProfile) (cryptoSnapshot, error) {
