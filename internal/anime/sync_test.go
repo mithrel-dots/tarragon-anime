@@ -164,6 +164,42 @@ func TestSyncCompletesEqualFinalProgress(t *testing.T) {
 	}
 }
 
+type flakyMetadataAniList struct {
+	err error
+}
+
+func (c *flakyMetadataAniList) Search(context.Context, string) ([]anilist.Media, error) {
+	return nil, nil
+}
+
+func (c *flakyMetadataAniList) Get(context.Context, int) (anilist.Media, error) {
+	if c.err != nil {
+		return anilist.Media{}, c.err
+	}
+	return anilist.Media{ID: 154587, Episodes: 28}, nil
+}
+
+func TestSyncKeepsEqualProgressQueuedWhenFinalStatusLookupFails(t *testing.T) {
+	state := newMemoryState()
+	if err := state.EnqueueSync(t.Context(), 154587, 28); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &flakyMetadataAniList{err: errors.New("metadata unavailable")}
+	syncer := &fakeSync{remote: 28, found: true, remoteStatus: "CURRENT"}
+	service := NewService(metadata, navigationProvider{}, &fakePlayer{session: newFakeSession()}, state, nil, syncer, DefaultConfig(), nil)
+	defer service.Close()
+	service.FlushSync(t.Context())
+	if state.pendingCount() != 1 || len(state.failures) != 1 || len(syncer.savedProgress()) != 0 {
+		t.Fatalf("failed lookup queue=%d failures=%v saved=%v", state.pendingCount(), state.failures, syncer.savedProgress())
+	}
+
+	metadata.err = nil
+	service.FlushSync(t.Context())
+	if state.pendingCount() != 0 || len(syncer.savedProgress()) != 1 || syncer.status != "COMPLETED" {
+		t.Fatalf("retry queue=%d saved=%v status=%q", state.pendingCount(), syncer.savedProgress(), syncer.status)
+	}
+}
+
 func TestQueueSyncMarksPlaybackOnlyAfterEnqueueSucceeds(t *testing.T) {
 	state := newMemoryState()
 	state.enqueue = errors.New("disk full")

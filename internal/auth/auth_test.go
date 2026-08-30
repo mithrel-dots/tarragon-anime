@@ -123,12 +123,22 @@ func TestParseCallbackRequiresExactRedirectAndMatchingState(t *testing.T) {
 		})
 	}
 
-	store := NewStore(filepath.Join(t.TempDir(), "token"))
-	if _, err := store.AuthorizationURL(DefaultClientID); err != nil {
+	path := filepath.Join(t.TempDir(), "token")
+	store := NewStore(path)
+	raw, err := store.AuthorizationURL(DefaultClientID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewStore(store.Path()).ParseCallback("tarragon-anime://auth#access_token=abc&state=wrong"); err == nil || !strings.Contains(err.Error(), "did not match") {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore(path).ParseCallback("tarragon-anime://auth#access_token=attacker&state=wrong"); err == nil || !strings.Contains(err.Error(), "did not match") {
 		t.Fatalf("ParseCallback() mismatched state error = %v", err)
+	}
+	callback := "tarragon-anime://auth#access_token=legitimate&state=" + url.QueryEscape(parsed.Query().Get("state"))
+	if token, err := NewStore(path).ParseCallback(callback); err != nil || token != "legitimate" {
+		t.Fatalf("ParseCallback() after mismatch = %q, %v", token, err)
 	}
 }
 
@@ -148,6 +158,38 @@ func TestOAuthStateWorksAcrossProcessesAndIsOneTime(t *testing.T) {
 	}
 	if _, err := NewStore(path).ParseCallback(callback); err == nil {
 		t.Fatal("ParseCallback() accepted a replayed callback")
+	}
+}
+
+func TestOAuthStateMatchingCallbackIsAtomicallyOneTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	raw, err := NewStore(path).AuthorizationURL(DefaultClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback := "tarragon-anime://auth#access_token=abc&state=" + url.QueryEscape(parsed.Query().Get("state"))
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := NewStore(path).ParseCallback(callback)
+			results <- err
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("matching callback successes = %d, want 1", successes)
 	}
 }
 

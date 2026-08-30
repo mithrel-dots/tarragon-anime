@@ -753,7 +753,11 @@ func (s *Service) pushSync(ctx context.Context, item store.SyncItem) error {
 		}
 	}
 	status := "CURRENT"
-	if total := s.totalEpisodes(ctx, item.MediaID); total > 0 && target >= total {
+	total, err := s.totalEpisodes(ctx, item.MediaID)
+	if err != nil {
+		return err
+	}
+	if total > 0 && target >= total {
 		status = "COMPLETED"
 	}
 	if found && remote.Progress == target && (status != "COMPLETED" || remote.Status == "COMPLETED") {
@@ -767,22 +771,21 @@ func (s *Service) pushSync(ctx context.Context, item store.SyncItem) error {
 	return nil
 }
 
-func (s *Service) totalEpisodes(ctx context.Context, mediaID int) int {
+func (s *Service) totalEpisodes(ctx context.Context, mediaID int) (int, error) {
 	s.cacheMu.RLock()
 	media, ok := s.media[mediaID]
 	s.cacheMu.RUnlock()
 	if ok {
-		return media.Episodes
+		return media.Episodes, nil
 	}
 	media, err := s.anilist.Get(ctx, mediaID)
 	if err != nil {
-		s.logger.Printf("look up media %d for sync status: %v", mediaID, err)
-		return 0
+		return 0, fmt.Errorf("look up media %d for sync status: %w", mediaID, err)
 	}
 	s.cacheMu.Lock()
 	s.media[mediaID] = media
 	s.cacheMu.Unlock()
-	return media.Episodes
+	return media.Episodes, nil
 }
 
 func (p *activePlayback) stop() {

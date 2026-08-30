@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -82,12 +83,8 @@ func (s *Store) ParseCallback(raw string) (string, error) {
 	if returnedState == "" {
 		return "", errors.New("callback did not contain OAuth state")
 	}
-	expectedState, err := s.consumeAuthorizationState()
-	if err != nil {
+	if err := s.consumeAuthorizationState(returnedState); err != nil {
 		return "", err
-	}
-	if subtle.ConstantTimeCompare([]byte(returnedState), []byte(expectedState)) != 1 {
-		return "", errors.New("callback OAuth state did not match the pending login")
 	}
 
 	if message, err := callbackValue(parsed.Query(), fragment, "error"); err != nil {
@@ -153,9 +150,11 @@ func (s *Store) authorizationStatePath() string {
 
 func (s *Store) saveAuthorizationState(state string, expires time.Time) error {
 	path := s.authorizationStatePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create OAuth state directory: %w", err)
+	lock, err := s.lockAuthorizationState()
+	if err != nil {
+		return err
 	}
+	defer unlockAuthorizationState(lock)
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".oauth-state-*")
 	if err != nil {
 		return fmt.Errorf("create OAuth state temporary file: %w", err)
@@ -179,43 +178,71 @@ func (s *Store) saveAuthorizationState(state string, expires time.Time) error {
 	return nil
 }
 
-func (s *Store) consumeAuthorizationState() (string, error) {
+func (s *Store) consumeAuthorizationState(returnedState string) error {
 	statePath := s.authorizationStatePath()
-	suffix, err := randomState()
+	lock, err := s.lockAuthorizationState()
 	if err != nil {
-		return "", fmt.Errorf("generate OAuth state claim: %w", err)
+		return err
 	}
-	claimedPath := statePath + ".consume-" + suffix
-	if err := os.Rename(statePath, claimedPath); err != nil {
+	defer unlockAuthorizationState(lock)
+	info, err := os.Stat(statePath)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", errors.New("no pending AniList login was found")
+			return errors.New("no pending AniList login was found")
 		}
-		return "", fmt.Errorf("claim OAuth state: %w", err)
-	}
-	defer os.Remove(claimedPath)
-	info, err := os.Stat(claimedPath)
-	if err != nil {
-		return "", fmt.Errorf("stat OAuth state: %w", err)
+		return fmt.Errorf("stat OAuth state: %w", err)
 	}
 	if info.Mode().Perm()&0o077 != 0 {
-		return "", fmt.Errorf("OAuth state file %s must use permissions 0600", statePath)
+		return fmt.Errorf("OAuth state file %s must use permissions 0600", statePath)
 	}
-	data, err := os.ReadFile(claimedPath)
+	data, err := os.ReadFile(statePath)
 	if err != nil {
-		return "", fmt.Errorf("read OAuth state: %w", err)
+		return fmt.Errorf("read OAuth state: %w", err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	if len(lines) != 2 || lines[1] == "" {
-		return "", errors.New("pending OAuth state is invalid")
+		return errors.New("pending OAuth state is invalid")
 	}
 	expires, err := strconv.ParseInt(lines[0], 10, 64)
 	if err != nil {
-		return "", errors.New("pending OAuth state is invalid")
+		return errors.New("pending OAuth state is invalid")
 	}
 	if time.Now().Unix() > expires {
-		return "", errors.New("pending AniList login has expired")
+		_ = os.Remove(statePath)
+		return errors.New("pending AniList login has expired")
 	}
-	return lines[1], nil
+	if subtle.ConstantTimeCompare([]byte(returnedState), []byte(lines[1])) != 1 {
+		return errors.New("callback OAuth state did not match the pending login")
+	}
+	if err := os.Remove(statePath); err != nil {
+		return fmt.Errorf("consume OAuth state: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) lockAuthorizationState() (*os.File, error) {
+	path := s.authorizationStatePath() + ".lock"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create OAuth state directory: %w", err)
+	}
+	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open OAuth state lock: %w", err)
+	}
+	if err := lock.Chmod(0o600); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("secure OAuth state lock: %w", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("lock OAuth state: %w", err)
+	}
+	return lock, nil
+}
+
+func unlockAuthorizationState(lock *os.File) {
+	_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	_ = lock.Close()
 }
 
 func (s *Store) Path() string {
