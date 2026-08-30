@@ -309,6 +309,38 @@ func TestDaemonBoundsActiveRequests(t *testing.T) {
 	}
 }
 
+func TestDaemonKeepsReadingWhileWorkersAreSaturated(t *testing.T) {
+	const floodCount = maxConcurrentRequests * 8
+	release := make(chan struct{})
+	handler := &boundedRequestHandler{
+		started: make(chan struct{}, floodCount),
+		release: release,
+		exited:  make(chan string, floodCount),
+	}
+	client := startDaemonTestClient(t, handler)
+	for i := range maxConcurrentRequests {
+		text := fmt.Sprintf("blocked-%d", i)
+		sendDaemonMessage(t, client, Message{Type: "request", QueryID: text, Text: text})
+		receive(t, handler.started)
+	}
+	// Every worker is now stuck inside a handler, so further requests must not
+	// back up into the socket reader.
+	for i := range floodCount {
+		text := fmt.Sprintf("flood-%d", i)
+		sendDaemonMessage(t, client, Message{Type: "request", QueryID: text, Text: text})
+	}
+
+	sendDaemonMessage(t, client, Message{Type: "select", QueryID: "flood-0", ResultID: "result"})
+	if selection := readDaemonMessage(t, client); selection.Type != "select_response" || !selection.Success {
+		t.Fatalf("select response = %#v", selection)
+	}
+
+	if err := client.conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+}
+
 type orderedRequestHandler struct {
 	started chan string
 	first   chan struct{}

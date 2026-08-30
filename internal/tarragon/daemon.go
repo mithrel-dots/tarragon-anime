@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -15,6 +16,8 @@ const maxNDJSONLineSize = 1 << 20
 const maxConcurrentRequests = 4
 
 type Handler interface {
+	// Request implementations must honor ctx cancellation for prompt resource
+	// release. Run returns without waiting for non-cooperative handlers.
 	Request(context.Context, string, string) Payload
 	Select(context.Context, Message) (bool, string)
 }
@@ -32,6 +35,67 @@ type requestJob struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	message Message
+}
+
+type requestState struct {
+	mu      *sync.Mutex
+	current *requestJob
+}
+
+func (s *requestState) replace(job *requestJob) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current != nil {
+		s.current.cancel()
+	}
+	s.current = job
+}
+
+func (s *requestState) finish(job *requestJob) {
+	s.mu.Lock()
+	if s.current == job {
+		s.current = nil
+	}
+	s.mu.Unlock()
+	job.cancel()
+}
+
+func (s *requestState) writeResponse(w io.Writer, job *requestJob, payload Payload) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.current != job || job.ctx.Err() != nil {
+		return false, nil
+	}
+	err := json.NewEncoder(w).Encode(response{Type: "response", QueryID: job.message.QueryID, Data: payload})
+	return err == nil, err
+}
+
+type requestQueue struct {
+	mu      sync.Mutex
+	ready   chan struct{}
+	pending *requestJob
+}
+
+func newRequestQueue() *requestQueue {
+	return &requestQueue{ready: make(chan struct{}, 1)}
+}
+
+func (q *requestQueue) replace(job *requestJob) {
+	q.mu.Lock()
+	q.pending = job
+	q.mu.Unlock()
+	select {
+	case q.ready <- struct{}{}:
+	default:
+	}
+}
+
+func (q *requestQueue) take() *requestJob {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	job := q.pending
+	q.pending = nil
+	return job
 }
 
 func NewDaemon(endpoint, name string, handler Handler, logger *log.Logger) *Daemon {
@@ -56,36 +120,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 	defer stopClose()
 
-	jobs := make(chan *requestJob, maxConcurrentRequests)
-	var requestMu sync.Mutex
-	var currentRequest *requestJob
-	finishRequest := func(job *requestJob) {
-		requestMu.Lock()
-		if currentRequest == job {
-			currentRequest = nil
-		}
-		requestMu.Unlock()
-		job.cancel()
-	}
+	queue := newRequestQueue()
+	requests := requestState{mu: &d.writeMu}
 	for range maxConcurrentRequests {
 		go func() {
 			for {
 				select {
 				case <-runCtx.Done():
 					return
-				case job := <-jobs:
+				case <-queue.ready:
+					job := queue.take()
+					if job == nil {
+						continue
+					}
 					if job.ctx.Err() != nil {
-						finishRequest(job)
+						requests.finish(job)
 						continue
 					}
 					d.logger.Printf("request qid=%s: %s", job.message.QueryID, job.message.Text)
 					payload := d.handler.Request(job.ctx, job.message.QueryID, job.message.Text)
-					if err := d.writeResponse(job.ctx, conn, response{Type: "response", QueryID: job.message.QueryID, Data: payload}); err != nil && job.ctx.Err() == nil {
+					sent, err := requests.writeResponse(conn, job, payload)
+					if err != nil && runCtx.Err() == nil {
 						d.logger.Printf("write Tarragon response: %v", err)
-					} else if job.ctx.Err() == nil {
+					} else if sent {
 						d.logger.Printf("response sent qid=%s", job.message.QueryID)
 					}
-					finishRequest(job)
+					requests.finish(job)
 				}
 			}
 		}()
@@ -106,17 +166,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			requestCtx, cancel := context.WithCancel(runCtx)
 			job := &requestJob{ctx: requestCtx, cancel: cancel, message: message}
-			requestMu.Lock()
-			if currentRequest != nil {
-				currentRequest.cancel()
-			}
-			currentRequest = job
-			requestMu.Unlock()
-			select {
-			case jobs <- job:
-			case <-runCtx.Done():
-				finishRequest(job)
-			}
+			requests.replace(job)
+			queue.replace(job)
 		case "select":
 			success, text := d.handler.Select(runCtx, message)
 			if err := d.write(conn, selectResponse{Type: "select_response", Success: success, Message: text}); err != nil {
@@ -130,15 +181,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return fmt.Errorf("read Tarragon messages: %w", err)
 	}
 	return nil
-}
-
-func (d *Daemon) writeResponse(ctx context.Context, conn net.Conn, message response) error {
-	d.writeMu.Lock()
-	defer d.writeMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return json.NewEncoder(conn).Encode(message)
 }
 
 func (d *Daemon) write(conn net.Conn, message any) error {
