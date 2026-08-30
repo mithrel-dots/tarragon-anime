@@ -109,10 +109,11 @@ type fakeSession struct {
 	subtitles []string
 	messages  []string
 	closed    bool
+	closedCh  chan struct{}
 }
 
 func newFakeSession() *fakeSession {
-	return &fakeSession{events: make(chan mpv.Event, 16)}
+	return &fakeSession{events: make(chan mpv.Event, 16), closedCh: make(chan struct{})}
 }
 
 func (s *fakeSession) Events() <-chan mpv.Event { return s.events }
@@ -147,7 +148,10 @@ func (s *fakeSession) ShowText(_ context.Context, message string) error {
 
 func (s *fakeSession) Close() {
 	s.mu.Lock()
-	s.closed = true
+	if !s.closed {
+		s.closed = true
+		close(s.closedCh)
+	}
 	s.mu.Unlock()
 }
 
@@ -474,7 +478,11 @@ func TestPlaybackCanDisableAutoNextAndResume(t *testing.T) {
 		t.Fatalf("initial resume position = %v, want 0", player.start)
 	}
 	session.events <- mpv.Event{Type: mpv.EventEndFile, Reason: "eof"}
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-session.closedCh:
+	case <-time.After(time.Second):
+		t.Fatal("playback did not stop after end of file")
+	}
 	if session.loadCount() != 0 {
 		t.Fatalf("load count = %d, want 0", session.loadCount())
 	}

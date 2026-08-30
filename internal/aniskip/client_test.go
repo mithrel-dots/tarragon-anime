@@ -2,24 +2,49 @@ package aniskip
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
+func assertRequest(t *testing.T, clientErr error, requestErrors <-chan error) {
+	t.Helper()
+	if clientErr != nil {
+		select {
+		case requestErr := <-requestErrors:
+			if requestErr != nil {
+				t.Fatalf("request handler: %v; client: %v", requestErr, clientErr)
+			}
+		default:
+		}
+		t.Fatal(clientErr)
+	}
+	select {
+	case requestErr := <-requestErrors:
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for request handler")
+	}
+}
+
 func TestSkipTimes(t *testing.T) {
+	requestErrors := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/skip-times/52991/4" || len(r.URL.Query()["types"]) != 2 || r.URL.Query().Get("episodeLength") != "1400.000" {
-			t.Fatalf("request = %s", r.URL.String())
+			requestErrors <- fmt.Errorf("request = %s", r.URL.String())
+		} else {
+			requestErrors <- nil
 		}
 		_, _ = w.Write([]byte(`{"results":[{"skipType":"op","interval":{"startTime":0,"endTime":89.5}},{"skipType":"ed","interval":{"startTime":1380,"endTime":1400}},{"skipType":"mixed","interval":{"startTime":1,"endTime":2}},{"skipType":"op","interval":{"startTime":4,"endTime":3}}]}`))
 	}))
 	defer server.Close()
 
 	times, err := NewClientWithEndpoint(server.Client(), server.URL+"/v2").SkipTimes(context.Background(), 52991, 4, 1400)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertRequest(t, err, requestErrors)
 	if len(times) != 2 || times[0].Type != Opening || times[0].End != 89.5 || times[1].Type != Ending {
 		t.Fatalf("SkipTimes() = %#v", times)
 	}
