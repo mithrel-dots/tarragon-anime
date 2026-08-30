@@ -73,3 +73,39 @@ func TestSearchUsesLocalPreviewPath(t *testing.T) {
 		t.Fatalf("Search() = %#v", results)
 	}
 }
+
+type episodeValueProvider struct {
+	value string
+}
+
+func (p *episodeValueProvider) Match(_ context.Context, id int, _ []string, _ string) (allanime.Anime, error) {
+	return allanime.Anime{ID: "show", Name: "Frieren", AniListID: id}, nil
+}
+
+func (p *episodeValueProvider) Episodes(context.Context, allanime.Anime, string) ([]allanime.Episode, error) {
+	return []allanime.Episode{{ShowID: "show", Number: 1, Value: "provider-episode-key"}}, nil
+}
+
+func (p *episodeValueProvider) Streams(_ context.Context, episode allanime.Episode, _, _ string) ([]allanime.Stream, error) {
+	p.value = episode.Value
+	return []allanime.Stream{{URL: "https://video.test/1.m3u8"}}, nil
+}
+
+func TestPlaybackPreservesProviderEpisodeValue(t *testing.T) {
+	provider := &episodeValueProvider{}
+	service := NewService(&cachingAniList{}, provider, &fakePlayer{session: newFakeSession()}, nil, nil, nil, DefaultConfig(), nil)
+	defer service.Close()
+	episodes, err := service.Episodes(t.Context(), 154587)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != 1 || episodes[0].Value != "provider-episode-key" {
+		t.Fatalf("Episodes() = %#v", episodes)
+	}
+	if err := service.PlayEpisode(t.Context(), episodes[0]); err != nil {
+		t.Fatal(err)
+	}
+	if provider.value != "provider-episode-key" {
+		t.Fatalf("provider stream episode value = %q", provider.value)
+	}
+}

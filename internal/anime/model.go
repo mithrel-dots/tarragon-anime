@@ -23,6 +23,7 @@ type Episode struct {
 	Title      string
 	Provider   string
 	ProviderID string
+	Value      string
 }
 
 func (e Episode) ResultID() string {

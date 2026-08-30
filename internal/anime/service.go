@@ -11,7 +11,6 @@ import (
 
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/aniskip"
-	"tarragon-anime/internal/auth"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/provider/allanime"
 	"tarragon-anime/internal/store"
@@ -68,6 +67,7 @@ type tokenStore interface {
 	Token() (string, error)
 	Save(string) error
 	Delete() error
+	AuthorizationURL(string) (string, error)
 }
 
 // browser opens the AniList consent page in the user's default browser.
@@ -100,6 +100,13 @@ type Service struct {
 	accountMu    sync.Mutex
 	accountToken string
 	accountName  string
+
+	rootCtx      context.Context
+	rootCancel   context.CancelFunc
+	lifecycleMu  sync.Mutex
+	closed       bool
+	workers      sync.WaitGroup
+	serviceClose sync.Once
 }
 
 type activePlayback struct {
@@ -146,10 +153,11 @@ func NewService(anilistClient aniListClient, provider providerClient, player pla
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
+	rootCtx, rootCancel := context.WithCancel(context.Background())
 	return &Service{
 		anilist: anilistClient, provider: provider, player: player, state: state, preview: previews,
 		sync: syncer, config: config, logger: logger, media: make(map[int]anilist.Media),
-		episodes: make(map[int][]Episode),
+		episodes: make(map[int][]Episode), rootCtx: rootCtx, rootCancel: rootCancel,
 	}
 }
 
@@ -182,10 +190,10 @@ func (s *Service) SignedIn() bool {
 
 // StartLogin opens the AniList consent page for the implicit grant.
 func (s *Service) StartLogin(context.Context) error {
-	if s.browser == nil {
+	if s.browser == nil || s.tokens == nil {
 		return fmt.Errorf("AniList sign-in is unavailable")
 	}
-	url, err := auth.AuthorizeURL(s.config.ClientID)
+	url, err := s.tokens.AuthorizationURL(s.config.ClientID)
 	if err != nil {
 		return err
 	}
@@ -381,7 +389,7 @@ func (s *Service) Episodes(ctx context.Context, mediaID int) ([]Episode, error) 
 		result = append(result, Episode{
 			MediaID: mediaID, Number: item.Number,
 			Title:    fmt.Sprintf("%s - Episode %d", media.Title, item.Number),
-			Provider: "allanime", ProviderID: providerAnime.ID,
+			Provider: "allanime", ProviderID: providerAnime.ID, Value: item.Value,
 		})
 	}
 	s.cacheMu.Lock()
@@ -415,6 +423,7 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 	if index < 0 {
 		return fmt.Errorf("episode %d is not available for AniList %d", episode.Number, episode.MediaID)
 	}
+	episode = episodes[index]
 	stream, err := s.resolveStream(ctx, episode)
 	if err != nil {
 		return err
@@ -425,7 +434,7 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 	if err != nil {
 		return fmt.Errorf("launch mpv: %w", err)
 	}
-	playbackCtx, cancel := context.WithCancel(ctx)
+	playbackCtx, cancel := context.WithCancel(s.rootCtx)
 	active := &activePlayback{
 		ctx: playbackCtx, cancel: cancel, session: session,
 		episodes: episodes, index: index, stream: stream,
@@ -439,21 +448,51 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 	previous := s.active
 	s.active = active
 	s.playbackMu.Unlock()
+	if !s.launch(func() { s.controlPlayback(active) }) {
+		active.stop()
+		s.playbackMu.Lock()
+		if s.active == active {
+			s.active = nil
+		}
+		s.playbackMu.Unlock()
+		return fmt.Errorf("service is closed")
+	}
 	if previous != nil {
 		previous.stop()
 	}
-	go s.controlPlayback(active)
 	return nil
 }
 
 func (s *Service) Close() {
-	s.playbackMu.Lock()
-	active := s.active
-	s.active = nil
-	s.playbackMu.Unlock()
-	if active != nil {
-		active.stop()
+	s.serviceClose.Do(func() {
+		s.lifecycleMu.Lock()
+		s.closed = true
+		s.rootCancel()
+		s.lifecycleMu.Unlock()
+
+		s.playbackMu.Lock()
+		active := s.active
+		s.active = nil
+		s.playbackMu.Unlock()
+		if active != nil {
+			active.stop()
+		}
+		s.workers.Wait()
+	})
+}
+
+func (s *Service) launch(run func()) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closed {
+		return false
 	}
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		run()
+	}()
+	return true
 }
 
 func (s *Service) controlPlayback(active *activePlayback) {
@@ -562,13 +601,16 @@ func (s *Service) startNextPrefetch(active *activePlayback) {
 	generation := active.nextGeneration
 	ctx, cancel := context.WithCancel(active.ctx)
 	active.nextPrefetch = &nextPrefetch{generation: generation, cancel: cancel}
-	go func() {
+	if !s.launch(func() {
 		stream, err := s.resolveStream(ctx, target)
 		select {
 		case active.nextResults <- nextResult{generation: generation, episode: target, stream: stream, err: err}:
 		case <-ctx.Done():
 		}
-	}()
+	}) {
+		cancel()
+		active.nextPrefetch = nil
+	}
 }
 
 func (s *Service) handleNextResult(active *activePlayback, result nextResult) {
@@ -618,15 +660,21 @@ func (s *Service) Run(ctx context.Context) {
 	if !s.syncEnabled() {
 		return
 	}
-	s.FlushSync(ctx)
+	runCtx, cancel := context.WithCancel(ctx)
+	stopRootCancel := context.AfterFunc(s.rootCtx, cancel)
+	defer func() {
+		stopRootCancel()
+		cancel()
+	}()
+	s.FlushSync(runCtx)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return
 		case <-ticker.C:
-			s.FlushSync(ctx)
+			s.FlushSync(runCtx)
 		}
 	}
 }
@@ -643,20 +691,20 @@ func (s *Service) queueSync(active *activePlayback) {
 	if !s.syncEnabled() || active.synced || active.index < 0 || active.index >= len(active.episodes) {
 		return
 	}
-	active.synced = true
 	episode := active.episodes[active.index]
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(active.ctx), 5*time.Second)
 	defer cancel()
 	if err := s.state.EnqueueSync(ctx, episode.MediaID, episode.Number); err != nil {
 		s.logger.Printf("queue AniList sync media_id=%d episode=%d: %v", episode.MediaID, episode.Number, err)
 		return
 	}
+	active.synced = true
 	s.logger.Printf("queued AniList sync media_id=%d episode=%d", episode.MediaID, episode.Number)
-	go func() {
-		flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	s.launch(func() {
+		flushCtx, cancel := context.WithTimeout(s.rootCtx, 30*time.Second)
 		defer cancel()
 		s.FlushSync(flushCtx)
-	}()
+	})
 }
 
 func (s *Service) FlushSync(ctx context.Context) {
@@ -699,17 +747,17 @@ func (s *Service) pushSync(ctx context.Context, item store.SyncItem) error {
 			target = remote.Progress
 		}
 	case "remote":
-		if found && remote.Progress >= item.Episode {
+		if found && remote.Progress > item.Episode {
 			s.logger.Printf("AniList progress kept media_id=%d remote=%d local=%d", item.MediaID, remote.Progress, item.Episode)
 			return nil
 		}
 	}
-	if found && remote.Progress == target {
-		return nil
-	}
 	status := "CURRENT"
 	if total := s.totalEpisodes(ctx, item.MediaID); total > 0 && target >= total {
 		status = "COMPLETED"
+	}
+	if found && remote.Progress == target && (status != "COMPLETED" || remote.Status == "COMPLETED") {
+		return nil
 	}
 	entry, err := s.sync.SaveProgress(ctx, item.MediaID, target, status)
 	if err != nil {
@@ -904,7 +952,7 @@ func skipLabel(kind string) string {
 
 func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Stream, error) {
 	streams, err := s.provider.Streams(ctx, allanime.Episode{
-		ShowID: episode.ProviderID, Number: episode.Number, Value: fmt.Sprint(episode.Number),
+		ShowID: episode.ProviderID, Number: episode.Number, Value: episode.Value,
 	}, s.config.Translation, s.config.PreferredQuality)
 	if err != nil {
 		return mpv.Stream{}, fmt.Errorf("resolve AllAnime episode %d: %w", episode.Number, err)
@@ -985,7 +1033,7 @@ func (s *Service) saveProgress(active *activePlayback, complete bool) {
 		return
 	}
 	episode := active.episodes[active.index]
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(active.ctx), 2*time.Second)
 	defer cancel()
 	if err := s.state.SaveProgress(ctx, store.Progress{
 		MediaID: episode.MediaID, Episode: episode.Number,

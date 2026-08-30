@@ -48,7 +48,11 @@ func command(args []string) error {
 		if err != nil {
 			return err
 		}
-		url, err := auth.AuthorizeURL(config.ClientID)
+		store, err := tokenStore()
+		if err != nil {
+			return err
+		}
+		url, err := store.AuthorizationURL(config.ClientID)
 		if err != nil {
 			return err
 		}
@@ -58,11 +62,11 @@ func command(args []string) error {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: tarragon-anime auth <callback-uri>")
 		}
-		token, err := auth.ParseCallback(args[1])
+		store, err := tokenStore()
 		if err != nil {
 			return err
 		}
-		store, err := tokenStore()
+		token, err := store.ParseCallback(args[1])
 		if err != nil {
 			return err
 		}
@@ -180,8 +184,14 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go service.Run(ctx)
+	serviceDone := make(chan struct{})
+	go func() {
+		defer close(serviceDone)
+		service.Run(ctx)
+	}()
 	err = daemon.Run(ctx)
+	service.Close()
+	<-serviceDone
 	logger.Printf("shutdown")
 	return err
 }
