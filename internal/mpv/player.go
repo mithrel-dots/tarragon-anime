@@ -112,6 +112,7 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string, start fl
 		return nil, fmt.Errorf("connect mpv IPC: %w", err)
 	}
 	session := newSession(conn, cmd, socket, p.logger)
+	go session.dispatchEvents()
 	go session.readIPC()
 	go session.wait(exited)
 
@@ -166,12 +167,21 @@ type Session struct {
 	logger *log.Logger
 	events chan Event
 	done   chan struct{}
+	exited chan struct{}
 
-	writeMu sync.Mutex
+	writeMu chan struct{}
 	mu      sync.Mutex
 	nextID  int
 	pending map[int]chan ipcResponse
-	once    sync.Once
+
+	eventMu     sync.Mutex
+	eventQueue  []Event
+	eventNotify chan struct{}
+	eventClosed bool
+
+	finishOnce   sync.Once
+	closeOnce    sync.Once
+	closeTimeout time.Duration
 }
 
 type ipcResponse struct {
@@ -182,8 +192,9 @@ type ipcResponse struct {
 func newSession(conn net.Conn, cmd *exec.Cmd, socket string, logger *log.Logger) *Session {
 	return &Session{
 		conn: conn, cmd: cmd, socket: socket, logger: logger,
-		events: make(chan Event, 64), done: make(chan struct{}),
-		pending: make(map[int]chan ipcResponse),
+		events: make(chan Event), done: make(chan struct{}), exited: make(chan struct{}),
+		writeMu: make(chan struct{}, 1), pending: make(map[int]chan ipcResponse),
+		eventNotify: make(chan struct{}, 1), closeTimeout: time.Second,
 	}
 }
 
@@ -226,11 +237,20 @@ func (s *Session) Seek(ctx context.Context, position float64) error {
 }
 
 func (s *Session) Close() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if _, err := s.command(ctx, "quit"); err != nil {
-		s.kill()
-	}
+	s.closeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), s.closeTimeout)
+		defer cancel()
+
+		_, _ = s.command(ctx, "quit")
+		select {
+		case <-s.exited:
+			return
+		case <-ctx.Done():
+			s.kill()
+		}
+		// Process.Kill unblocks Wait, which must complete to release OS resources.
+		<-s.exited
+	})
 }
 
 func (s *Session) command(ctx context.Context, args ...any) (json.RawMessage, error) {
@@ -242,11 +262,25 @@ func (s *Session) command(ctx context.Context, args ...any) (json.RawMessage, er
 	s.mu.Unlock()
 
 	message := map[string]any{"command": args, "request_id": id}
-	s.writeMu.Lock()
-	err := json.NewEncoder(s.conn).Encode(message)
-	s.writeMu.Unlock()
+	select {
+	case s.writeMu <- struct{}{}:
+	case <-s.done:
+		s.removePending(id)
+		return nil, fmt.Errorf("mpv IPC closed")
+	case <-ctx.Done():
+		s.removePending(id)
+		return nil, ctx.Err()
+	}
+	err := s.write(ctx, message)
+	<-s.writeMu
 	if err != nil {
 		s.removePending(id)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return nil, context.DeadlineExceeded
+		}
 		return nil, err
 	}
 	select {
@@ -259,6 +293,28 @@ func (s *Session) command(ctx context.Context, args ...any) (json.RawMessage, er
 		s.removePending(id)
 		return nil, ctx.Err()
 	}
+}
+
+func (s *Session) write(ctx context.Context, message any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := s.conn.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = s.conn.SetWriteDeadline(time.Now())
+		close(canceled)
+	})
+	err := json.NewEncoder(s.conn).Encode(message)
+	if !stop() {
+		<-canceled
+	}
+	_ = s.conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 func (s *Session) readIPC() {
@@ -333,13 +389,82 @@ func (s *Session) handleEvent(event, name, reason string, args []string, data js
 }
 
 func (s *Session) emit(event Event) {
-	select {
-	case s.events <- event:
-	default:
-		if event.Type != EventPosition && event.Type != EventDuration {
-			s.logger.Printf("mpv event queue full type=%d", event.Type)
+	s.eventMu.Lock()
+	if s.eventClosed {
+		s.eventMu.Unlock()
+		return
+	}
+	if isTelemetry(event) {
+		// Keep only the latest property values between reliable events.
+		coalesced := false
+		for index := len(s.eventQueue) - 1; index >= 0 && isTelemetry(s.eventQueue[index]); index-- {
+			if s.eventQueue[index].Type == event.Type {
+				s.eventQueue[index] = event
+				coalesced = true
+				break
+			}
+		}
+		if !coalesced {
+			s.eventQueue = append(s.eventQueue, event)
+		}
+	} else {
+		s.eventQueue = append(s.eventQueue, event)
+	}
+	s.eventMu.Unlock()
+	s.notifyEvents()
+}
+
+func (s *Session) dispatchEvents() {
+	for {
+		s.eventMu.Lock()
+		index := s.nextEvent()
+		if index < 0 {
+			closed := s.eventClosed
+			if closed {
+				s.eventQueue = nil
+			}
+			s.eventMu.Unlock()
+			if closed {
+				close(s.events)
+				return
+			}
+			<-s.eventNotify
+			continue
+		}
+		event := s.eventQueue[index]
+		s.eventMu.Unlock()
+
+		select {
+		case s.events <- event:
+			s.eventMu.Lock()
+			s.eventQueue = append(s.eventQueue[:index], s.eventQueue[index+1:]...)
+			s.eventMu.Unlock()
+		case <-s.eventNotify:
 		}
 	}
+}
+
+func (s *Session) nextEvent() int {
+	for index, event := range s.eventQueue {
+		if !isTelemetry(event) {
+			return index
+		}
+	}
+	if len(s.eventQueue) > 0 && !s.eventClosed {
+		return 0
+	}
+	return -1
+}
+
+func (s *Session) notifyEvents() {
+	select {
+	case s.eventNotify <- struct{}{}:
+	default:
+	}
+}
+
+func isTelemetry(event Event) bool {
+	return event.Type == EventPosition || event.Type == EventDuration
 }
 
 func (s *Session) wait(exited <-chan error) {
@@ -349,10 +474,11 @@ func (s *Session) wait(exited <-chan error) {
 	}
 	_ = s.conn.Close()
 	_ = os.Remove(s.socket)
+	close(s.exited)
 }
 
 func (s *Session) finish() {
-	s.once.Do(func() {
+	s.finishOnce.Do(func() {
 		close(s.done)
 		s.mu.Lock()
 		for id, response := range s.pending {
@@ -360,12 +486,15 @@ func (s *Session) finish() {
 			delete(s.pending, id)
 		}
 		s.mu.Unlock()
-		close(s.events)
+		s.eventMu.Lock()
+		s.eventClosed = true
+		s.eventMu.Unlock()
+		s.notifyEvents()
 	})
 }
 
 func (s *Session) kill() {
-	if s.cmd.Process != nil {
+	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
 	_ = s.conn.Close()

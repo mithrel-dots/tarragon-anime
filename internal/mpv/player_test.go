@@ -2,11 +2,14 @@ package mpv
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -49,6 +52,15 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 		t.Fatal(err)
 	}
 	session.Close()
+	concrete := session.(*Session)
+	select {
+	case <-concrete.exited:
+	default:
+		t.Fatal("Close returned before mpv exited")
+	}
+	if concrete.cmd.ProcessState == nil {
+		t.Fatal("Close returned before mpv was reaped")
+	}
 	args, err := os.ReadFile(argsFile)
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +90,296 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 		if !strings.Contains(string(commands), expected) {
 			t.Errorf("mpv commands %q do not contain %q", commands, expected)
 		}
+	}
+}
+
+func TestSessionMapsIPCEvents(t *testing.T) {
+	session, server := protocolSession(t)
+	encoder := json.NewEncoder(server)
+	tests := []struct {
+		name    string
+		message map[string]any
+		want    Event
+	}{
+		{name: "file loaded", message: map[string]any{"event": "file-loaded"}, want: Event{Type: EventFileLoaded}},
+		{name: "end file", message: map[string]any{"event": "end-file", "reason": "eof"}, want: Event{Type: EventEndFile, Reason: "eof"}},
+		{name: "shutdown", message: map[string]any{"event": "shutdown"}, want: Event{Type: EventShutdown}},
+		{name: "next", message: map[string]any{"event": "client-message", "args": []string{"tarragon-next"}}, want: Event{Type: EventNext}},
+		{name: "previous", message: map[string]any{"event": "client-message", "args": []string{"tarragon-previous"}}, want: Event{Type: EventPrevious}},
+		{name: "skip", message: map[string]any{"event": "client-message", "args": []string{"tarragon-skip"}}, want: Event{Type: EventSkip}},
+		{name: "position", message: map[string]any{"event": "property-change", "name": "time-pos", "data": 12.5}, want: Event{Type: EventPosition, Value: 12.5}},
+		{name: "duration", message: map[string]any{"event": "property-change", "name": "duration", "data": 24.5}, want: Event{Type: EventDuration, Value: 24.5}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := encoder.Encode(test.message); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case got := <-session.Events():
+				if got != test.want {
+					t.Fatalf("event = %#v, want %#v", got, test.want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for event")
+			}
+		})
+	}
+}
+
+func TestSessionPreservesControlEventsUnderTelemetryPressure(t *testing.T) {
+	session, server := protocolSession(t)
+	eventsWritten := make(chan error, 1)
+	protocolDone := make(chan error, 1)
+	go func() {
+		encoder := json.NewEncoder(server)
+		for index := 0; index < 2_000; index++ {
+			name := "time-pos"
+			if index%2 == 1 {
+				name = "duration"
+			}
+			if err := encoder.Encode(map[string]any{"event": "property-change", "name": name, "data": index}); err != nil {
+				eventsWritten <- err
+				return
+			}
+		}
+		for _, message := range []map[string]any{
+			{"event": "file-loaded"},
+			{"event": "end-file", "reason": "eof"},
+			{"event": "shutdown"},
+			{"event": "client-message", "args": []string{"tarragon-next"}},
+			{"event": "client-message", "args": []string{"tarragon-previous"}},
+			{"event": "client-message", "args": []string{"tarragon-skip"}},
+		} {
+			if err := encoder.Encode(message); err != nil {
+				eventsWritten <- err
+				return
+			}
+		}
+		eventsWritten <- nil
+
+		scanner := bufio.NewScanner(server)
+		if !scanner.Scan() {
+			protocolDone <- scanner.Err()
+			return
+		}
+		var request struct {
+			RequestID int `json:"request_id"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
+			protocolDone <- err
+			return
+		}
+		protocolDone <- encoder.Encode(map[string]any{"request_id": request.RequestID, "error": "success"})
+	}()
+
+	select {
+	case err := <-eventsWritten:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IPC reader blocked by event delivery")
+	}
+	if _, err := session.command(t.Context(), "get_property", "path"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-protocolDone; err != nil {
+		t.Fatal(err)
+	}
+
+	want := []EventType{EventFileLoaded, EventEndFile, EventShutdown, EventNext, EventPrevious, EventSkip}
+	var got []EventType
+	deadline := time.After(time.Second)
+	for len(got) < len(want) {
+		select {
+		case event := <-session.Events():
+			if !isTelemetry(event) {
+				got = append(got, event.Type)
+			}
+		case <-deadline:
+			t.Fatalf("control events = %v, want %v", got, want)
+		}
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("control events = %v, want %v", got, want)
+		}
+	}
+
+	session.eventMu.Lock()
+	queuedTelemetry := 0
+	for _, event := range session.eventQueue {
+		if isTelemetry(event) {
+			queuedTelemetry++
+		}
+	}
+	session.eventMu.Unlock()
+	if queuedTelemetry > 2 {
+		t.Fatalf("telemetry queue length = %d, want at most 2", queuedTelemetry)
+	}
+}
+
+func TestSessionCleansPendingCommands(t *testing.T) {
+	session, server := protocolSession(t)
+	requestRead := make(chan struct{}, 2)
+	closeServer := make(chan struct{})
+	go func() {
+		scanner := bufio.NewScanner(server)
+		for range 2 {
+			if !scanner.Scan() {
+				return
+			}
+			requestRead <- struct{}{}
+		}
+		<-closeServer
+		_ = server.Close()
+	}()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	first := make(chan error, 1)
+	go func() {
+		_, err := session.command(ctx, "get_property", "path")
+		first <- err
+	}()
+	<-requestRead
+	cancel()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled command error = %v", err)
+	}
+	assertNoPending(t, session)
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := session.command(t.Context(), "get_property", "duration")
+		second <- err
+	}()
+	<-requestRead
+	close(closeServer)
+	if err := <-second; err == nil || !strings.Contains(err.Error(), "mpv IPC closed") {
+		t.Fatalf("closed IPC command error = %v", err)
+	}
+	assertNoPending(t, session)
+}
+
+func TestCommandWriteHonorsContext(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	session := newSession(client, nil, "", log.New(io.Discard, "", 0))
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := session.command(ctx, "quit")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("command error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("blocked socket write took %v", elapsed)
+	}
+	assertNoPending(t, session)
+}
+
+func TestSessionCloseKillsAndReapsAfterQuitAcknowledgement(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCloseHelperProcess$")
+	cmd.Env = append(os.Environ(), "MPV_CLOSE_HELPER=1")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	client, server := net.Pipe()
+	session := newSession(client, cmd, "", log.New(io.Discard, "", 0))
+	session.closeTimeout = 50 * time.Millisecond
+	go session.dispatchEvents()
+	go session.readIPC()
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	go session.wait(exited)
+
+	quitAcknowledged := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer server.Close()
+		scanner := bufio.NewScanner(server)
+		if !scanner.Scan() {
+			quitAcknowledged <- scanner.Err()
+			return
+		}
+		var request struct {
+			Command   []string `json:"command"`
+			RequestID int      `json:"request_id"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
+			quitAcknowledged <- err
+			return
+		}
+		if len(request.Command) != 1 || request.Command[0] != "quit" {
+			quitAcknowledged <- errors.New("expected quit command")
+			return
+		}
+		quitAcknowledged <- json.NewEncoder(server).Encode(map[string]any{"request_id": request.RequestID, "error": "success"})
+		for scanner.Scan() {
+		}
+	}()
+
+	session.Close()
+	if err := <-quitAcknowledged; err != nil {
+		t.Fatal(err)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("Close did not reap process")
+	}
+	select {
+	case <-session.exited:
+	default:
+		t.Fatal("Close returned before process termination")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("IPC server did not observe connection close")
+	}
+
+	started := time.Now()
+	session.Close()
+	if elapsed := time.Since(started); elapsed > 25*time.Millisecond {
+		t.Fatalf("second Close took %v", elapsed)
+	}
+}
+
+func TestCloseHelperProcess(t *testing.T) {
+	if os.Getenv("MPV_CLOSE_HELPER") != "1" {
+		return
+	}
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+func protocolSession(t *testing.T) (*Session, net.Conn) {
+	t.Helper()
+	client, server := net.Pipe()
+	session := newSession(client, nil, "", log.New(io.Discard, "", 0))
+	go session.dispatchEvents()
+	go session.readIPC()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = client.Close()
+	})
+	return session, server
+}
+
+func assertNoPending(t *testing.T, session *Session) {
+	t.Helper()
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if len(session.pending) != 0 {
+		t.Fatalf("pending commands = %d, want 0", len(session.pending))
 	}
 }
 
