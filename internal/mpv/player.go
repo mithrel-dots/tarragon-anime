@@ -112,6 +112,7 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string, start fl
 		return nil, fmt.Errorf("connect mpv IPC: %w", err)
 	}
 	session := newSession(conn, cmd, socket, p.logger)
+	go session.dispatchEvents()
 	go session.readIPC()
 	go session.wait(exited)
 
@@ -160,19 +161,37 @@ func (p *Player) connect(ctx context.Context, socket string, exited <-chan error
 }
 
 type Session struct {
-	conn   net.Conn
-	cmd    *exec.Cmd
-	socket string
-	logger *log.Logger
-	events chan Event
-	done   chan struct{}
+	conn       net.Conn
+	cmd        *exec.Cmd
+	socket     string
+	logger     *log.Logger
+	events     chan Event
+	done       chan struct{}
+	exited     chan struct{}
+	readerDone chan struct{}
+	eventDone  chan struct{}
 
-	writeMu sync.Mutex
+	writeMu chan struct{}
 	mu      sync.Mutex
 	nextID  int
 	pending map[int]chan ipcResponse
-	once    sync.Once
+
+	eventMu     sync.Mutex
+	eventQueue  []Event
+	eventNotify chan struct{}
+	eventStop   chan struct{}
+	eventClosed bool
+	overflowed  bool
+
+	finishOnce    sync.Once
+	closeOnce     sync.Once
+	eventStopOnce sync.Once
+	closeTimeout  time.Duration
 }
+
+// eventQueueLimit bounds events waiting behind a blocked consumer. Telemetry
+// is dropped first; exhausting the limit with reliable events ends the session.
+const eventQueueLimit = 64
 
 type ipcResponse struct {
 	data json.RawMessage
@@ -182,8 +201,10 @@ type ipcResponse struct {
 func newSession(conn net.Conn, cmd *exec.Cmd, socket string, logger *log.Logger) *Session {
 	return &Session{
 		conn: conn, cmd: cmd, socket: socket, logger: logger,
-		events: make(chan Event, 64), done: make(chan struct{}),
-		pending: make(map[int]chan ipcResponse),
+		events: make(chan Event), done: make(chan struct{}), exited: make(chan struct{}),
+		readerDone: make(chan struct{}), eventDone: make(chan struct{}),
+		writeMu: make(chan struct{}, 1), pending: make(map[int]chan ipcResponse),
+		eventNotify: make(chan struct{}, 1), eventStop: make(chan struct{}), closeTimeout: time.Second,
 	}
 }
 
@@ -226,11 +247,25 @@ func (s *Session) Seek(ctx context.Context, position float64) error {
 }
 
 func (s *Session) Close() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if _, err := s.command(ctx, "quit"); err != nil {
-		s.kill()
-	}
+	s.closeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), s.closeTimeout)
+		defer cancel()
+
+		_, _ = s.command(ctx, "quit")
+		select {
+		case <-s.exited:
+		case <-ctx.Done():
+			s.kill()
+			// Process.Kill unblocks Wait, which must complete to release OS resources.
+			<-s.exited
+		}
+		<-s.readerDone
+		// The caller is tearing the session down and may itself be the event
+		// consumer, so release the dispatcher rather than waiting for a read
+		// that will never come.
+		s.stopEvents()
+		<-s.eventDone
+	})
 }
 
 func (s *Session) command(ctx context.Context, args ...any) (json.RawMessage, error) {
@@ -242,11 +277,25 @@ func (s *Session) command(ctx context.Context, args ...any) (json.RawMessage, er
 	s.mu.Unlock()
 
 	message := map[string]any{"command": args, "request_id": id}
-	s.writeMu.Lock()
-	err := json.NewEncoder(s.conn).Encode(message)
-	s.writeMu.Unlock()
+	select {
+	case s.writeMu <- struct{}{}:
+	case <-s.done:
+		s.removePending(id)
+		return nil, fmt.Errorf("mpv IPC closed")
+	case <-ctx.Done():
+		s.removePending(id)
+		return nil, ctx.Err()
+	}
+	err := s.write(ctx, message)
+	<-s.writeMu
 	if err != nil {
 		s.removePending(id)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return nil, context.DeadlineExceeded
+		}
 		return nil, err
 	}
 	select {
@@ -261,7 +310,30 @@ func (s *Session) command(ctx context.Context, args ...any) (json.RawMessage, er
 	}
 }
 
+func (s *Session) write(ctx context.Context, message any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := s.conn.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = s.conn.SetWriteDeadline(time.Now())
+		close(canceled)
+	})
+	err := json.NewEncoder(s.conn).Encode(message)
+	if !stop() {
+		<-canceled
+	}
+	_ = s.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
 func (s *Session) readIPC() {
+	defer close(s.readerDone)
 	scanner := bufio.NewScanner(s.conn)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
 	for scanner.Scan() {
@@ -333,13 +405,131 @@ func (s *Session) handleEvent(event, name, reason string, args []string, data js
 }
 
 func (s *Session) emit(event Event) {
-	select {
-	case s.events <- event:
-	default:
-		if event.Type != EventPosition && event.Type != EventDuration {
-			s.logger.Printf("mpv event queue full type=%d", event.Type)
+	s.eventMu.Lock()
+	if s.eventClosed || s.overflowed {
+		s.eventMu.Unlock()
+		return
+	}
+	if isTelemetry(event) {
+		// Keep only the latest property values between reliable events.
+		coalesced := false
+		for index := len(s.eventQueue) - 1; index >= 0 && isTelemetry(s.eventQueue[index]); index-- {
+			if s.eventQueue[index].Type == event.Type {
+				s.eventQueue[index] = event
+				coalesced = true
+				break
+			}
+		}
+		if !coalesced {
+			if len(s.eventQueue) >= eventQueueLimit {
+				s.eventMu.Unlock()
+				return
+			}
+			s.eventQueue = append(s.eventQueue, event)
+		}
+	} else {
+		if len(s.eventQueue) >= eventQueueLimit && !s.dropTelemetryLocked() {
+			s.overflowed = true
+			s.eventMu.Unlock()
+			s.logger.Printf("mpv reliable event queue overflow limit=%d; terminating session", eventQueueLimit)
+			// The consumer has stopped reading, so the backlog can never be
+			// delivered: end the session instead of growing without bound.
+			s.kill()
+			s.stopEvents()
+			return
+		}
+		s.eventQueue = append(s.eventQueue, event)
+	}
+	s.eventMu.Unlock()
+	s.notifyEvents()
+}
+
+func (s *Session) dispatchEvents() {
+	defer close(s.eventDone)
+	defer close(s.events)
+	for {
+		s.eventMu.Lock()
+		if len(s.eventQueue) == 0 {
+			// The queue is drained: once IPC has ended there is nothing left
+			// to deliver, so the consumer can observe the closed channel.
+			if s.eventClosed {
+				s.eventMu.Unlock()
+				return
+			}
+			s.eventMu.Unlock()
+			select {
+			case <-s.eventNotify:
+			case <-s.eventStop:
+				s.eventMu.Lock()
+				dropped := s.discardEventsLocked(nil)
+				s.eventMu.Unlock()
+				s.logDiscardedEvents(dropped)
+				return
+			}
+			continue
+		}
+		event := s.eventQueue[0]
+		s.eventQueue = s.eventQueue[1:]
+		s.eventMu.Unlock()
+
+		select {
+		case s.events <- event:
+		case <-s.eventStop:
+			s.eventMu.Lock()
+			dropped := s.discardEventsLocked(&event)
+			s.eventMu.Unlock()
+			s.logDiscardedEvents(dropped)
+			return
 		}
 	}
+}
+
+func (s *Session) dropTelemetryLocked() bool {
+	for index := len(s.eventQueue) - 1; index >= 0; index-- {
+		if isTelemetry(s.eventQueue[index]) {
+			s.eventQueue = append(s.eventQueue[:index], s.eventQueue[index+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Session) discardEventsLocked(inFlight *Event) int {
+	dropped := 0
+	if inFlight != nil && !isTelemetry(*inFlight) {
+		dropped++
+	}
+	for _, event := range s.eventQueue {
+		if !isTelemetry(event) {
+			dropped++
+		}
+	}
+	s.eventQueue = nil
+	return dropped
+}
+
+func (s *Session) logDiscardedEvents(count int) {
+	if count > 0 {
+		s.logger.Printf("mpv event dispatcher stopped with %d undelivered reliable events", count)
+	}
+}
+
+// stopEvents abandons events the consumer has not taken yet. Undelivered
+// reliable events are reported, because dropping one is a loss of control or
+// lifecycle information rather than of replaceable telemetry.
+func (s *Session) stopEvents() {
+	s.eventStopOnce.Do(func() { close(s.eventStop) })
+}
+
+func (s *Session) notifyEvents() {
+	select {
+	case s.eventNotify <- struct{}{}:
+	default:
+	}
+}
+
+func isTelemetry(event Event) bool {
+	return event.Type == EventPosition || event.Type == EventDuration
 }
 
 func (s *Session) wait(exited <-chan error) {
@@ -349,10 +539,11 @@ func (s *Session) wait(exited <-chan error) {
 	}
 	_ = s.conn.Close()
 	_ = os.Remove(s.socket)
+	close(s.exited)
 }
 
 func (s *Session) finish() {
-	s.once.Do(func() {
+	s.finishOnce.Do(func() {
 		close(s.done)
 		s.mu.Lock()
 		for id, response := range s.pending {
@@ -360,12 +551,18 @@ func (s *Session) finish() {
 			delete(s.pending, id)
 		}
 		s.mu.Unlock()
-		close(s.events)
+		s.eventMu.Lock()
+		s.eventClosed = true
+		s.eventMu.Unlock()
+		// Wake the dispatcher so it can drain what is already queued. Only
+		// Close abandons undelivered events, because the consumer usually
+		// keeps reading until the event channel is closed.
+		s.notifyEvents()
 	})
 }
 
 func (s *Session) kill() {
-	if s.cmd.Process != nil {
+	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
 	_ = s.conn.Close()
