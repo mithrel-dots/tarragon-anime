@@ -16,6 +16,8 @@ type Store struct {
 	db *sql.DB
 }
 
+const schemaVersion = 3
+
 type Progress struct {
 	MediaID  int
 	Episode  int
@@ -135,19 +137,37 @@ func (s *Store) Progress(ctx context.Context, mediaID, episode int) (Progress, b
 }
 
 func (s *Store) SaveProgress(ctx context.Context, progress Progress) error {
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO watch_progress (anilist_id, episode, position, duration, completed, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin watch progress save: %w", err)
+	}
+	defer tx.Rollback()
+
+	var writeSeq int64
+	if err := tx.QueryRowContext(ctx, `
+		UPDATE progress_write_sequence
+		SET value = value + 1
+		WHERE id = 1
+		RETURNING value`).Scan(&writeSeq); err != nil {
+		return fmt.Errorf("advance watch progress sequence: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO watch_progress (anilist_id, episode, position, duration, completed, updated_at, write_seq)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(anilist_id, episode) DO UPDATE SET
 			position = excluded.position,
 			duration = excluded.duration,
 			completed = excluded.completed,
-			updated_at = excluded.updated_at`,
+			updated_at = excluded.updated_at,
+			write_seq = excluded.write_seq`,
 		progress.MediaID, progress.Episode, progress.Position, progress.Duration,
-		progress.Complete, time.Now().Unix(),
+		progress.Complete, time.Now().Unix(), writeSeq,
 	)
 	if err != nil {
 		return fmt.Errorf("save watch progress: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit watch progress: %w", err)
 	}
 	return nil
 }
@@ -177,7 +197,7 @@ func (s *Store) MediaProgress(ctx context.Context, mediaID int) (Progress, bool,
 	err := s.db.QueryRowContext(ctx, `
 		SELECT anilist_id, episode, position, duration, completed
 		FROM watch_progress WHERE anilist_id = ?
-		ORDER BY updated_at DESC, episode DESC LIMIT 1`,
+		ORDER BY write_seq DESC LIMIT 1`,
 		mediaID,
 	).Scan(&progress.MediaID, &progress.Episode, &progress.Position, &progress.Duration, &complete)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -199,10 +219,10 @@ func (s *Store) ResumeEntries(ctx context.Context, limit int) ([]ResumeEntry, er
 		WHERE w.rowid = (
 			SELECT latest.rowid FROM watch_progress latest
 			WHERE latest.anilist_id = w.anilist_id
-			ORDER BY latest.updated_at DESC, latest.episode DESC
+			ORDER BY latest.write_seq DESC
 			LIMIT 1
 		)
-		ORDER BY w.updated_at DESC, w.episode DESC
+		ORDER BY w.write_seq DESC
 		LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query resume entries: %w", err)
@@ -293,45 +313,89 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("begin migration: %w", err)
 	}
 	defer tx.Rollback()
-	statements := []string{
-		`CREATE TABLE IF NOT EXISTS provider_mappings (
-			anilist_id INTEGER NOT NULL,
-			provider TEXT NOT NULL,
-			provider_id TEXT NOT NULL,
-			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (anilist_id, provider)
-		)`,
-		`CREATE TABLE IF NOT EXISTS watch_progress (
-			anilist_id INTEGER NOT NULL,
-			episode INTEGER NOT NULL,
-			position REAL NOT NULL DEFAULT 0,
-			duration REAL NOT NULL DEFAULT 0,
-			completed INTEGER NOT NULL DEFAULT 0,
-			updated_at INTEGER NOT NULL,
-			PRIMARY KEY (anilist_id, episode)
-		)`,
-		`CREATE TABLE IF NOT EXISTS media (
-			anilist_id INTEGER PRIMARY KEY,
-			title TEXT NOT NULL,
-			preview_path TEXT NOT NULL DEFAULT '',
-			episodes INTEGER NOT NULL DEFAULT 0,
-			updated_at INTEGER NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS sync_queue (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			anilist_id INTEGER NOT NULL,
-			episode INTEGER NOT NULL,
-			attempts INTEGER NOT NULL DEFAULT 0,
-			last_error TEXT NOT NULL DEFAULT '',
-			updated_at INTEGER NOT NULL,
-			UNIQUE (anilist_id, episode)
-		)`,
-		`PRAGMA user_version = 2`,
+	var version int
+	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read SQLite schema version: %w", err)
 	}
-	for _, statement := range statements {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return fmt.Errorf("apply migration: %w", err)
+	if version > schemaVersion {
+		return fmt.Errorf("unsupported SQLite schema version %d (latest supported is %d)", version, schemaVersion)
+	}
+	for version < schemaVersion {
+		target := version + 1
+		var statements []string
+		switch target {
+		case 1:
+			statements = []string{
+				`CREATE TABLE provider_mappings (
+					anilist_id INTEGER NOT NULL,
+					provider TEXT NOT NULL,
+					provider_id TEXT NOT NULL,
+					updated_at INTEGER NOT NULL,
+					PRIMARY KEY (anilist_id, provider)
+				)`,
+				`CREATE TABLE watch_progress (
+					anilist_id INTEGER NOT NULL,
+					episode INTEGER NOT NULL,
+					position REAL NOT NULL DEFAULT 0,
+					duration REAL NOT NULL DEFAULT 0,
+					completed INTEGER NOT NULL DEFAULT 0,
+					updated_at INTEGER NOT NULL,
+					PRIMARY KEY (anilist_id, episode)
+				)`,
+			}
+		case 2:
+			statements = []string{
+				`CREATE TABLE media (
+					anilist_id INTEGER PRIMARY KEY,
+					title TEXT NOT NULL,
+					preview_path TEXT NOT NULL DEFAULT '',
+					episodes INTEGER NOT NULL DEFAULT 0,
+					updated_at INTEGER NOT NULL
+				)`,
+				`CREATE TABLE sync_queue (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					anilist_id INTEGER NOT NULL,
+					episode INTEGER NOT NULL,
+					attempts INTEGER NOT NULL DEFAULT 0,
+					last_error TEXT NOT NULL DEFAULT '',
+					updated_at INTEGER NOT NULL,
+					UNIQUE (anilist_id, episode)
+				)`,
+			}
+		case 3:
+			statements = []string{
+				`ALTER TABLE watch_progress ADD COLUMN write_seq INTEGER NOT NULL DEFAULT 0`,
+				`WITH ranked AS (
+					SELECT rowid, ROW_NUMBER() OVER (
+						ORDER BY updated_at, episode, anilist_id
+					) AS write_seq
+					FROM watch_progress
+				)
+				UPDATE watch_progress
+				SET write_seq = (
+					SELECT ranked.write_seq FROM ranked
+					WHERE ranked.rowid = watch_progress.rowid
+				)`,
+				`CREATE UNIQUE INDEX watch_progress_write_seq ON watch_progress(write_seq)`,
+				`CREATE TABLE progress_write_sequence (
+					id INTEGER PRIMARY KEY CHECK (id = 1),
+					value INTEGER NOT NULL
+				)`,
+				`INSERT INTO progress_write_sequence (id, value)
+				 SELECT 1, COALESCE(MAX(write_seq), 0) FROM watch_progress`,
+			}
+		default:
+			return fmt.Errorf("no migration for SQLite schema version %d", target)
 		}
+		for _, statement := range statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("migrate SQLite schema to version %d: %w", target, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, target)); err != nil {
+			return fmt.Errorf("record SQLite schema version %d: %w", target, err)
+		}
+		version = target
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit migration: %w", err)
