@@ -291,6 +291,135 @@ func TestMigrateDeployedV2PreservesData(t *testing.T) {
 	}
 }
 
+func TestMigratePopulatedUnversionedDatabase(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run("v"+strconv.Itoa(version), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "anime.db")
+			db := createLegacyDatabase(t, path, version)
+			mustExec(t, db, `INSERT INTO provider_mappings VALUES (25, 'allanime', 'show-25', 100)`)
+			mustExec(t, db, `INSERT INTO watch_progress VALUES (25, 3, 15, 25, 0, 200)`)
+			if version == 2 {
+				mustExec(t, db, `INSERT INTO media VALUES (25, 'Unversioned', '/preview.jpg', 12, 300)`)
+				mustExec(t, db, `INSERT INTO sync_queue (anilist_id, episode, attempts, last_error, updated_at)
+					VALUES (25, 3, 1, 'retry', 400)`)
+			}
+			mustExec(t, db, `PRAGMA user_version = 0`)
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			state, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			if got := databaseVersion(t, state.db); got != schemaVersion {
+				t.Fatalf("user_version = %d, want %d", got, schemaVersion)
+			}
+			providerID, found, err := state.ProviderMapping(t.Context(), 25, "allanime")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !found || providerID != "show-25" {
+				t.Fatalf("ProviderMapping() = %q, %v", providerID, found)
+			}
+			progress, found, err := state.Progress(t.Context(), 25, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !found || progress.Position != 15 {
+				t.Fatalf("Progress() = %#v, %v", progress, found)
+			}
+			if version == 2 {
+				entries, err := state.ResumeEntries(t.Context(), 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 1 || entries[0].Title != "Unversioned" || entries[0].Episode != 3 {
+					t.Fatalf("ResumeEntries() = %#v", entries)
+				}
+				items, err := state.PendingSyncs(t.Context(), 10)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(items) != 1 || items[0].Attempts != 1 {
+					t.Fatalf("PendingSyncs() = %#v", items)
+				}
+			}
+		})
+	}
+}
+
+func TestMigrateEmptyUnversionedDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anime.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PingContext(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if got := databaseVersion(t, state.db); got != schemaVersion {
+		t.Fatalf("user_version = %d, want %d", got, schemaVersion)
+	}
+	for _, table := range []string{"provider_mappings", "watch_progress", "media", "sync_queue", "progress_write_sequence"} {
+		assertTableExists(t, state.db, table)
+	}
+}
+
+func TestRejectsMalformedPopulatedUnversionedDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anime.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `CREATE TABLE provider_mappings (
+		anilist_id INTEGER NOT NULL,
+		provider TEXT NOT NULL,
+		provider_id TEXT NOT NULL,
+		updated_at INTEGER NOT NULL,
+		PRIMARY KEY (anilist_id, provider)
+	)`)
+	mustExec(t, db, `CREATE TABLE watch_progress (
+		anilist_id INTEGER NOT NULL,
+		episode INTEGER NOT NULL,
+		position REAL NOT NULL DEFAULT 0,
+		PRIMARY KEY (anilist_id, episode)
+	)`)
+	mustExec(t, db, `INSERT INTO watch_progress VALUES (31, 4, 17)`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "unsupported populated unversioned SQLite schema") {
+		t.Fatalf("Open() error = %v, want unsupported populated schema", err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := databaseVersion(t, db); got != 0 {
+		t.Fatalf("user_version = %d after rejected inference, want 0", got)
+	}
+	var count int
+	if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM watch_progress`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("watch_progress row count = %d after rejection, want 1", count)
+	}
+}
+
 func TestMigrationFailureDoesNotAdvanceVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "anime.db")
 	db := createLegacyDatabase(t, path, 1)

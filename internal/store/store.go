@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -17,6 +19,46 @@ type Store struct {
 }
 
 const schemaVersion = 3
+
+type columnShape struct {
+	name         string
+	kind         string
+	notNull      int
+	defaultValue string
+	primaryKey   int
+}
+
+var legacyTableShapes = map[string][]columnShape{
+	"provider_mappings": {
+		{name: "anilist_id", kind: "INTEGER", notNull: 1, primaryKey: 1},
+		{name: "provider", kind: "TEXT", notNull: 1, primaryKey: 2},
+		{name: "provider_id", kind: "TEXT", notNull: 1},
+		{name: "updated_at", kind: "INTEGER", notNull: 1},
+	},
+	"watch_progress": {
+		{name: "anilist_id", kind: "INTEGER", notNull: 1, primaryKey: 1},
+		{name: "episode", kind: "INTEGER", notNull: 1, primaryKey: 2},
+		{name: "position", kind: "REAL", notNull: 1, defaultValue: "0"},
+		{name: "duration", kind: "REAL", notNull: 1, defaultValue: "0"},
+		{name: "completed", kind: "INTEGER", notNull: 1, defaultValue: "0"},
+		{name: "updated_at", kind: "INTEGER", notNull: 1},
+	},
+	"media": {
+		{name: "anilist_id", kind: "INTEGER", primaryKey: 1},
+		{name: "title", kind: "TEXT", notNull: 1},
+		{name: "preview_path", kind: "TEXT", notNull: 1, defaultValue: "''"},
+		{name: "episodes", kind: "INTEGER", notNull: 1, defaultValue: "0"},
+		{name: "updated_at", kind: "INTEGER", notNull: 1},
+	},
+	"sync_queue": {
+		{name: "id", kind: "INTEGER", primaryKey: 1},
+		{name: "anilist_id", kind: "INTEGER", notNull: 1},
+		{name: "episode", kind: "INTEGER", notNull: 1},
+		{name: "attempts", kind: "INTEGER", notNull: 1, defaultValue: "0"},
+		{name: "last_error", kind: "TEXT", notNull: 1, defaultValue: "''"},
+		{name: "updated_at", kind: "INTEGER", notNull: 1},
+	},
+}
 
 type Progress struct {
 	MediaID  int
@@ -320,6 +362,18 @@ func (s *Store) migrate(ctx context.Context) error {
 	if version > schemaVersion {
 		return fmt.Errorf("unsupported SQLite schema version %d (latest supported is %d)", version, schemaVersion)
 	}
+	if version == 0 {
+		inferredVersion, err := inferUnversionedSchema(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if inferredVersion != 0 {
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, inferredVersion)); err != nil {
+				return fmt.Errorf("record inferred SQLite schema version %d: %w", inferredVersion, err)
+			}
+			version = inferredVersion
+		}
+	}
 	for version < schemaVersion {
 		target := version + 1
 		var statements []string
@@ -401,4 +455,126 @@ func (s *Store) migrate(ctx context.Context) error {
 		return fmt.Errorf("commit migration: %w", err)
 	}
 	return nil
+}
+
+func inferUnversionedSchema(ctx context.Context, tx *sql.Tx) (int, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT name FROM sqlite_schema
+		WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+		ORDER BY name`)
+	if err != nil {
+		return 0, fmt.Errorf("inspect unversioned SQLite schema: %w", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("inspect unversioned SQLite table: %w", err)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("inspect unversioned SQLite tables: %w", err)
+	}
+	if len(tables) == 0 {
+		return 0, nil
+	}
+
+	var version int
+	switch {
+	case slices.Equal(tables, []string{"provider_mappings", "watch_progress"}):
+		version = 1
+	case slices.Equal(tables, []string{"media", "provider_mappings", "sync_queue", "watch_progress"}):
+		version = 2
+	default:
+		return 0, fmt.Errorf("unsupported populated unversioned SQLite schema: tables %s do not match v1 or v2", strings.Join(tables, ", "))
+	}
+	for _, table := range tables {
+		if err := validateLegacyTable(ctx, tx, table); err != nil {
+			return 0, fmt.Errorf("unsupported populated unversioned SQLite schema: %w", err)
+		}
+	}
+	if version == 2 {
+		unique, err := hasUniqueColumns(ctx, tx, "sync_queue", []string{"anilist_id", "episode"})
+		if err != nil {
+			return 0, fmt.Errorf("inspect unversioned SQLite sync queue: %w", err)
+		}
+		if !unique {
+			return 0, errors.New("unsupported populated unversioned SQLite schema: sync_queue lacks its media/episode uniqueness constraint")
+		}
+	}
+	return version, nil
+}
+
+func validateLegacyTable(ctx context.Context, tx *sql.Tx, table string) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	defer rows.Close()
+	var columns []columnShape
+	for rows.Next() {
+		var cid int
+		var column columnShape
+		var defaultValue sql.NullString
+		if err := rows.Scan(
+			&cid, &column.name, &column.kind, &column.notNull, &defaultValue, &column.primaryKey,
+		); err != nil {
+			return fmt.Errorf("inspect table %s column: %w", table, err)
+		}
+		column.kind = strings.ToUpper(column.kind)
+		if defaultValue.Valid {
+			column.defaultValue = defaultValue.String
+		}
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect table %s columns: %w", table, err)
+	}
+	if !slices.Equal(columns, legacyTableShapes[table]) {
+		return fmt.Errorf("table %s does not match the supported schema", table)
+	}
+	return nil
+}
+
+func hasUniqueColumns(ctx context.Context, tx *sql.Tx, table string, want []string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_index_list(?) WHERE "unique" = 1`, table)
+	if err != nil {
+		return false, err
+	}
+	var indexes []string
+	for rows.Next() {
+		var index string
+		if err := rows.Scan(&index); err != nil {
+			rows.Close()
+			return false, err
+		}
+		indexes = append(indexes, index)
+	}
+	if err := rows.Close(); err != nil {
+		return false, err
+	}
+	for _, index := range indexes {
+		indexRows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_index_info(?) ORDER BY seqno`, index)
+		if err != nil {
+			return false, err
+		}
+		var columns []string
+		for indexRows.Next() {
+			var column string
+			if err := indexRows.Scan(&column); err != nil {
+				indexRows.Close()
+				return false, err
+			}
+			columns = append(columns, column)
+		}
+		if err := indexRows.Close(); err != nil {
+			return false, err
+		}
+		if slices.Equal(columns, want) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
