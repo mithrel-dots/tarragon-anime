@@ -38,6 +38,8 @@ type autoNextProvider struct {
 	errors      map[int]error
 	blockFirst  chan struct{}
 	started     chan struct{}
+	canceled    chan struct{}
+	finish      chan struct{}
 }
 
 func (p *autoNextProvider) Match(_ context.Context, id int, _ []string, _ string) (allanime.Anime, error) {
@@ -62,6 +64,12 @@ func (p *autoNextProvider) Streams(ctx context.Context, episode allanime.Episode
 		select {
 		case <-p.blockFirst:
 		case <-ctx.Done():
+			if p.canceled != nil {
+				close(p.canceled)
+			}
+			if p.finish != nil {
+				<-p.finish
+			}
 			return nil, ctx.Err()
 		}
 	}
@@ -213,6 +221,7 @@ type memoryState struct {
 	queue    []store.SyncItem
 	nextID   int64
 	failures []string
+	enqueue  error
 }
 
 func newMemoryState() *memoryState {
@@ -259,6 +268,9 @@ func (s *memoryState) ResumeEntries(_ context.Context, _ int) ([]store.ResumeEnt
 func (s *memoryState) EnqueueSync(_ context.Context, mediaID, episode int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.enqueue != nil {
+		return s.enqueue
+	}
 	for _, item := range s.queue {
 		if item.MediaID == mediaID && item.Episode == episode {
 			return nil
@@ -332,6 +344,67 @@ func (s *memoryState) saved(mediaID, episode int) store.Progress {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.progress[[2]int{mediaID, episode}]
+}
+
+type blockingSaveState struct {
+	*memoryState
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingSaveState) SaveProgress(ctx context.Context, progress store.Progress) error {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-s.release
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.memoryState.SaveProgress(ctx, progress)
+}
+
+func TestCloseWaitsForFinalProgressSave(t *testing.T) {
+	session := newFakeSession()
+	state := &blockingSaveState{
+		memoryState: newMemoryState(),
+		started:     make(chan struct{}, 1),
+		release:     make(chan struct{}),
+	}
+	config := DefaultConfig()
+	config.AutoNext = false
+	service := NewService(&cachingAniList{}, navigationProvider{}, &fakePlayer{session: session}, state, nil, nil, config, nil)
+	startTestPlayback(t, service)
+
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 100}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 40}
+	session.events <- mpv.Event{Type: mpv.EventSkip}
+	waitFor(t, func() bool { return len(session.messagesCopy()) == 1 })
+
+	closed := make(chan struct{})
+	go func() {
+		service.Close()
+		close(closed)
+	}()
+	select {
+	case <-state.started:
+	case <-time.After(time.Second):
+		t.Fatal("final progress save did not start")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before final progress was persisted")
+	default:
+	}
+	close(state.release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after final progress was persisted")
+	}
+	if progress := state.saved(154587, 1); progress.Position != 40 || progress.Duration != 100 || progress.Complete {
+		t.Fatalf("final progress = %#v", progress)
+	}
 }
 
 func TestPlaybackAutoNextAndPrevious(t *testing.T) {
@@ -586,6 +659,50 @@ func TestPlaybackManualNavigationCancelsAutoNextPrefetch(t *testing.T) {
 	}
 	if provider.callsFor(2) != 2 || session.isClosed() {
 		t.Fatalf("provider calls for episode 2 = %d, closed = %v", provider.callsFor(2), session.isClosed())
+	}
+}
+
+func TestCloseCancelsAndWaitsForPrefetch(t *testing.T) {
+	session := newFakeSession()
+	provider := &autoNextProvider{
+		episodes:   []int{1, 2},
+		blockFirst: make(chan struct{}),
+		started:    make(chan struct{}),
+		canceled:   make(chan struct{}),
+		finish:     make(chan struct{}),
+	}
+	config := DefaultConfig()
+	config.AutoNextThresholdPercent = 80
+	service := NewService(&cachingAniList{}, provider, &fakePlayer{session: session}, nil, nil, nil, config, nil)
+	startTestPlayback(t, service)
+	session.events <- mpv.Event{Type: mpv.EventDuration, Value: 100}
+	session.events <- mpv.Event{Type: mpv.EventPosition, Value: 80}
+	select {
+	case <-provider.started:
+	case <-time.After(time.Second):
+		t.Fatal("auto-next prefetch did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		service.Close()
+		close(closed)
+	}()
+	select {
+	case <-provider.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel auto-next prefetch")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before auto-next prefetch exited")
+	default:
+	}
+	close(provider.finish)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after auto-next prefetch exited")
 	}
 }
 

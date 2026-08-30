@@ -6,13 +6,18 @@
 package auth
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -26,27 +31,37 @@ const (
 	DefaultClientID = "49699"
 
 	authorizeEndpoint = "https://anilist.co/api/v2/oauth/authorize"
+	authorizationTTL  = 10 * time.Minute
 )
 
-// AuthorizeURL builds the AniList implicit-grant sign-in URL.
-func AuthorizeURL(clientID string) (string, error) {
+// AuthorizationURL persists a one-time state value and builds the AniList
+// implicit-grant sign-in URL. The callback may be handled by another process.
+func (s *Store) AuthorizationURL(clientID string) (string, error) {
 	clientID = strings.TrimSpace(clientID)
 	if clientID == "" {
 		return "", errors.New("no AniList client ID is configured")
 	}
-	// AniList's implicit grant accepts only these parameters and takes the
-	// redirect from the application settings; sending redirect_uri here is
-	// rejected with unsupported_grant_type.
+	state, err := randomState()
+	if err != nil {
+		return "", fmt.Errorf("generate OAuth state: %w", err)
+	}
+	if err := s.saveAuthorizationState(state, time.Now().Add(authorizationTTL)); err != nil {
+		return "", err
+	}
+	// AniList takes the redirect from the application settings; sending
+	// redirect_uri here is rejected with unsupported_grant_type.
 	query := url.Values{
 		"client_id":     {clientID},
 		"response_type": {"token"},
+		"state":         {state},
 	}
 	return authorizeEndpoint + "?" + query.Encode(), nil
 }
 
-// ParseCallback extracts the access token from a redirect URI. AniList returns
-// implicit-grant tokens in the fragment, but errors arrive as query parameters.
-func ParseCallback(raw string) (string, error) {
+// ParseCallback validates and consumes the pending state before extracting the
+// access token. AniList returns tokens in the fragment, while some URI handlers
+// deliver the fragment as query parameters.
+func (s *Store) ParseCallback(raw string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return "", fmt.Errorf("parse callback URI: %w", err)
@@ -54,20 +69,39 @@ func ParseCallback(raw string) (string, error) {
 	if parsed.Scheme != Scheme {
 		return "", fmt.Errorf("unexpected callback scheme %q", parsed.Scheme)
 	}
-	if message := parsed.Query().Get("error"); message != "" {
-		if description := parsed.Query().Get("error_description"); description != "" {
+	if parsed.Host != "auth" || parsed.Path != "" || parsed.User != nil {
+		return "", fmt.Errorf("unexpected callback authority or path %q", parsed.Host+parsed.EscapedPath())
+	}
+	fragment, err := url.ParseQuery(parsed.Fragment)
+	if err != nil {
+		return "", fmt.Errorf("parse callback fragment: %w", err)
+	}
+	returnedState, err := callbackValue(parsed.Query(), fragment, "state")
+	if err != nil {
+		return "", err
+	}
+	if returnedState == "" {
+		return "", errors.New("callback did not contain OAuth state")
+	}
+	if err := s.consumeAuthorizationState(returnedState); err != nil {
+		return "", err
+	}
+
+	if message, err := callbackValue(parsed.Query(), fragment, "error"); err != nil {
+		return "", err
+	} else if message != "" {
+		description, err := callbackValue(parsed.Query(), fragment, "error_description")
+		if err != nil {
+			return "", err
+		}
+		if description != "" {
 			return "", fmt.Errorf("AniList denied authorization: %s: %s", message, description)
 		}
 		return "", fmt.Errorf("AniList denied authorization: %s", message)
 	}
-	values, err := url.ParseQuery(parsed.Fragment)
+	token, err := callbackValue(parsed.Query(), fragment, "access_token")
 	if err != nil {
-		return "", fmt.Errorf("parse callback fragment: %w", err)
-	}
-	token := values.Get("access_token")
-	if token == "" {
-		// Some handlers deliver the fragment as a query string instead.
-		token = parsed.Query().Get("access_token")
+		return "", err
 	}
 	if token == "" {
 		return "", errors.New("callback did not contain an access token")
@@ -89,6 +123,126 @@ type Store struct {
 
 func NewStore(path string) *Store {
 	return &Store{path: path}
+}
+
+func randomState() (string, error) {
+	data := make([]byte, 32)
+	if _, err := rand.Read(data); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func callbackValue(query, fragment url.Values, name string) (string, error) {
+	queryValue, fragmentValue := query.Get(name), fragment.Get(name)
+	if queryValue != "" && fragmentValue != "" && queryValue != fragmentValue {
+		return "", fmt.Errorf("callback contained conflicting %s values", name)
+	}
+	if fragmentValue != "" {
+		return fragmentValue, nil
+	}
+	return queryValue, nil
+}
+
+func (s *Store) authorizationStatePath() string {
+	return s.path + ".oauth-state"
+}
+
+func (s *Store) saveAuthorizationState(state string, expires time.Time) error {
+	path := s.authorizationStatePath()
+	lock, err := s.lockAuthorizationState()
+	if err != nil {
+		return err
+	}
+	defer unlockAuthorizationState(lock)
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".oauth-state-*")
+	if err != nil {
+		return fmt.Errorf("create OAuth state temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("secure OAuth state file: %w", err)
+	}
+	if _, err := fmt.Fprintf(temporary, "%d\n%s\n", expires.Unix(), state); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("write OAuth state: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close OAuth state file: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("store OAuth state: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) consumeAuthorizationState(returnedState string) error {
+	statePath := s.authorizationStatePath()
+	lock, err := s.lockAuthorizationState()
+	if err != nil {
+		return err
+	}
+	defer unlockAuthorizationState(lock)
+	info, err := os.Stat(statePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("no pending AniList login was found")
+		}
+		return fmt.Errorf("stat OAuth state: %w", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("OAuth state file %s must use permissions 0600", statePath)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		return fmt.Errorf("read OAuth state: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 || lines[1] == "" {
+		return errors.New("pending OAuth state is invalid")
+	}
+	expires, err := strconv.ParseInt(lines[0], 10, 64)
+	if err != nil {
+		return errors.New("pending OAuth state is invalid")
+	}
+	if time.Now().Unix() > expires {
+		_ = os.Remove(statePath)
+		return errors.New("pending AniList login has expired")
+	}
+	if subtle.ConstantTimeCompare([]byte(returnedState), []byte(lines[1])) != 1 {
+		return errors.New("callback OAuth state did not match the pending login")
+	}
+	if err := os.Remove(statePath); err != nil {
+		return fmt.Errorf("consume OAuth state: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) lockAuthorizationState() (*os.File, error) {
+	path := s.authorizationStatePath() + ".lock"
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create OAuth state directory: %w", err)
+	}
+	lock, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open OAuth state lock: %w", err)
+	}
+	if err := lock.Chmod(0o600); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("secure OAuth state lock: %w", err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("lock OAuth state: %w", err)
+	}
+	return lock, nil
+}
+
+func unlockAuthorizationState(lock *os.File) {
+	_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	_ = lock.Close()
 }
 
 func (s *Store) Path() string {

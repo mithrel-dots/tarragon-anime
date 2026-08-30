@@ -5,18 +5,20 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/store"
 )
 
 type fakeSync struct {
-	mu     sync.Mutex
-	remote int
-	found  bool
-	fail   error
-	saved  []int
-	status string
+	mu           sync.Mutex
+	remote       int
+	found        bool
+	fail         error
+	saved        []int
+	status       string
+	remoteStatus string
 }
 
 func (f *fakeSync) ListEntry(context.Context, int) (anilist.ListEntry, bool, error) {
@@ -25,7 +27,11 @@ func (f *fakeSync) ListEntry(context.Context, int) (anilist.ListEntry, bool, err
 	if f.fail != nil {
 		return anilist.ListEntry{}, false, f.fail
 	}
-	return anilist.ListEntry{Progress: f.remote, Status: "CURRENT"}, f.found, nil
+	status := f.remoteStatus
+	if status == "" {
+		status = "CURRENT"
+	}
+	return anilist.ListEntry{Progress: f.remote, Status: status}, f.found, nil
 }
 
 func (f *fakeSync) SaveProgress(_ context.Context, _ int, progress int, status string) (anilist.ListEntry, error) {
@@ -143,6 +149,133 @@ func TestSyncMarksCompletedOnFinalEpisode(t *testing.T) {
 	newSyncService(t, state, syncer, DefaultConfig()).FlushSync(t.Context())
 	if syncer.status != "COMPLETED" {
 		t.Fatalf("status = %q, want COMPLETED", syncer.status)
+	}
+}
+
+func TestSyncCompletesEqualFinalProgress(t *testing.T) {
+	state := newMemoryState()
+	if err := state.EnqueueSync(t.Context(), 154587, 28); err != nil {
+		t.Fatal(err)
+	}
+	syncer := &fakeSync{remote: 28, found: true, remoteStatus: "CURRENT"}
+	newSyncService(t, state, syncer, DefaultConfig()).FlushSync(t.Context())
+	if got := syncer.savedProgress(); len(got) != 1 || got[0] != 28 || syncer.status != "COMPLETED" {
+		t.Fatalf("saved = %v status = %q, want final COMPLETED update", got, syncer.status)
+	}
+}
+
+type flakyMetadataAniList struct {
+	err error
+}
+
+func (c *flakyMetadataAniList) Search(context.Context, string) ([]anilist.Media, error) {
+	return nil, nil
+}
+
+func (c *flakyMetadataAniList) Get(context.Context, int) (anilist.Media, error) {
+	if c.err != nil {
+		return anilist.Media{}, c.err
+	}
+	return anilist.Media{ID: 154587, Episodes: 28}, nil
+}
+
+func TestSyncKeepsEqualProgressQueuedWhenFinalStatusLookupFails(t *testing.T) {
+	state := newMemoryState()
+	if err := state.EnqueueSync(t.Context(), 154587, 28); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &flakyMetadataAniList{err: errors.New("metadata unavailable")}
+	syncer := &fakeSync{remote: 28, found: true, remoteStatus: "CURRENT"}
+	service := NewService(metadata, navigationProvider{}, &fakePlayer{session: newFakeSession()}, state, nil, syncer, DefaultConfig(), nil)
+	defer service.Close()
+	service.FlushSync(t.Context())
+	if state.pendingCount() != 1 || len(state.failures) != 1 || len(syncer.savedProgress()) != 0 {
+		t.Fatalf("failed lookup queue=%d failures=%v saved=%v", state.pendingCount(), state.failures, syncer.savedProgress())
+	}
+
+	metadata.err = nil
+	service.FlushSync(t.Context())
+	if state.pendingCount() != 0 || len(syncer.savedProgress()) != 1 || syncer.status != "COMPLETED" {
+		t.Fatalf("retry queue=%d saved=%v status=%q", state.pendingCount(), syncer.savedProgress(), syncer.status)
+	}
+}
+
+func TestQueueSyncMarksPlaybackOnlyAfterEnqueueSucceeds(t *testing.T) {
+	state := newMemoryState()
+	state.enqueue = errors.New("disk full")
+	service := newSyncService(t, state, &fakeSync{}, DefaultConfig())
+	defer service.Close()
+	active := &activePlayback{
+		ctx:      service.rootCtx,
+		episodes: []Episode{{MediaID: 154587, Number: 4}},
+		index:    0,
+	}
+	service.queueSync(active)
+	if active.synced {
+		t.Fatal("playback marked synced after enqueue failed")
+	}
+	state.mu.Lock()
+	state.enqueue = nil
+	state.mu.Unlock()
+	service.queueSync(active)
+	if !active.synced {
+		t.Fatal("playback not marked synced after enqueue succeeded")
+	}
+}
+
+type blockingSync struct {
+	*fakeSync
+	started chan struct{}
+	finish  chan struct{}
+}
+
+func (s *blockingSync) ListEntry(ctx context.Context, _ int) (anilist.ListEntry, bool, error) {
+	close(s.started)
+	<-ctx.Done()
+	<-s.finish
+	return anilist.ListEntry{}, false, ctx.Err()
+}
+
+func TestCloseCancelsAndWaitsForImmediateSync(t *testing.T) {
+	state := newMemoryState()
+	syncer := &blockingSync{
+		fakeSync: &fakeSync{},
+		started:  make(chan struct{}),
+		finish:   make(chan struct{}),
+	}
+	service := newSyncService(t, state, syncer, DefaultConfig())
+	active := &activePlayback{
+		ctx:      service.rootCtx,
+		episodes: []Episode{{MediaID: 154587, Number: 4}},
+		index:    0,
+	}
+	service.queueSync(active)
+	select {
+	case <-syncer.started:
+	case <-time.After(time.Second):
+		t.Fatal("immediate sync did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		service.Close()
+		close(closed)
+	}()
+	select {
+	case <-service.rootCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel immediate sync")
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close returned before immediate sync exited")
+	default:
+	}
+	close(syncer.finish)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after immediate sync exited")
 	}
 }
 
