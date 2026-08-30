@@ -2,6 +2,7 @@ package mpv
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -124,6 +125,66 @@ func TestSessionMapsIPCEvents(t *testing.T) {
 				t.Fatal("timed out waiting for event")
 			}
 		})
+	}
+}
+
+func TestSessionPreservesTelemetryBeforeEOF(t *testing.T) {
+	session, server := protocolSession(t)
+	eventsWritten := make(chan error, 1)
+	protocolDone := make(chan error, 1)
+	go func() {
+		encoder := json.NewEncoder(server)
+		for _, message := range []map[string]any{
+			{"event": "property-change", "name": "time-pos", "data": 12.5},
+			{"event": "property-change", "name": "duration", "data": 24.5},
+			{"event": "end-file", "reason": "eof"},
+		} {
+			if err := encoder.Encode(message); err != nil {
+				eventsWritten <- err
+				return
+			}
+		}
+		eventsWritten <- nil
+
+		scanner := bufio.NewScanner(server)
+		if !scanner.Scan() {
+			protocolDone <- scanner.Err()
+			return
+		}
+		var request struct {
+			RequestID int `json:"request_id"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
+			protocolDone <- err
+			return
+		}
+		protocolDone <- encoder.Encode(map[string]any{"request_id": request.RequestID, "error": "success"})
+	}()
+
+	if err := <-eventsWritten; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.command(t.Context(), "get_property", "path"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-protocolDone; err != nil {
+		t.Fatal(err)
+	}
+
+	want := []Event{
+		{Type: EventPosition, Value: 12.5},
+		{Type: EventDuration, Value: 24.5},
+		{Type: EventEndFile, Reason: "eof"},
+	}
+	for _, expected := range want {
+		select {
+		case got := <-session.Events():
+			if got != expected {
+				t.Fatalf("event = %#v, want %#v", got, expected)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for event %#v", expected)
+		}
 	}
 }
 
@@ -262,6 +323,84 @@ func TestSessionCleansPendingCommands(t *testing.T) {
 	assertNoPending(t, session)
 }
 
+func TestSessionDeliversQueuedEventsAfterIPCEnds(t *testing.T) {
+	session, server := protocolSession(t)
+	encoder := json.NewEncoder(server)
+	for _, message := range []map[string]any{
+		{"event": "property-change", "name": "time-pos", "data": 42.5},
+		{"event": "end-file", "reason": "eof"},
+		{"event": "shutdown"},
+	} {
+		if err := encoder.Encode(message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The consumer is still reading, so ending IPC must not discard events
+	// that mpv already reported.
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []Event{
+		{Type: EventPosition, Value: 42.5},
+		{Type: EventEndFile, Reason: "eof"},
+		{Type: EventShutdown},
+	}
+	for _, expected := range want {
+		select {
+		case got, ok := <-session.Events():
+			if !ok {
+				t.Fatalf("event channel closed before %#v", expected)
+			}
+			if got != expected {
+				t.Fatalf("event = %#v, want %#v", got, expected)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for event %#v", expected)
+		}
+	}
+	select {
+	case _, ok := <-session.Events():
+		if ok {
+			t.Fatal("event channel produced an unexpected event")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("event channel was not closed after IPC ended")
+	}
+}
+
+func TestReliableEventOverflowTerminatesSession(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	var logs bytes.Buffer
+	session := newSession(client, nil, "", log.New(&logs, "", 0))
+	go session.dispatchEvents()
+	go session.readIPC()
+
+	encoder := json.NewEncoder(server)
+	for range eventQueueLimit + 2 {
+		if err := encoder.Encode(map[string]any{"event": "client-message", "args": []string{"tarragon-next"}}); err != nil {
+			break
+		}
+	}
+	select {
+	case <-session.readerDone:
+	case <-time.After(time.Second):
+		t.Fatal("overflow did not terminate IPC reader")
+	}
+	select {
+	case <-session.eventDone:
+	case <-time.After(time.Second):
+		t.Fatal("overflow did not terminate event dispatcher")
+	}
+	if !strings.Contains(logs.String(), "reliable event queue overflow") {
+		t.Fatalf("overflow log = %q", logs.String())
+	}
+	if _, ok := <-session.Events(); ok {
+		t.Fatal("Events remained open after overflow")
+	}
+}
+
 func TestCommandWriteHonorsContext(t *testing.T) {
 	client, server := net.Pipe()
 	t.Cleanup(func() {
@@ -322,7 +461,16 @@ func TestSessionCloseKillsAndReapsAfterQuitAcknowledgement(t *testing.T) {
 			quitAcknowledged <- errors.New("expected quit command")
 			return
 		}
-		quitAcknowledged <- json.NewEncoder(server).Encode(map[string]any{"request_id": request.RequestID, "error": "success"})
+		encoder := json.NewEncoder(server)
+		if err := encoder.Encode(map[string]any{"event": "end-file", "reason": "eof"}); err != nil {
+			quitAcknowledged <- err
+			return
+		}
+		if err := encoder.Encode(map[string]any{"event": "client-message", "args": []string{"tarragon-next"}}); err != nil {
+			quitAcknowledged <- err
+			return
+		}
+		quitAcknowledged <- encoder.Encode(map[string]any{"request_id": request.RequestID, "error": "success"})
 		for scanner.Scan() {
 		}
 	}()
@@ -343,6 +491,19 @@ func TestSessionCloseKillsAndReapsAfterQuitAcknowledgement(t *testing.T) {
 	case <-serverDone:
 	case <-time.After(time.Second):
 		t.Fatal("IPC server did not observe connection close")
+	}
+	if _, ok := <-session.Events(); ok {
+		t.Fatal("Close returned before Events closed")
+	}
+	select {
+	case <-session.readerDone:
+	default:
+		t.Fatal("Close returned before IPC reader stopped")
+	}
+	select {
+	case <-session.eventDone:
+	default:
+		t.Fatal("Close returned before event dispatcher stopped")
 	}
 
 	started := time.Now()
@@ -370,6 +531,17 @@ func protocolSession(t *testing.T) (*Session, net.Conn) {
 	t.Cleanup(func() {
 		_ = server.Close()
 		_ = client.Close()
+		session.stopEvents()
+		select {
+		case <-session.readerDone:
+		case <-time.After(time.Second):
+			t.Error("IPC reader did not stop")
+		}
+		select {
+		case <-session.eventDone:
+		case <-time.After(time.Second):
+			t.Error("event dispatcher did not stop")
+		}
 	})
 	return session, server
 }
