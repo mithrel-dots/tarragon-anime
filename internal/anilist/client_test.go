@@ -7,7 +7,30 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func assertRequest(t *testing.T, clientErr error, requestErrors <-chan error) {
+	t.Helper()
+	if clientErr != nil {
+		select {
+		case requestErr := <-requestErrors:
+			if requestErr != nil {
+				t.Fatalf("request handler: %v; client: %v", requestErr, clientErr)
+			}
+		default:
+		}
+		t.Fatal(clientErr)
+	}
+	select {
+	case requestErr := <-requestErrors:
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for request handler")
+	}
+}
 
 func TestSearchMapsGraphQLMedia(t *testing.T) {
 	requestErrors := make(chan error, 1)
@@ -37,12 +60,7 @@ func TestSearchMapsGraphQLMedia(t *testing.T) {
 	defer server.Close()
 
 	media, err := NewClientWithEndpoint(server.Client(), server.URL).Search(context.Background(), "frieren")
-	if requestErr := <-requestErrors; requestErr != nil {
-		t.Fatal(requestErr)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertRequest(t, err, requestErrors)
 	if len(media) != 1 || media[0].ID != 154587 || media[0].IDMal != 52991 || media[0].Title != "Frieren: Beyond Journey's End" || media[0].Episodes != 28 {
 		t.Fatalf("Search() = %#v", media)
 	}
@@ -89,22 +107,12 @@ func TestAuthenticatedProgressOperations(t *testing.T) {
 	defer server.Close()
 	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, func() (string, error) { return "test-token", nil })
 	entry, found, err := client.ListEntry(t.Context(), 154587)
-	if requestErr := <-requestErrors; requestErr != nil {
-		t.Fatal(requestErr)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertRequest(t, err, requestErrors)
 	if !found || entry.Progress != 3 {
 		t.Fatalf("ListEntry() = %#v, %v", entry, found)
 	}
 	entry, err = client.SaveProgress(t.Context(), 154587, 4, "CURRENT")
-	if requestErr := <-requestErrors; requestErr != nil {
-		t.Fatal(requestErr)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertRequest(t, err, requestErrors)
 	if entry.Progress != 4 || requests != 2 {
 		t.Fatalf("SaveProgress() = %#v, requests = %d", entry, requests)
 	}
@@ -149,20 +157,10 @@ func TestAuthenticatedListOperations(t *testing.T) {
 	defer server.Close()
 	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, func() (string, error) { return "test-token", nil })
 	items, err := client.List(t.Context(), 1, "CURRENT")
-	if requestErr := <-requestErrors; requestErr != nil {
-		t.Fatal(requestErr)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertRequest(t, err, requestErrors)
 	if len(items) != 1 || items[0].Media.ID != 154587 || items[0].Progress != 4 {
 		t.Fatalf("List() = %#v", items)
 	}
 	err = client.SetStatus(t.Context(), 154587, "COMPLETED")
-	if requestErr := <-requestErrors; requestErr != nil {
-		t.Fatal(requestErr)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertRequest(t, err, requestErrors)
 }

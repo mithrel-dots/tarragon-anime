@@ -6,7 +6,30 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func assertRequest(t *testing.T, clientErr error, requestErrors <-chan error) {
+	t.Helper()
+	if clientErr != nil {
+		select {
+		case requestErr := <-requestErrors:
+			if requestErr != nil {
+				t.Fatalf("request handler: %v; client: %v", requestErr, clientErr)
+			}
+		default:
+		}
+		t.Fatal(clientErr)
+	}
+	select {
+	case requestErr := <-requestErrors:
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for request handler")
+	}
+}
 
 func TestSkipTimes(t *testing.T) {
 	requestErrors := make(chan error, 1)
@@ -21,12 +44,7 @@ func TestSkipTimes(t *testing.T) {
 	defer server.Close()
 
 	times, err := NewClientWithEndpoint(server.Client(), server.URL+"/v2").SkipTimes(context.Background(), 52991, 4, 1400)
-	if requestErr := <-requestErrors; requestErr != nil {
-		t.Fatal(requestErr)
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertRequest(t, err, requestErrors)
 	if len(times) != 2 || times[0].Type != Opening || times[0].End != 89.5 || times[1].Type != Ending {
 		t.Fatalf("SkipTimes() = %#v", times)
 	}
