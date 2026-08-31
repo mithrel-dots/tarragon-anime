@@ -87,7 +87,7 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"define-section", "Shift+N", "Shift+P", "Shift+S", "loadfile", "next.m3u8", "sub-add", "show-text"} {
+	for _, expected := range []string{"mpv-version", "define-section", "Shift+N", "Shift+P", "Shift+S", "loadfile", "next.m3u8", "sub-add", "show-text"} {
 		if !strings.Contains(string(commands), expected) {
 			t.Errorf("mpv commands %q do not contain %q", commands, expected)
 		}

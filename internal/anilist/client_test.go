@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -163,4 +164,35 @@ func TestAuthenticatedListOperations(t *testing.T) {
 	}
 	err = client.SetStatus(t.Context(), 154587, "COMPLETED")
 	assertRequest(t, err, requestErrors)
+}
+
+func TestAuthenticatedUnfilteredList(t *testing.T) {
+	requestErrors := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var handlerErr error
+		defer func() { requestErrors <- handlerErr }()
+		var request struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			handlerErr = err
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, found := request.Variables["status"]; found || strings.Contains(request.Query, "$status") {
+			handlerErr = fmt.Errorf("unfiltered list request included status: %#v", request)
+			http.Error(w, handlerErr.Error(), http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"MediaListCollection":{"lists":[{"entries":[{"status":"CURRENT","progress":4,"media":{"_id":154587,"title":{"english":"Frieren"},"episodes":28}}]}]}}}`))
+	}))
+	defer server.Close()
+
+	client := NewAuthenticatedClientWithEndpoint(server.Client(), server.URL, func() (string, error) { return "test-token", nil })
+	items, err := client.List(t.Context(), 1, "")
+	assertRequest(t, err, requestErrors)
+	if len(items) != 1 || items[0].Media.ID != 154587 || items[0].Progress != 4 {
+		t.Fatalf("List() = %#v", items)
+	}
 }

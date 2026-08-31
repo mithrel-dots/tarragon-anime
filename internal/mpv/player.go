@@ -116,7 +116,7 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string, start fl
 	go session.readIPC()
 	go session.wait(exited)
 
-	if _, err := session.command(ctx, "get_property", "path"); err != nil {
+	if _, err := session.command(ctx, "get_property", "mpv-version"); err != nil {
 		session.kill()
 		return nil, fmt.Errorf("initialize mpv IPC: %w", err)
 	}

@@ -654,10 +654,10 @@ func (s *Service) cancelNextPrefetch(active *activePlayback) {
 	active.nextGeneration++
 }
 
-// Run flushes queued AniList updates until the plugin shuts down, so progress
-// recorded while offline is not lost.
+// Run exchanges AniList progress until the plugin shuts down, so remote history
+// is imported and progress recorded while offline is not lost.
 func (s *Service) Run(ctx context.Context) {
-	if !s.syncEnabled() {
+	if !s.syncConfigured() {
 		return
 	}
 	runCtx, cancel := context.WithCancel(ctx)
@@ -666,6 +666,7 @@ func (s *Service) Run(ctx context.Context) {
 		stopRootCancel()
 		cancel()
 	}()
+	s.PullSync(runCtx)
 	s.FlushSync(runCtx)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -674,17 +675,77 @@ func (s *Service) Run(ctx context.Context) {
 		case <-runCtx.Done():
 			return
 		case <-ticker.C:
+			s.PullSync(runCtx)
 			s.FlushSync(runCtx)
 		}
 	}
 }
 
+func (s *Service) syncConfigured() bool {
+	return s.config.Sync.Enabled && s.sync != nil && s.state != nil
+}
+
 func (s *Service) syncEnabled() bool {
-	if !s.config.Sync.Enabled || s.sync == nil || s.state == nil {
+	if !s.syncConfigured() {
 		return false
 	}
 	// Queued updates are retained until the user signs in.
 	return s.tokens == nil || s.SignedIn()
+}
+
+// PullSync imports the signed-in user's AniList progress into local history.
+func (s *Service) PullSync(ctx context.Context) {
+	if !s.syncEnabled() {
+		return
+	}
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+
+	viewer, err := s.sync.Viewer(ctx)
+	if err != nil {
+		s.logger.Printf("get AniList viewer for history sync: %v", err)
+		return
+	}
+	items, err := s.sync.List(ctx, viewer.ID, "")
+	if err != nil {
+		s.logger.Printf("read AniList history: %v", err)
+		return
+	}
+	for _, item := range items {
+		if ctx.Err() != nil {
+			return
+		}
+		if item.Progress <= 0 {
+			continue
+		}
+		local, found, err := s.state.MediaProgress(ctx, item.Media.ID)
+		if err != nil {
+			s.logger.Printf("read local history media_id=%d: %v", item.Media.ID, err)
+			continue
+		}
+		if found {
+			switch s.config.Sync.Conflict {
+			case "local":
+				continue
+			case "highest":
+				if local.Episode >= item.Progress {
+					continue
+				}
+			case "remote":
+				if local.Episode == item.Progress && local.Complete {
+					continue
+				}
+			}
+		}
+		s.cacheMedia(ctx, item.Media)
+		if err := s.state.SaveProgress(ctx, store.Progress{
+			MediaID: item.Media.ID, Episode: item.Progress, Complete: true,
+		}); err != nil {
+			s.logger.Printf("import AniList history media_id=%d episode=%d: %v", item.Media.ID, item.Progress, err)
+			continue
+		}
+		s.logger.Printf("AniList history imported media_id=%d episode=%d", item.Media.ID, item.Progress)
+	}
 }
 
 func (s *Service) queueSync(active *activePlayback) {
@@ -747,7 +808,7 @@ func (s *Service) pushSync(ctx context.Context, item store.SyncItem) error {
 			target = remote.Progress
 		}
 	case "remote":
-		if found && remote.Progress > item.Episode {
+		if found {
 			s.logger.Printf("AniList progress kept media_id=%d remote=%d local=%d", item.MediaID, remote.Progress, item.Episode)
 			return nil
 		}

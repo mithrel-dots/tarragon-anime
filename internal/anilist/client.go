@@ -163,7 +163,12 @@ func (c *Client) SaveProgress(ctx context.Context, mediaID, progress int, status
 }
 
 func (c *Client) List(ctx context.Context, userID int, status string) ([]ListItem, error) {
-	const gql = `query ($userId: Int!, $status: MediaListStatus!) { MediaListCollection(userId: $userId, type: ANIME, status: $status) { lists { entries { status progress media { ` + mediaFields + ` } } } } }`
+	gql := `query ($userId: Int!, $status: MediaListStatus!) { MediaListCollection(userId: $userId, type: ANIME, status: $status) { lists { entries { status progress media { ` + mediaFields + ` } } } } }`
+	variables := map[string]any{"userId": userID, "status": status}
+	if status == "" {
+		gql = `query ($userId: Int!) { MediaListCollection(userId: $userId, type: ANIME) { lists { entries { status progress media { ` + mediaFields + ` } } } } }`
+		variables = map[string]any{"userId": userID}
+	}
 	var response struct {
 		Collection struct {
 			Lists []struct {
@@ -175,7 +180,7 @@ func (c *Client) List(ctx context.Context, userID int, status string) ([]ListIte
 			} `json:"lists"`
 		} `json:"MediaListCollection"`
 	}
-	if err := c.do(ctx, gql, map[string]any{"userId": userID, "status": status}, &response); err != nil {
+	if err := c.do(ctx, gql, variables, &response); err != nil {
 		return nil, fmt.Errorf("list AniList media with status %s: %w", status, err)
 	}
 	var items []ListItem

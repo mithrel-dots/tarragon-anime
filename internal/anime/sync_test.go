@@ -19,6 +19,8 @@ type fakeSync struct {
 	saved        []int
 	status       string
 	remoteStatus string
+	listItems    []anilist.ListItem
+	listStatuses []string
 }
 
 func (f *fakeSync) ListEntry(context.Context, int) (anilist.ListEntry, bool, error) {
@@ -45,11 +47,15 @@ func (f *fakeSync) SaveProgress(_ context.Context, _ int, progress int, status s
 	return anilist.ListEntry{Progress: progress, Status: status}, nil
 }
 
-func (f *fakeSync) List(context.Context, int, string) ([]anilist.ListItem, error) {
+func (f *fakeSync) List(_ context.Context, _ int, status string) ([]anilist.ListItem, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.fail != nil {
 		return nil, f.fail
+	}
+	f.listStatuses = append(f.listStatuses, status)
+	if f.listItems != nil {
+		return append([]anilist.ListItem(nil), f.listItems...), nil
 	}
 	return []anilist.ListItem{{Media: anilist.Media{ID: 154587, Title: "Frieren", Episodes: 28}, Status: "CURRENT", Progress: 4}}, nil
 }
@@ -92,6 +98,7 @@ func TestFlushSyncConflictPolicies(t *testing.T) {
 		{name: "highest pushes local lead", conflict: "highest", remote: 1, found: true, want: []int{4}},
 		{name: "local overwrites remote", conflict: "local", remote: 9, found: true, want: []int{4}},
 		{name: "remote wins", conflict: "remote", remote: 9, found: true, want: nil},
+		{name: "remote keeps lower progress", conflict: "remote", remote: 1, found: true, want: nil},
 		{name: "no remote entry", conflict: "highest", found: false, want: []int{4}},
 	}
 	for _, test := range tests {
@@ -112,6 +119,66 @@ func TestFlushSyncConflictPolicies(t *testing.T) {
 			}
 			if state.pendingCount() != 0 {
 				t.Fatalf("queue not drained: %d", state.pendingCount())
+			}
+		})
+	}
+}
+
+func TestPullSyncImportsAniListHistory(t *testing.T) {
+	state := newMemoryState()
+	syncer := &fakeSync{listItems: []anilist.ListItem{
+		{Media: anilist.Media{ID: 154587, Title: "Frieren", Episodes: 28}, Status: "CURRENT", Progress: 4},
+		{Media: anilist.Media{ID: 1, Title: "Planning"}, Status: "PLANNING", Progress: 0},
+	}}
+	newSyncService(t, state, syncer, DefaultConfig()).PullSync(t.Context())
+
+	progress := state.saved(154587, 4)
+	if !progress.Complete {
+		t.Fatalf("progress = %#v, want completed episode 4", progress)
+	}
+	if media := state.media[154587]; media.Title != "Frieren" || media.Episodes != 28 {
+		t.Fatalf("media = %#v", media)
+	}
+	if _, found, _ := state.MediaProgress(t.Context(), 1); found {
+		t.Fatal("zero-progress planning entry was imported")
+	}
+	if len(syncer.listStatuses) != 1 || syncer.listStatuses[0] != "" {
+		t.Fatalf("list statuses = %v, want an unfiltered history query", syncer.listStatuses)
+	}
+}
+
+func TestPullSyncConflictPolicies(t *testing.T) {
+	tests := []struct {
+		name       string
+		conflict   string
+		local      int
+		remote     int
+		wantImport bool
+	}{
+		{name: "highest imports remote lead", conflict: "highest", local: 4, remote: 6, wantImport: true},
+		{name: "highest keeps local lead", conflict: "highest", local: 4, remote: 2},
+		{name: "local keeps local history", conflict: "local", local: 4, remote: 6},
+		{name: "remote imports remote rollback", conflict: "remote", local: 4, remote: 2, wantImport: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := newMemoryState()
+			if err := state.SaveProgress(t.Context(), store.Progress{MediaID: 154587, Episode: test.local, Complete: true}); err != nil {
+				t.Fatal(err)
+			}
+			syncer := &fakeSync{listItems: []anilist.ListItem{{
+				Media: anilist.Media{ID: 154587, Title: "Frieren", Episodes: 28}, Progress: test.remote,
+			}}}
+			config := DefaultConfig()
+			config.Sync.Conflict = test.conflict
+			newSyncService(t, state, syncer, config).PullSync(t.Context())
+
+			_, imported, err := state.Progress(t.Context(), 154587, test.remote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if imported != test.wantImport {
+				t.Fatalf("remote episode imported = %v, want %v", imported, test.wantImport)
 			}
 		})
 	}
