@@ -12,7 +12,7 @@ import (
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/aniskip"
 	"tarragon-anime/internal/mpv"
-	"tarragon-anime/internal/provider/allanime"
+	"tarragon-anime/internal/provider"
 	"tarragon-anime/internal/store"
 )
 
@@ -21,11 +21,7 @@ type aniListClient interface {
 	Get(context.Context, int) (anilist.Media, error)
 }
 
-type providerClient interface {
-	Match(context.Context, int, []string, string) (allanime.Anime, error)
-	Episodes(context.Context, allanime.Anime, string) ([]allanime.Episode, error)
-	Streams(context.Context, allanime.Episode, string, string) ([]allanime.Stream, error)
-}
+type providerClient = provider.Client
 
 type player interface {
 	Play(context.Context, mpv.Stream, string, float64) (mpv.SessionController, error)
@@ -1015,7 +1011,7 @@ func skipLabel(kind string) string {
 }
 
 func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Stream, error) {
-	streams, err := s.provider.Streams(ctx, allanime.Episode{
+	streams, err := s.provider.Streams(ctx, provider.Episode{
 		ShowID: episode.ProviderID, Number: episode.Number, Value: episode.Value,
 	}, s.config.Translation, s.config.PreferredQuality)
 	if err != nil {
@@ -1039,7 +1035,7 @@ func (s *Service) availableEpisodes(ctx context.Context, mediaID int) ([]Episode
 	return s.Episodes(ctx, mediaID)
 }
 
-func (s *Service) resolveProvider(ctx context.Context, mediaID int) (anilist.Media, allanime.Anime, error) {
+func (s *Service) resolveProvider(ctx context.Context, mediaID int) (anilist.Media, provider.Anime, error) {
 	s.cacheMu.RLock()
 	media, ok := s.media[mediaID]
 	s.cacheMu.RUnlock()
@@ -1047,7 +1043,7 @@ func (s *Service) resolveProvider(ctx context.Context, mediaID int) (anilist.Med
 		var err error
 		media, err = s.anilist.Get(ctx, mediaID)
 		if err != nil {
-			return anilist.Media{}, allanime.Anime{}, err
+			return anilist.Media{}, provider.Anime{}, err
 		}
 		s.cacheMu.Lock()
 		s.media[mediaID] = media
@@ -1058,14 +1054,14 @@ func (s *Service) resolveProvider(ctx context.Context, mediaID int) (anilist.Med
 		if err != nil {
 			s.logger.Printf("load provider mapping media_id=%d: %v", mediaID, err)
 		} else if found {
-			return media, allanime.Anime{ID: providerID, AniListID: mediaID}, nil
+			return media, provider.Anime{ID: providerID, AniListID: mediaID}, nil
 		}
 	}
 	aliases := []string{media.English, media.Romaji, media.Native, media.Title}
 	aliases = append(aliases, media.Synonyms...)
 	match, err := s.provider.Match(ctx, mediaID, aliases, s.config.Translation)
 	if err != nil {
-		return anilist.Media{}, allanime.Anime{}, fmt.Errorf("match provider title for AniList %d: %w", mediaID, err)
+		return anilist.Media{}, provider.Anime{}, fmt.Errorf("match provider title for AniList %d: %w", mediaID, err)
 	}
 	s.logger.Printf("provider match provider=allanime media_id=%d provider_id=%s", mediaID, match.ID)
 	if s.state != nil {

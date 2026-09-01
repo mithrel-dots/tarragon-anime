@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"tarragon-anime/internal/provider"
 )
 
 const (
@@ -36,24 +38,11 @@ const sourceQueryHash = "436dcab03223760b0ef4a96bef43f640fca6d761b84513eabb7ec13
 
 var ErrCryptoProfileRotated = errors.New("AllAnime crypto profile has rotated; update the plugin")
 
-type Anime struct {
-	ID        string
-	Name      string
-	English   string
-	AniListID int
-}
-
-type Episode struct {
-	ShowID string
-	Number int
-	Value  string
-}
-
-type Stream struct {
-	URL      string
-	Headers  map[string]string
-	Subtitle string
-}
+// Aliases preserve the provider's existing public model names while keeping
+// the service dependent on the provider-neutral contract.
+type Anime = provider.Anime
+type Episode = provider.Episode
+type Stream = provider.Stream
 
 type cryptoProfile struct {
 	BuildID       string
