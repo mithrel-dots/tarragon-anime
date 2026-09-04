@@ -36,7 +36,7 @@ const episodesQuery = `query($showId:String!){show(_id:$showId){_id availableEpi
 const sourceQuery = `query($showId:String!,$translationType:VaildTranslationTypeEnumType!,$episodeString:String!){episode(showId:$showId translationType:$translationType episodeString:$episodeString){sourceUrls show{_id}}}`
 const sourceQueryHash = "436dcab03223760b0ef4a96bef43f640fca6d761b84513eabb7ec13fa9b62a2a"
 
-var ErrCryptoProfileRotated = errors.New("AllAnime crypto profile has rotated; update the plugin")
+var ErrCryptoProfileRotated = errors.New("AllAnime crypto bootstrap is unavailable")
 
 // Aliases preserve the provider's existing public model names while keeping
 // the service dependent on the provider-neutral contract.
@@ -73,14 +73,14 @@ type cryptoFlight struct {
 }
 
 var currentProfile = cryptoProfile{
-	BuildID:       "148",
+	BuildID:       "162",
 	Lane:          "k7",
-	MaskHex:       "5431adffc5cb1502e4817f2c007b2c3def93b91221aaf808d0b0fea4bf3d30bf",
+	MaskHex:       "3b580c541f756a454382a830eb8ab5b83a97d102fe61a75a91963806269be253",
 	EpochBucketMS: 604800000,
 	GraceMS:       86400000,
-	BootPrefix:    "sXKiyl:",
-	BootJoin:      "~",
-	BootParts:     []string{"epoch", "host", "buildId", "lane", "group"},
+	BootPrefix:    "1QsVezwV:",
+	BootJoin:      ":",
+	BootParts:     []string{"group", "lane", "epoch", "host", "buildId"},
 	KeyGroup:      "mkissa",
 	Host:          "mkissa.to",
 }

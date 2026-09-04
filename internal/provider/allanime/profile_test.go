@@ -60,3 +60,15 @@ func TestRefreshProfilesResolvesAppBundleFromOrigin(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntimeProfilePatternFindsMinifiedConstants(t *testing.T) {
+	js := `const ad=Qt(953,1066),NA=6048e5,PA=Number(86400000),lm=[a()+b(),c()+d(),e()+f(),g()+h()],Tf={v:1,saltMul:240,saltAdd:242,fragMul:238,fragAdd:176,bootPrefix:x(),join:":",parts:[a(),b(),c(),d(),e()]};`
+	match := runtimeProfileRE.FindStringSubmatch(js)
+	if len(match) != 6 {
+		t.Fatalf("runtime profile match = %#v", match)
+	}
+	want := []string{"ad", "NA", "PA", "lm", "Tf"}
+	if !reflect.DeepEqual(match[1:], want) {
+		t.Fatalf("runtime profile names = %#v, want %#v", match[1:], want)
+	}
+}

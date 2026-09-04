@@ -4,13 +4,18 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
 )
 
 type bundleDecoder struct {
@@ -35,15 +40,16 @@ type bundleData struct {
 }
 
 var (
-	bundleTableRE  = regexp.MustCompile(`(?s)function ([A-Za-z$_][A-Za-z0-9$_]*)\(\)\s*\{\s*(?:const|let|var)\s+[A-Za-z$_][A-Za-z0-9$_]*\s*=\s*(\[[^\]]*\]);`)
-	bundleBaseRE   = regexp.MustCompile(`function ([A-Za-z$_][A-Za-z0-9$_]*)\(([A-Za-z$_][A-Za-z0-9$_]*)(?:,[A-Za-z$_][A-Za-z0-9$_]*)*\)\{return [A-Za-z$_][A-Za-z0-9$_]*=[A-Za-z$_][A-Za-z0-9$_]*-\(([-+*0-9 ]+)\),([A-Za-z$_][A-Za-z0-9$_]*)\(\)\[[A-Za-z$_][A-Za-z0-9$_]*\]\}`)
-	bundleAliasRE  = regexp.MustCompile(`function ([A-Za-z$_][A-Za-z0-9$_]*)\(([A-Za-z$_][A-Za-z0-9$_]*),([A-Za-z$_][A-Za-z0-9$_]*)\)\{return ([A-Za-z$_][A-Za-z0-9$_]*)\(([A-Za-z$_][A-Za-z0-9$_]*)((?:[-+][+\-0-9* ]+)?)\)\}`)
-	bundleCallRE   = regexp.MustCompile(`([A-Za-z$_][A-Za-z0-9$_]*)\(\s*(-?[0-9]+)\s*(?:,\s*(-?[0-9]+)\s*)?\)`)
-	bundleNumberRE = regexp.MustCompile(`^[0-9]{2,8}$`)
-	bundleSeedRE   = regexp.MustCompile(`^[A-Za-z0-9+/]{11}=$`)
-	bundleEntryRE  = regexp.MustCompile(`import\("([^"]*/entry/app\.[^"]+\.js)"\)`)
-	bundleChunkRE  = regexp.MustCompile(`['"](\.\.?/chunks/[A-Za-z0-9_$./-]+\.js)['"]`)
-	bundleConfigRE = regexp.MustCompile(`(?s)[A-Za-z$_][A-Za-z0-9$_]*=\{([^}]*saltMul[^}]*bootPrefix[^}]*)\}`)
+	bundleTableRE    = regexp.MustCompile(`(?s)function ([A-Za-z$_][A-Za-z0-9$_]*)\(\)\s*\{\s*(?:const|let|var)\s+[A-Za-z$_][A-Za-z0-9$_]*\s*=\s*(\[[^\]]*\]);`)
+	bundleBaseRE     = regexp.MustCompile(`function ([A-Za-z$_][A-Za-z0-9$_]*)\(([A-Za-z$_][A-Za-z0-9$_]*)(?:,[A-Za-z$_][A-Za-z0-9$_]*)*\)\{return [A-Za-z$_][A-Za-z0-9$_]*=[A-Za-z$_][A-Za-z0-9$_]*-\(([-+*0-9 ]+)\),([A-Za-z$_][A-Za-z0-9$_]*)\(\)\[[A-Za-z$_][A-Za-z0-9$_]*\]\}`)
+	bundleAliasRE    = regexp.MustCompile(`function ([A-Za-z$_][A-Za-z0-9$_]*)\(([A-Za-z$_][A-Za-z0-9$_]*),([A-Za-z$_][A-Za-z0-9$_]*)\)\{return ([A-Za-z$_][A-Za-z0-9$_]*)\(([A-Za-z$_][A-Za-z0-9$_]*)((?:[-+][+\-0-9* ]+)?)\)\}`)
+	bundleCallRE     = regexp.MustCompile(`([A-Za-z$_][A-Za-z0-9$_]*)\(\s*(-?[0-9]+)\s*(?:,\s*(-?[0-9]+)\s*)?\)`)
+	bundleNumberRE   = regexp.MustCompile(`^[0-9]{2,8}$`)
+	bundleSeedRE     = regexp.MustCompile(`^[A-Za-z0-9+/]{11}=$`)
+	bundleEntryRE    = regexp.MustCompile(`import\("([^"]*/entry/app\.[^"]+\.js)"\)`)
+	bundleChunkRE    = regexp.MustCompile(`['"](\.\.?/chunks/[A-Za-z0-9_$./-]+\.js)['"]`)
+	bundleConfigRE   = regexp.MustCompile(`(?s)[A-Za-z$_][A-Za-z0-9$_]*=\{([^}]*saltMul[^}]*bootPrefix[^}]*)\}`)
+	runtimeProfileRE = regexp.MustCompile(`const\s+([A-Za-z$_][A-Za-z0-9$_]*)=[^;]{1,100},([A-Za-z$_][A-Za-z0-9$_]*)=[^,;]+,([A-Za-z$_][A-Za-z0-9$_]*)=Number\([^;]+?\),([A-Za-z$_][A-Za-z0-9$_]*)=\[[^;]{1,500}\],([A-Za-z$_][A-Za-z0-9$_]*)=\{v:1,saltMul:[^;]{1,1000}\};`)
 )
 
 func (c *Client) refreshProfiles(ctx context.Context) ([]cryptoProfile, error) {
@@ -70,6 +76,7 @@ func (c *Client) refreshProfiles(ctx context.Context) ([]cryptoProfile, error) {
 	}
 	refs := bundleChunkRE.FindAllStringSubmatch(app, -1)
 	seen := make(map[string]bool)
+	var runtimeErr error
 	for index, ref := range refs {
 		if index >= 40 {
 			break
@@ -86,8 +93,94 @@ func (c *Client) refreshProfiles(ctx context.Context) ([]cryptoProfile, error) {
 		if profiles := parseBundleProfiles(chunk, c.origin); len(profiles) > 0 {
 			return profiles, nil
 		}
+		profiles, err := extractRuntimeProfiles(ctx, chunkURL.String(), chunk, c.origin)
+		if err == nil && len(profiles) > 0 {
+			return profiles, nil
+		}
+		if err != nil {
+			runtimeErr = err
+		}
+	}
+	if runtimeErr != nil {
+		return nil, fmt.Errorf("current crypto profile was not found in site bundle: runtime extraction: %w", runtimeErr)
 	}
 	return nil, fmt.Errorf("current crypto profile was not found in site bundle")
+}
+
+type runtimeProfilePayload struct {
+	BuildID       string   `json:"buildId"`
+	EpochBucketMS int64    `json:"epochBucketMs"`
+	GraceMS       int64    `json:"graceMs"`
+	Seeds         []string `json:"seeds"`
+	Config        struct {
+		SaltMul    int      `json:"saltMul"`
+		SaltAdd    int      `json:"saltAdd"`
+		FragMul    int      `json:"fragMul"`
+		FragAdd    int      `json:"fragAdd"`
+		BootPrefix string   `json:"bootPrefix"`
+		Join       string   `json:"join"`
+		Parts      []string `json:"parts"`
+	} `json:"config"`
+}
+
+func extractRuntimeProfiles(ctx context.Context, endpoint, js, origin string) ([]cryptoProfile, error) {
+	names := runtimeProfileRE.FindStringSubmatch(js)
+	if len(names) != 6 {
+		return nil, fmt.Errorf("runtime profile constants were not found")
+	}
+	bin, err := exec.LookPath("chromium")
+	if err != nil {
+		bin, err = exec.LookPath("chromium-browser")
+	}
+	if err != nil {
+		bin, err = exec.LookPath("google-chrome")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("Chromium is required to evaluate the current profile")
+	}
+
+	var encoded string
+	err = rod.Try(func() {
+		browserLauncher := launcher.New().Bin(bin).Headless(true)
+		defer browserLauncher.Cleanup()
+		browser := rod.New().ControlURL(browserLauncher.MustLaunch()).Context(ctx).MustConnect()
+		defer browser.MustClose()
+		page := browser.MustPage(endpoint)
+		encoded = page.MustEval(`async (endpoint, names) => {
+			const response = await fetch(endpoint, {cache: "no-store"});
+			let source = await response.text();
+			const base = new URL(".", endpoint).href;
+			source = source.replaceAll('from"./', 'from"' + base).replaceAll('import"./', 'import"' + base);
+			source += ';export {' + names.build + ' as __build,' + names.epoch + ' as __epoch,' + names.grace + ' as __grace,' + names.seeds + ' as __seeds,' + names.config + ' as __config};';
+			const module = await import(URL.createObjectURL(new Blob([source], {type: "text/javascript"})));
+			return JSON.stringify({buildId: module.__build, epochBucketMs: module.__epoch, graceMs: module.__grace, seeds: module.__seeds, config: module.__config});
+		}`, endpoint, map[string]string{
+			"build": names[1], "epoch": names[2], "grace": names[3], "seeds": names[4], "config": names[5],
+		}).Str()
+	})
+	if err != nil {
+		return nil, err
+	}
+	var payload runtimeProfilePayload
+	if err := json.Unmarshal([]byte(encoded), &payload); err != nil {
+		return nil, fmt.Errorf("decode runtime profile: %w", err)
+	}
+	mask, ok := deriveBundleMask(payload.BuildID, payload.Seeds, [4]int{
+		payload.Config.SaltMul, payload.Config.SaltAdd, payload.Config.FragMul, payload.Config.FragAdd,
+	})
+	if !ok || payload.BuildID == "" || payload.EpochBucketMS <= 0 || payload.Config.BootPrefix == "" || len(payload.Config.Parts) == 0 {
+		return nil, fmt.Errorf("runtime profile is incomplete")
+	}
+	host := "mkissa.to"
+	if parsed, err := url.Parse(origin); err == nil && parsed.Hostname() != "" {
+		host = parsed.Hostname()
+	}
+	return []cryptoProfile{{
+		BuildID: payload.BuildID, Lane: "k7", MaskHex: hex.EncodeToString(mask),
+		EpochBucketMS: payload.EpochBucketMS, GraceMS: payload.GraceMS,
+		BootPrefix: payload.Config.BootPrefix, BootJoin: payload.Config.Join, BootParts: payload.Config.Parts,
+		KeyGroup: "mkissa", Host: host,
+	}}, nil
 }
 
 func (c *Client) fetchBundleText(ctx context.Context, endpoint string) (string, error) {
