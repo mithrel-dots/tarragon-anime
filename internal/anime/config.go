@@ -14,6 +14,7 @@ import (
 
 type Config struct {
 	Provider                 string
+	Providers                []string
 	PreferredQuality         string
 	Translation              string
 	AutoNext                 bool
@@ -43,6 +44,7 @@ type SyncConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Provider:         "allanime",
+		Providers:        []string{"allanime"},
 		PreferredQuality: "best",
 		Translation:      "sub",
 		AutoNext:         true,
@@ -98,7 +100,26 @@ func LoadConfig(path string) (Config, error) {
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 		switch section + "." + key {
 		case ".provider":
-			cfg.Provider, err = parseString(value)
+			if strings.HasPrefix(strings.TrimSpace(value), "[") {
+				cfg.Providers, err = parseStringArray(value)
+				if len(cfg.Providers) > 0 {
+					cfg.Provider = cfg.Providers[0]
+				} else {
+					cfg.Provider = ""
+				}
+			} else {
+				cfg.Provider, err = parseString(value)
+				if err == nil {
+					cfg.Providers = []string{cfg.Provider}
+				}
+			}
+		case ".providers":
+			cfg.Providers, err = parseStringArray(value)
+			if len(cfg.Providers) > 0 {
+				cfg.Provider = cfg.Providers[0]
+			} else {
+				cfg.Provider = ""
+			}
 		case ".preferred_quality":
 			cfg.PreferredQuality, err = parseString(value)
 		case ".translation":
@@ -141,8 +162,15 @@ func LoadConfig(path string) (Config, error) {
 	if err := scanner.Err(); err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
-	if cfg.Provider != "allanime" {
-		return Config{}, fmt.Errorf("unsupported provider %q", cfg.Provider)
+	for index, name := range cfg.Providers {
+		name = strings.ToLower(strings.TrimSpace(name))
+		cfg.Providers[index] = name
+		if name != "allanime" && name != "animepahe" {
+			return Config{}, fmt.Errorf("unsupported provider %q", name)
+		}
+	}
+	if len(cfg.Providers) > 0 {
+		cfg.Provider = cfg.Providers[0]
 	}
 	if cfg.Translation != "sub" && cfg.Translation != "dub" {
 		return Config{}, fmt.Errorf("translation must be %q or %q", "sub", "dub")
@@ -195,7 +223,7 @@ func parseStringArray(value string) ([]string, error) {
 	}
 	value = strings.TrimSpace(value[1 : len(value)-1])
 	if value == "" {
-		return nil, nil
+		return []string{}, nil
 	}
 	parts, err := splitArray(value)
 	if err != nil {

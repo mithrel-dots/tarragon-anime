@@ -17,7 +17,9 @@ import (
 	"tarragon-anime/internal/auth"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/preview"
+	"tarragon-anime/internal/provider"
 	"tarragon-anime/internal/provider/allanime"
+	"tarragon-anime/internal/provider/animepahe"
 	"tarragon-anime/internal/store"
 	"tarragon-anime/internal/tarragon"
 )
@@ -164,12 +166,15 @@ func run() error {
 
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	aniListClient := anilist.NewClient(httpClient)
-	provider := allanime.NewClient(httpClient)
+	providers := map[string]provider.Client{
+		"allanime":  allanime.NewClient(httpClient),
+		"animepahe": animepahe.NewClient(httpClient),
+	}
 	player := mpv.New(config.MPVArgs, logger)
 	previews := preview.NewCache(httpClient, previewDir)
 
 	syncClient := anilist.NewAuthenticatedClient(httpClient, tokens.Token)
-	service := anime.NewService(aniListClient, provider, player, state, previews,
+	service := anime.NewServiceWithProviders(aniListClient, providers, player, state, previews,
 		syncClient, config, logger).WithAuth(tokens, openBrowser{}).WithSkip(aniskip.NewClient(httpClient))
 	if config.Sync.Enabled {
 		if service.SignedIn() {
