@@ -30,6 +30,8 @@ type player interface {
 type stateStore interface {
 	ProviderMapping(context.Context, int, string) (string, bool, error)
 	SaveProviderMapping(context.Context, int, string, string) error
+	CachedMedia(context.Context, int) (store.MediaInfo, bool, error)
+	SearchMedia(context.Context, string) ([]store.MediaInfo, error)
 	Progress(context.Context, int, int) (store.Progress, bool, error)
 	SaveProgress(context.Context, store.Progress) error
 	SaveMedia(context.Context, store.MediaInfo) error
@@ -295,13 +297,39 @@ func (s *Service) Search(ctx context.Context, query string) ([]Media, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
 	}
-	items, err := s.anilist.Search(ctx, query)
+	var items []anilist.Media
+	var err error
+	if s.anilist == nil {
+		err = fmt.Errorf("AniList client is unavailable")
+	} else {
+		items, err = s.anilist.Search(ctx, query)
+	}
 	if err != nil {
+		cached, cacheErr := s.cachedSearch(ctx, query)
+		if cacheErr == nil && len(cached) > 0 {
+			s.logger.Printf("AniList search unavailable, using cached media query=%q", query)
+			return cached, nil
+		}
 		return nil, err
 	}
 	result := make([]Media, 0, len(items))
 	for _, item := range items {
 		result = append(result, s.cacheMedia(ctx, item))
+	}
+	return result, nil
+}
+
+func (s *Service) cachedSearch(ctx context.Context, query string) ([]Media, error) {
+	if s.state == nil {
+		return nil, nil
+	}
+	items, err := s.state.SearchMedia(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]Media, 0, len(items))
+	for _, item := range items {
+		result = append(result, mediaFromAniList(mediaFromStore(item)))
 	}
 	return result, nil
 }
@@ -1098,15 +1126,37 @@ func (s *Service) mediaFor(ctx context.Context, mediaID int) (anilist.Media, err
 	s.cacheMu.RUnlock()
 	if !ok {
 		var err error
-		media, err = s.anilist.Get(ctx, mediaID)
-		if err != nil {
-			return anilist.Media{}, err
+		if s.anilist != nil {
+			media, err = s.anilist.Get(ctx, mediaID)
+		}
+		if err != nil || s.anilist == nil {
+			if cached, found, cacheErr := s.cachedMedia(ctx, mediaID); cacheErr == nil && found {
+				s.logger.Printf("AniList media unavailable, using cached media media_id=%d", mediaID)
+				media = cached
+			} else if err != nil {
+				return anilist.Media{}, err
+			} else if cacheErr != nil {
+				return anilist.Media{}, cacheErr
+			} else {
+				return anilist.Media{}, fmt.Errorf("media %d is not cached", mediaID)
+			}
 		}
 		s.cacheMu.Lock()
 		s.media[mediaID] = media
 		s.cacheMu.Unlock()
 	}
 	return media, nil
+}
+
+func (s *Service) cachedMedia(ctx context.Context, mediaID int) (anilist.Media, bool, error) {
+	if s.state == nil {
+		return anilist.Media{}, false, nil
+	}
+	item, found, err := s.state.CachedMedia(ctx, mediaID)
+	if err != nil || !found {
+		return anilist.Media{}, found, err
+	}
+	return mediaFromStore(item), true, nil
 }
 
 func (s *Service) providerNames() []string {
@@ -1236,5 +1286,11 @@ func mediaFromAniList(item anilist.Media) Media {
 	return Media{
 		ID: item.ID, Title: item.Title, Format: item.Format, Episodes: item.Episodes,
 		CoverURL: item.CoverURL, Aliases: aliases,
+	}
+}
+
+func mediaFromStore(item store.MediaInfo) anilist.Media {
+	return anilist.Media{
+		ID: item.ID, Title: item.Title, Episodes: item.Episodes, CoverURL: item.PreviewPath,
 	}
 }

@@ -3,6 +3,7 @@ package anime
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -240,6 +241,26 @@ func (s *memoryState) SaveMedia(_ context.Context, media store.MediaInfo) error 
 	s.media[media.ID] = media
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *memoryState) CachedMedia(_ context.Context, mediaID int) (store.MediaInfo, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	media, found := s.media[mediaID]
+	return media, found, nil
+}
+
+func (s *memoryState) SearchMedia(_ context.Context, query string) ([]store.MediaInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	query = strings.ToLower(query)
+	var result []store.MediaInfo
+	for _, media := range s.media {
+		if strings.Contains(strings.ToLower(media.Title), query) {
+			result = append(result, media)
+		}
+	}
+	return result, nil
 }
 
 func (s *memoryState) MediaProgress(_ context.Context, mediaID int) (store.Progress, bool, error) {

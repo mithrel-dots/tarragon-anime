@@ -231,6 +231,45 @@ func (s *Store) SaveMedia(ctx context.Context, media MediaInfo) error {
 	return nil
 }
 
+func (s *Store) CachedMedia(ctx context.Context, mediaID int) (MediaInfo, bool, error) {
+	var media MediaInfo
+	err := s.db.QueryRowContext(ctx, `
+		SELECT anilist_id, title, preview_path, episodes
+		FROM media WHERE anilist_id = ?`, mediaID).Scan(
+		&media.ID, &media.Title, &media.PreviewPath, &media.Episodes,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MediaInfo{}, false, nil
+	}
+	if err != nil {
+		return MediaInfo{}, false, fmt.Errorf("query cached media: %w", err)
+	}
+	return media, true, nil
+}
+
+func (s *Store) SearchMedia(ctx context.Context, query string) ([]MediaInfo, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT anilist_id, title, preview_path, episodes
+		FROM media WHERE lower(title) LIKE '%' || lower(?) || '%'
+		ORDER BY updated_at DESC`, query)
+	if err != nil {
+		return nil, fmt.Errorf("search cached media: %w", err)
+	}
+	defer rows.Close()
+	var result []MediaInfo
+	for rows.Next() {
+		var media MediaInfo
+		if err := rows.Scan(&media.ID, &media.Title, &media.PreviewPath, &media.Episodes); err != nil {
+			return nil, fmt.Errorf("scan cached media: %w", err)
+		}
+		result = append(result, media)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read cached media: %w", err)
+	}
+	return result, nil
+}
+
 // MediaProgress returns the most recently updated episode for a media entry,
 // which is the episode a user expects to resume.
 func (s *Store) MediaProgress(ctx context.Context, mediaID int) (Progress, bool, error) {

@@ -111,6 +111,26 @@ func TestStoreResumeEntriesAndSyncQueue(t *testing.T) {
 	}
 }
 
+func TestStoreCachedMediaLookup(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "anime.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if err := state.SaveMedia(t.Context(), MediaInfo{ID: 154587, Title: "Frieren", PreviewPath: "/tmp/frieren.jpg", Episodes: 28}); err != nil {
+		t.Fatal(err)
+	}
+
+	media, found, err := state.CachedMedia(t.Context(), 154587)
+	if err != nil || !found || media.Title != "Frieren" || media.Episodes != 28 {
+		t.Fatalf("CachedMedia() = %#v, %v, %v", media, found, err)
+	}
+	items, err := state.SearchMedia(t.Context(), "rieren")
+	if err != nil || len(items) != 1 || items[0].ID != 154587 {
+		t.Fatalf("SearchMedia() = %#v, %v", items, err)
+	}
+}
+
 func TestStoreUpdatesProgress(t *testing.T) {
 	state, err := Open(filepath.Join(t.TempDir(), "anime.db"))
 	if err != nil {

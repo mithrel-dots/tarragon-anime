@@ -259,7 +259,17 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		return fmt.Errorf("send GraphQL request: %w", err)
 	}
 	defer resp.Body.Close()
+	var envelope struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&envelope)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if decodeErr == nil && len(envelope.Errors) > 0 {
+			return fmt.Errorf("GraphQL HTTP status %s: %s", resp.Status, envelope.Errors[0].Message)
+		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			retryAfter := resp.Header.Get("Retry-After")
 			if retryAfter != "" {
@@ -268,14 +278,8 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		}
 		return fmt.Errorf("GraphQL HTTP status %s", resp.Status)
 	}
-	var envelope struct {
-		Data   json.RawMessage `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
-		return fmt.Errorf("decode GraphQL response: %w", err)
+	if decodeErr != nil {
+		return fmt.Errorf("decode GraphQL response: %w", decodeErr)
 	}
 	if len(envelope.Errors) > 0 {
 		return fmt.Errorf("GraphQL: %s", envelope.Errors[0].Message)

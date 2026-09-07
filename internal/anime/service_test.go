@@ -2,15 +2,27 @@ package anime
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/provider/allanime"
+	"tarragon-anime/internal/store"
 )
 
 type cachingAniList struct {
 	getCalls int
+}
+
+type offlineAniList struct{}
+
+func (offlineAniList) Search(context.Context, string) ([]anilist.Media, error) {
+	return nil, errors.New("AniList unavailable")
+}
+
+func (offlineAniList) Get(context.Context, int) (anilist.Media, error) {
+	return anilist.Media{}, errors.New("AniList unavailable")
 }
 
 func (c *cachingAniList) Search(context.Context, string) ([]anilist.Media, error) {
@@ -71,6 +83,35 @@ func TestSearchUsesLocalPreviewPath(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].CoverURL != "/tmp/tarragon-anime-cover.jpg" {
 		t.Fatalf("Search() = %#v", results)
+	}
+}
+
+func TestOfflineAniListUsesCachedMedia(t *testing.T) {
+	state := newMemoryState()
+	if err := state.SaveMedia(t.Context(), store.MediaInfo{
+		ID: 154587, Title: "Frieren", PreviewPath: "/tmp/frieren.jpg", Episodes: 28,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	player := &fakePlayer{session: newFakeSession()}
+	service := NewService(offlineAniList{}, &episodeValueProvider{}, player, state, nil, nil, DefaultConfig(), nil)
+	defer service.Close()
+
+	results, err := service.Search(t.Context(), "frieren")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ID != 154587 || results[0].Title != "Frieren" {
+		t.Fatalf("cached Search() = %#v", results)
+	}
+	if _, err := service.Episodes(t.Context(), 154587); err != nil {
+		t.Fatalf("cached Episodes() error = %v", err)
+	}
+	if err := service.ResumeMedia(t.Context(), 154587); err != nil {
+		t.Fatalf("cached ResumeMedia() error = %v", err)
+	}
+	if player.plays != 1 {
+		t.Fatalf("cached ResumeMedia() plays = %d, want 1", player.plays)
 	}
 }
 

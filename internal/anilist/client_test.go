@@ -78,6 +78,19 @@ func TestGraphQLError(t *testing.T) {
 	}
 }
 
+func TestGraphQLHTTPErrorIncludesMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":[{"message":"API temporarily disabled"}]}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClientWithEndpoint(server.Client(), server.URL).Search(context.Background(), "x")
+	if err == nil || !strings.Contains(err.Error(), "403 Forbidden: API temporarily disabled") {
+		t.Fatalf("Search() error = %v", err)
+	}
+}
+
 func TestAuthenticatedProgressOperations(t *testing.T) {
 	requests := 0
 	requestErrors := make(chan error, 2)
