@@ -10,6 +10,7 @@ import (
 
 	"tarragon-anime/internal/aniskip"
 	"tarragon-anime/internal/mpv"
+	"tarragon-anime/internal/provider"
 	"tarragon-anime/internal/provider/allanime"
 	"tarragon-anime/internal/store"
 )
@@ -111,6 +112,7 @@ type fakeSession struct {
 	messages  []string
 	closed    bool
 	closedCh  chan struct{}
+	loadErr   error
 }
 
 func newFakeSession() *fakeSession {
@@ -123,7 +125,7 @@ func (s *fakeSession) Load(_ context.Context, stream mpv.Stream, title string, s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.loads = append(s.loads, loadCall{stream: stream, title: title, start: start})
-	return nil
+	return s.loadErr
 }
 
 func (s *fakeSession) AddSubtitle(_ context.Context, subtitle string) error {
@@ -210,12 +212,13 @@ type fakePlayer struct {
 	session *fakeSession
 	start   float64
 	plays   int
+	err     error
 }
 
 func (p *fakePlayer) Play(_ context.Context, _ mpv.Stream, _ string, start float64) (mpv.SessionController, error) {
 	p.start = start
 	p.plays++
-	return p.session, nil
+	return p.session, p.err
 }
 
 type memoryState struct {
@@ -732,6 +735,60 @@ func TestCloseCancelsAndWaitsForPrefetch(t *testing.T) {
 	case <-closed:
 	case <-time.After(time.Second):
 		t.Fatal("Close did not return after auto-next prefetch exited")
+	}
+}
+
+func TestPlaybackLoadInvalidatesResolvedEpisode(t *testing.T) {
+	for _, prepared := range []bool{false, true} {
+		for _, failLoad := range []bool{false, true} {
+			t.Run(fmt.Sprintf("prepared=%t/failLoad=%t", prepared, failLoad), func(t *testing.T) {
+				primary := &invalidatingProvider{stackTestProvider: stackTestProvider{name: "allanime", streamErr: fmt.Errorf("unavailable")}}
+				fallback := &invalidatingProvider{stackTestProvider: stackTestProvider{name: "animepahe", streamURL: "https://video.test/expired"}}
+				config := DefaultConfig()
+				config.Providers = []string{"allanime", "animepahe"}
+				config.AutoNext = false
+				config.Translation, config.PreferredQuality = "dub", "worst"
+				service := NewServiceWithProviders(&cachingAniList{}, map[string]provider.Client{
+					"allanime": primary, "animepahe": fallback,
+				}, nil, nil, nil, nil, config, nil)
+				defer service.Close()
+				session := newFakeSession()
+				if failLoad {
+					session.loadErr = fmt.Errorf("load failed")
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				original := Episode{MediaID: 154587, Number: 1, Provider: "allanime", ProviderID: "original-show", Value: "original-value"}
+				active := &activePlayback{ctx: ctx, cancel: cancel, session: session, episodes: []Episode{original}, index: 0}
+				if prepared {
+					stream, resolved, err := service.resolveStream(ctx, original)
+					if err != nil {
+						t.Fatal(err)
+					}
+					active.nextReady = &nextResult{episode: resolved, stream: stream}
+					service.loadPreparedNext(active)
+				} else {
+					service.navigate(active, 0, false)
+				}
+				if failLoad {
+					if active.episodes[active.index] != original {
+						t.Fatal("failed Load changed active episode")
+					}
+				} else {
+					if len(fallback.invalidations) != 0 {
+						t.Fatal("successful Load invalidated streams")
+					}
+					service.handlePlaybackEvent(active, mpv.Event{Type: mpv.EventEndFile, Reason: "error"})
+				}
+				want := invalidationCall{provider.Episode{ShowID: "animepahe-show", Number: 1, Value: "animepahe-episode"}, "dub", "worst"}
+				if len(primary.invalidations) != 0 || len(fallback.invalidations) != 1 || fallback.invalidations[0] != want {
+					t.Fatalf("invalidations: primary=%v fallback=%v, want %v", primary.invalidations, fallback.invalidations, want)
+				}
+				if session.loadCount() != 1 {
+					t.Fatalf("Load calls = %d, want 1 (no retry)", session.loadCount())
+				}
+			})
+		}
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/cdp"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/ysmood/gson"
 )
@@ -305,6 +307,9 @@ func TestCollectorAppliesSettleWindow(t *testing.T) {
 		RequestID: "1", Type: "Media",
 		Request: &proto.NetworkRequest{URL: "https://cdn.test/a.mp4", Headers: proto.NetworkHeaders{}},
 	})
+	collector.response(&proto.NetworkResponseReceived{
+		RequestID: "1", Type: "Media", Response: &proto.NetworkResponse{Status: 200},
+	})
 	if _, done := collector.settled(); done {
 		t.Fatal("collector settled before the settle window elapsed")
 	}
@@ -321,6 +326,56 @@ func TestCollectorAppliesSettleWindow(t *testing.T) {
 	}
 	if len(found) != 1 || found[0].URL != "https://cdn.test/a.mp4" {
 		t.Fatalf("collector matches = %#v, want only the media request", found)
+	}
+}
+
+type captureEventCDP struct {
+	lifecycleCDP
+	events chan *cdp.Event
+}
+
+func (c captureEventCDP) Event() <-chan *cdp.Event { return c.events }
+
+func TestChromeCaptureHonorsContextErrorsWithPartialMatches(t *testing.T) {
+	for _, want := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(want.Error(), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			client := captureEventCDP{events: make(chan *cdp.Event, 2)}
+			client.call = func(_ context.Context, method string, _ interface{}) ([]byte, error) {
+				switch method {
+				case "Target.createTarget":
+					return []byte(`{"targetId":"tab"}`), nil
+				case "Target.attachToTarget":
+					return []byte(`{"sessionId":"session"}`), nil
+				case "Page.navigate":
+					client.events <- &cdp.Event{SessionID: "session", Method: "Network.requestWillBeSent", Params: []byte(`{"requestId":"media","request":{"url":"https://cdn.test/video.mp4"}}`)}
+					client.events <- &cdp.Event{SessionID: "session", Method: "Network.responseReceived", Params: []byte(`{"requestId":"media","response":{"status":200}}`)}
+				}
+				return []byte(`{}`), nil
+			}
+			b := rod.New().Context(t.Context()).Client(client).NoDefaultDevice()
+			if err := b.Connect(); err != nil {
+				t.Fatal(err)
+			}
+			var ready atomic.Bool
+			req := testRequest()
+			req.Settle = time.Hour
+			req.Ready = func(Candidate) bool {
+				ready.Store(true)
+				if want == context.Canceled {
+					cancel()
+				}
+				return true
+			}
+			found, err := (&chromeEngine{browser: b}).capture(ctx, req)
+			if !ready.Load() {
+				t.Fatal("capture ended before a partial match was accepted")
+			}
+			if !errors.Is(err, want) || len(found) != 0 {
+				t.Fatalf("capture() = %#v, %v; want no matches and %v", found, err, want)
+			}
+		})
 	}
 }
 

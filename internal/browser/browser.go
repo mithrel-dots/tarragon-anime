@@ -49,9 +49,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -115,9 +117,14 @@ type Request struct {
 	// Accept reports whether an observed request is wanted. It is called
 	// from the event loop and must not block.
 	Accept func(Candidate) bool
-	// Settle is how long to keep observing after the first accepted request
+	// Ready optionally selects which accepted candidates start and keep the
+	// settle window. Nil treats every accepted candidate as ready. Like Accept,
+	// it runs in the event loop and must not block.
+	Ready func(Candidate) bool
+	// Settle is how long to keep observing after the first ready request
 	// so alternates, such as higher quality variants or subtitle tracks, are
-	// not missed. Zero returns as soon as something matches.
+	// not missed. The window resets when no ready candidates remain.
+	// Non-positive values use the resolver's default settle window.
 	Settle time.Duration
 }
 
@@ -162,11 +169,14 @@ type Resolver struct {
 	sem       chan struct{}
 	newEngine func(context.Context, Options) (engine, error)
 
-	mu     sync.Mutex
-	eng    engine
-	active int
-	idle   *time.Timer
-	closed bool
+	mu          sync.Mutex
+	eng         engine
+	active      int
+	idle        *time.Timer
+	closed      bool
+	starting    chan struct{}
+	startCancel context.CancelFunc
+	done        chan struct{}
 }
 
 // New returns a resolver. Chromium is not started until the first capture, so
@@ -188,6 +198,7 @@ func New(opts Options) *Resolver {
 		opts:      opts,
 		sem:       make(chan struct{}, opts.MaxSessions),
 		newEngine: newChromeEngine,
+		done:      make(chan struct{}),
 	}
 }
 
@@ -205,10 +216,15 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 		req.Settle = defaultSettle
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
+	defer cancel()
+
 	select {
 	case r.sem <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-r.done:
+		return nil, ErrClosed
 	}
 	defer func() { <-r.sem }()
 
@@ -218,11 +234,8 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 	}
 	defer r.release()
 
-	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
-	defer cancel()
-
 	found, err := eng.capture(ctx, req)
-	if err != nil && isEngineFailure(err) {
+	if err != nil && isEngineFailure(err) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		// The browser itself is unusable; drop it so the next capture starts
 		// a fresh process instead of reusing a dead connection.
 		r.opts.Logger.Printf("browser session failed, restarting Chromium: %v", err)
@@ -239,6 +252,10 @@ func (r *Resolver) Close() {
 		return
 	}
 	r.closed = true
+	close(r.done)
+	if r.startCancel != nil {
+		r.startCancel()
+	}
 	if r.idle != nil {
 		r.idle.Stop()
 		r.idle = nil
@@ -253,24 +270,73 @@ func (r *Resolver) Close() {
 }
 
 func (r *Resolver) acquire(ctx context.Context) (engine, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed {
-		return nil, ErrClosed
-	}
-	if r.idle != nil {
-		r.idle.Stop()
-		r.idle = nil
-	}
-	if r.eng == nil {
-		eng, err := r.newEngine(ctx, r.opts)
-		if err != nil {
+	for {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return nil, ErrClosed
+		}
+		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
 			return nil, err
 		}
-		r.eng = eng
+		if r.eng != nil {
+			if r.idle != nil {
+				r.idle.Stop()
+				r.idle = nil
+			}
+			r.active++
+			eng := r.eng
+			r.mu.Unlock()
+			return eng, nil
+		}
+		starting := r.starting
+		var result chan error
+		if starting == nil {
+			starting = make(chan struct{})
+			r.starting = starting
+			startCtx, cancel := context.WithCancel(ctx)
+			r.startCancel = cancel
+			result = make(chan error, 1)
+			go func() {
+				eng, err := r.newEngine(startCtx, r.opts)
+				r.mu.Lock()
+				if err == nil {
+					err = startCtx.Err()
+				}
+				if r.closed {
+					err = ErrClosed
+				}
+				if err == nil {
+					r.eng = eng
+					r.idle = time.AfterFunc(r.opts.IdleTimeout, r.shutdownIdle)
+				}
+				r.mu.Unlock()
+				if err != nil && eng != nil {
+					eng.close()
+				}
+				cancel()
+				r.mu.Lock()
+				r.starting, r.startCancel = nil, nil
+				result <- err
+				close(starting)
+				r.mu.Unlock()
+			}()
+		}
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-r.done:
+			return nil, ErrClosed
+		case <-starting:
+			if result != nil {
+				if err := <-result; err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
-	r.active++
-	return r.eng, nil
 }
 
 func (r *Resolver) release() {
@@ -358,9 +424,13 @@ func DefaultProfileDir() (string, error) {
 type chromeEngine struct {
 	launcher *launcher.Launcher
 	browser  *rod.Browser
+	cancel   context.CancelFunc
 }
 
-func newChromeEngine(_ context.Context, opts Options) (engine, error) {
+func newChromeEngine(ctx context.Context, opts Options) (engine, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	bin := opts.Binary
 	if bin == "" {
 		found, err := FindBinary()
@@ -382,6 +452,7 @@ func newChromeEngine(_ context.Context, opts Options) (engine, error) {
 	}
 
 	l := launcher.New().
+		Context(ctx).
 		Bin(bin).
 		UserDataDir(profile).
 		Set("no-first-run").
@@ -415,17 +486,30 @@ func newChromeEngine(_ context.Context, opts Options) (engine, error) {
 		return nil, fmt.Errorf("launch Chromium: %w", err)
 	}
 
-	b := rod.New().ControlURL(controlURL).NoDefaultDevice()
+	// Startup cancellation must not become the shared connection's lifetime.
+	lifetime, cancel := context.WithCancel(context.Background())
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	b := rod.New().Context(lifetime).ControlURL(controlURL).NoDefaultDevice()
 	if err := b.Connect(); err != nil {
+		cancel()
 		l.Kill()
 		return nil, fmt.Errorf("connect to Chromium: %w", err)
 	}
+	if !stop() || ctx.Err() != nil {
+		cancel()
+		l.Kill()
+		return nil, ctx.Err()
+	}
 	opts.Logger.Printf("browser started bin=%s profile=%s headless=%t", bin, profile, opts.Headless)
-	return &chromeEngine{launcher: l, browser: b}, nil
+	return &chromeEngine{launcher: l, browser: b, cancel: cancel}, nil
 }
 
 func (e *chromeEngine) close() {
-	_ = e.browser.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = e.browser.Context(ctx).Close()
+	e.cancel()
 	// launcher.Cleanup would delete the user data directory. The profile is
 	// persistent and holds the origin's clearance cookie, so the process is
 	// killed without touching it.
@@ -433,13 +517,20 @@ func (e *chromeEngine) close() {
 }
 
 func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, error) {
-	// Binding the page to ctx makes cancellation tear the tab down instead of
-	// leaving it loading in the shared browser.
-	page, err := e.browser.Context(ctx).Page(proto.TargetCreateTarget{URL: "about:blank"})
+	target, err := (proto.TargetCreateTarget{URL: "about:blank"}).Call(e.browser.Context(ctx))
 	if err != nil {
 		return nil, engineFailure{fmt.Errorf("open browser page: %w", err)}
 	}
-	defer func() { _ = page.Close() }()
+	defer func() {
+		// Page.Close uses the cancelled page context and may wait for unload handlers.
+		cleanup, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, _ = (proto.TargetCloseTarget{TargetID: target.TargetID}).Call(e.browser.Context(cleanup))
+	}()
+	page, err := e.browser.Context(ctx).PageFromTarget(target.TargetID)
+	if err != nil {
+		return nil, engineFailure{fmt.Errorf("attach browser page: %w", err)}
+	}
 
 	if err := (proto.NetworkEnable{}).Call(page); err != nil {
 		return nil, engineFailure{fmt.Errorf("observe browser network: %w", err)}
@@ -451,6 +542,8 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 	stop := page.EachEvent(
 		func(ev *proto.NetworkRequestWillBeSent) { col.request(ev) },
 		func(ev *proto.NetworkResponseReceived) { col.response(ev) },
+		func(ev *proto.NetworkRequestWillBeSentExtraInfo) { col.extraInfo(ev) },
+		func(ev *proto.NetworkLoadingFailed) { col.failed(ev) },
 	)
 	go stop()
 
@@ -463,14 +556,11 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 	for {
 		select {
 		case <-ctx.Done():
-			if found := col.matches(); len(found) > 0 {
-				return found, nil
-			}
-			if col.challenged() {
-				return nil, ErrChallenged
-			}
 			return nil, ctx.Err()
 		case <-ticker.C:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if col.challenged() {
 				return nil, ErrChallenged
 			}
@@ -491,14 +581,27 @@ type collector struct {
 	start time.Time
 
 	mu         sync.Mutex
-	pending    map[string]*Candidate
+	pending    map[string]*requestChain
 	accepted   []*Candidate
 	firstMatch time.Time
 	docStatus  int
 }
 
+type requestHop struct {
+	Candidate
+	responseKnown bool
+	wantsExtra    bool
+	hasExtra      bool
+	discarded     bool
+}
+
+type requestChain struct {
+	hops  []*requestHop
+	extra []proto.NetworkHeaders
+}
+
 func newCollector(req Request) *collector {
-	return &collector{req: req, start: time.Now(), pending: map[string]*Candidate{}}
+	return &collector{req: req, start: time.Now(), pending: map[string]*requestChain{}}
 }
 
 func (c *collector) request(ev *proto.NetworkRequestWillBeSent) {
@@ -511,28 +614,119 @@ func (c *collector) request(ev *proto.NetworkRequestWillBeSent) {
 	}
 
 	c.mu.Lock()
-	c.pending[string(ev.RequestID)] = candidate
-	if c.req.Accept(*candidate) {
-		c.accepted = append(c.accepted, candidate)
-		if c.firstMatch.IsZero() {
-			c.firstMatch = time.Now()
-		}
+	defer c.mu.Unlock()
+	id := string(ev.RequestID)
+	chain := c.pending[id]
+	if chain == nil {
+		chain = &requestChain{}
+		c.pending[id] = chain
 	}
-	c.mu.Unlock()
+	if len(chain.hops) > 0 {
+		previous := chain.hops[len(chain.hops)-1]
+		previous.discarded = true
+		previous.responseKnown = true
+		previous.wantsExtra = ev.RedirectHasExtraInfo
+		c.evaluateLocked(previous)
+	}
+	chain.hops = append(chain.hops, &requestHop{Candidate: *candidate})
+	c.mergeExtraLocked(chain)
 }
 
 func (c *collector) response(ev *proto.NetworkResponseReceived) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if candidate, ok := c.pending[string(ev.RequestID)]; ok {
+	if chain := c.pending[string(ev.RequestID)]; chain != nil && len(chain.hops) > 0 {
+		candidate := chain.hops[len(chain.hops)-1]
 		candidate.MIME = ev.Response.MIMEType
 		candidate.Status = ev.Response.Status
+		candidate.Kind = string(ev.Type)
+		candidate.responseKnown = true
+		candidate.wantsExtra = ev.HasExtraInfo
+		c.mergeExtraLocked(chain)
+		c.evaluateLocked(candidate)
 	}
 	// A bot check replaces the page itself, so only the top document's status
 	// is meaningful; sub-resource failures are normal on ad-heavy pages.
 	if ev.Type == proto.NetworkResourceTypeDocument && ev.Response.URL == c.req.PageURL {
 		c.docStatus = ev.Response.Status
 	}
+}
+
+func (c *collector) extraInfo(ev *proto.NetworkRequestWillBeSentExtraInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id := string(ev.RequestID)
+	chain := c.pending[id]
+	if chain == nil {
+		chain = &requestChain{}
+		c.pending[id] = chain
+	}
+	chain.extra = append(chain.extra, ev.Headers)
+	c.mergeExtraLocked(chain)
+}
+
+func (c *collector) mergeExtraLocked(chain *requestChain) {
+	// ExtraInfo is ordered within its own stream, not against request/response
+	// events. Wait for each hop's flag before consuming or skipping its slot.
+	for _, hop := range chain.hops {
+		if !hop.responseKnown {
+			break
+		}
+		if !hop.wantsExtra || hop.hasExtra {
+			continue
+		}
+		if len(chain.extra) == 0 {
+			break
+		}
+		for key, value := range headerMap(chain.extra[0]) {
+			for old := range hop.Headers {
+				if strings.EqualFold(old, key) {
+					delete(hop.Headers, old)
+				}
+			}
+			hop.Headers[key] = value
+		}
+		chain.extra = chain.extra[1:]
+		hop.hasExtra = true
+		c.evaluateLocked(hop)
+	}
+}
+
+func (c *collector) failed(ev *proto.NetworkLoadingFailed) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if chain := c.pending[string(ev.RequestID)]; chain != nil && len(chain.hops) > 0 {
+		hop := chain.hops[len(chain.hops)-1]
+		hop.discarded = true
+		c.evaluateLocked(hop)
+	}
+}
+
+func (c *collector) evaluateLocked(hop *requestHop) {
+	wanted := !hop.discarded && hop.Status >= 200 && hop.Status < 300 &&
+		(!hop.wantsExtra || hop.hasExtra) && c.req.Accept(hop.Candidate)
+	for i, candidate := range c.accepted {
+		if candidate == &hop.Candidate {
+			if wanted {
+				wanted = false // Already retained; still re-evaluate readiness.
+			} else {
+				c.accepted = append(c.accepted[:i], c.accepted[i+1:]...)
+			}
+			break
+		}
+	}
+	if wanted {
+		c.accepted = append(c.accepted, &hop.Candidate)
+	}
+	for _, candidate := range c.accepted {
+		if c.req.Ready == nil || c.req.Ready(*candidate) {
+			if c.firstMatch.IsZero() {
+				c.firstMatch = time.Now()
+			}
+			return
+		}
+	}
+	c.firstMatch = time.Time{}
 }
 
 func (c *collector) challenged() bool {
@@ -542,7 +736,7 @@ func (c *collector) challenged() bool {
 }
 
 // settled reports the accepted candidates once the settle window has passed
-// since the first match, so late higher quality variants are still collected.
+// since the first ready match, so late variants and subtitles are still collected.
 func (c *collector) settled() ([]Candidate, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -564,8 +758,11 @@ func (c *collector) matches() []Candidate {
 func (c *collector) snapshotLocked() []Candidate {
 	out := make([]Candidate, 0, len(c.accepted))
 	for _, candidate := range c.accepted {
-		out = append(out, *candidate)
+		copy := *candidate
+		copy.Headers = maps.Clone(candidate.Headers)
+		out = append(out, copy)
 	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Observed < out[j].Observed })
 	return out
 }
 

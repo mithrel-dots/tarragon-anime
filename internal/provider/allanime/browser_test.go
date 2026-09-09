@@ -3,7 +3,9 @@ package allanime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -72,6 +74,7 @@ func TestAcceptMediaSelectsTheEpisodeMedia(t *testing.T) {
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			test.candidate.Status = 200
 			if got := accept(test.candidate); got != test.want {
 				t.Fatalf("acceptMedia()(%q) = %t, want %t", test.candidate.URL, got, test.want)
 			}
@@ -81,7 +84,7 @@ func TestAcceptMediaSelectsTheEpisodeMedia(t *testing.T) {
 
 func TestStreamsFromCandidatesPrefersThePlayedEpisode(t *testing.T) {
 	candidates := []browser.Candidate{
-		{URL: "https://cdn.test/videos/otherShowId/sub/1.mp4", Kind: "XHR", Observed: time.Millisecond},
+		{URL: "https://cdn.test/videos/otherShowId/sub/1.mp4", Kind: "XHR", Status: 200, Observed: time.Millisecond},
 		playedCandidate(),
 	}
 	streams, err := streamsFromCandidates(candidates, testEpisode(), "sub", "https://mkissa.to", "best")
@@ -95,9 +98,9 @@ func TestStreamsFromCandidatesPrefersThePlayedEpisode(t *testing.T) {
 
 func TestStreamsFromCandidatesHonoursQuality(t *testing.T) {
 	candidates := []browser.Candidate{
-		{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/480p.m3u8", Kind: "XHR"},
-		{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/1080p.m3u8", Kind: "XHR"},
-		{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/720p.m3u8", Kind: "XHR"},
+		{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/480p.m3u8", Kind: "XHR", Status: 200},
+		{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/1080p.m3u8", Kind: "XHR", Status: 200},
+		{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/720p.m3u8", Kind: "XHR", Status: 200},
 	}
 	best, err := streamsFromCandidates(candidates, testEpisode(), "sub", "https://mkissa.to", "best")
 	if err != nil {
@@ -118,7 +121,7 @@ func TestStreamsFromCandidatesHonoursQuality(t *testing.T) {
 func TestStreamsFromCandidatesAttachesSubtitles(t *testing.T) {
 	candidates := []browser.Candidate{
 		playedCandidate(),
-		{URL: "https://cdn.test/subs/ReHMC7TQnch3C6z8j/sub/1/en.vtt", Kind: "Fetch"},
+		{URL: "https://cdn.test/subs/ReHMC7TQnch3C6z8j/sub/1/en.vtt", Kind: "Fetch", Status: 200},
 	}
 	streams, err := streamsFromCandidates(candidates, testEpisode(), "sub", "https://mkissa.to", "best")
 	if err != nil {
@@ -153,10 +156,11 @@ func TestPlaybackHeadersCarryOnlyWhatTheBrowserSent(t *testing.T) {
 func TestPlaybackHeadersNeverLeakForeignCredentials(t *testing.T) {
 	candidate := playedCandidate()
 	candidate.Headers["Authorization"] = "Bearer anilist-token"
+	candidate.Headers["cOoKiE"] = "session=secret"
 	candidate.Headers["X-Csrf-Token"] = "secret"
 	got := playbackHeaders(candidate, "https://mkissa.to")
 	for key := range got {
-		if key != "Referer" && key != "User-Agent" && key != "Origin" && key != "Cookie" {
+		if key != "Referer" && key != "User-Agent" && key != "Origin" {
 			t.Fatalf("playbackHeaders() forwarded %q, want only playback context", key)
 		}
 	}
@@ -178,6 +182,24 @@ func TestStreamsUsesBrowserResolution(t *testing.T) {
 	client := NewClientWithEndpoints(nil, "https://api.test", "https://mkissa.to")
 	client.UseBrowser(captureFunc(func(_ context.Context, req browser.Request) ([]browser.Candidate, error) {
 		pageURL.Store(req.PageURL)
+		if req.Ready == nil {
+			t.Fatal("browser request has no readiness predicate")
+		}
+		for _, candidate := range []browser.Candidate{
+			playedCandidate(),
+			{URL: "https://cdn.test/master.m3u8", Status: 200},
+			{URL: "https://cdn.test/en.vtt", Status: 200},
+			{URL: "https://cdn.test/cover.png", Status: 200},
+			{URL: "https://cdn.test/otherShow/sub/1.mp4", Kind: "Media", Status: 200},
+		} {
+			want := req.Accept(candidate) && !strings.HasSuffix(candidate.URL, ".vtt")
+			if req.Ready(candidate) != want {
+				t.Errorf("Ready(%q) = %t, want %t", candidate.URL, req.Ready(candidate), want)
+			}
+		}
+		if !req.Accept(browser.Candidate{URL: "https://cdn.test/en.vtt", Status: 200}) {
+			t.Fatal("readiness filtering excluded accepted subtitles")
+		}
 		return []browser.Candidate{playedCandidate()}, nil
 	}))
 
@@ -232,9 +254,13 @@ func TestFailedResolutionIsNotCached(t *testing.T) {
 func TestStreamsCachesByEpisodeTranslationAndQuality(t *testing.T) {
 	var captures atomic.Int32
 	client := NewClientWithEndpoints(nil, "https://api.test", "https://mkissa.to")
-	client.UseBrowser(captureFunc(func(context.Context, browser.Request) ([]browser.Candidate, error) {
+	client.UseBrowser(captureFunc(func(_ context.Context, req browser.Request) ([]browser.Candidate, error) {
 		captures.Add(1)
-		return []browser.Candidate{playedCandidate()}, nil
+		identity := strings.Split(strings.TrimPrefix(req.PageURL, "https://mkissa.to/anime/"), "/p-")
+		variant := strings.Split(identity[1], "-")
+		candidate := playedCandidate()
+		candidate.URL = fmt.Sprintf("https://cdn.test/videos/%s/%s/%s", identity[0], variant[1], variant[0])
+		return []browser.Candidate{candidate}, nil
 	}))
 
 	for range 3 {
@@ -345,5 +371,104 @@ func TestResolutionHint(t *testing.T) {
 		if got := resolutionHint(raw); got != want {
 			t.Fatalf("resolutionHint(%q) = %d, want %d", raw, got, want)
 		}
+	}
+}
+
+func TestCandidateIdentityIsRechecked(t *testing.T) {
+	for _, path := range []string{
+		"otherShowId/sub/1", "ReHMC7TQnch3C6z8j/sub/7", "ReHMC7TQnch3C6z8j/dub/1",
+		"ReHMC7TQnch3C6z8j-extra/sub/1",
+	} {
+		for _, suffix := range []string{"", ".mp4", ".m3u8", ".mpd", "/en.vtt"} {
+			for _, kind := range []string{"Media", "XHR"} {
+				t.Run(path+suffix+kind, func(t *testing.T) {
+					candidate := browser.Candidate{URL: "https://cdn.test/videos/" + path + suffix, Kind: kind, Status: 200}
+					if acceptMedia(testEpisode().ShowID, "1", "sub")(candidate) {
+						t.Fatal("accepted explicit identity mismatch")
+					}
+					streams, err := streamsFromCandidates([]browser.Candidate{candidate, playedCandidate()}, testEpisode(), "sub", "", "best")
+					if err != nil || len(streams) != 1 || streams[0].URL != playedCandidate().URL || streams[0].Subtitle != "" {
+						t.Fatalf("mismatched candidate survived conversion: %#v, %v", streams, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestManifestMIMEAndRanking(t *testing.T) {
+	for _, mime := range []string{"application/vnd.apple.mpegurl", "Application/X-MpegURL; charset=utf-8", "audio/mpegurl", "audio/x-mpegurl", "application/dash+xml"} {
+		t.Run(mime, func(t *testing.T) {
+			manifest := browser.Candidate{URL: "https://cdn.test/opaque/manifest?token=abc", MIME: mime, Kind: "XHR", Status: 200}
+			if !acceptMedia(testEpisode().ShowID, "1", "sub")(manifest) {
+				t.Fatal("extensionless manifest rejected")
+			}
+			candidates := []browser.Candidate{
+				{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/init.mp4", Kind: "XHR", Status: 200},
+				{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1/segment-1.mp4", Kind: "XHR", Status: 206},
+				manifest,
+			}
+			for _, quality := range []string{"best", "worst"} {
+				streams, err := streamsFromCandidates(candidates, testEpisode(), "sub", "", quality)
+				if err != nil || streams[0].URL != manifest.URL {
+					t.Fatalf("manifest did not beat speculative MP4: %#v, %v", streams, err)
+				}
+				streams, err = streamsFromCandidates(append(candidates, playedCandidate()), testEpisode(), "sub", "", quality)
+				if err != nil || streams[0].URL != playedCandidate().URL {
+					t.Fatalf("manifest displaced correlated played media: %#v, %v", streams, err)
+				}
+			}
+		})
+	}
+	for _, candidate := range []browser.Candidate{
+		{URL: "https://cdn.test/opaque", Kind: "Media", Status: 206},
+		{URL: "https://cdn.test/opaque/master.m3u8", Kind: "XHR", Status: 200},
+	} {
+		streams, err := streamsFromCandidates([]browser.Candidate{candidate}, testEpisode(), "sub", "", "best")
+		if err != nil || len(streams) != 1 {
+			t.Fatalf("opaque candidate rejected: %#v, %v", streams, err)
+		}
+	}
+}
+
+func TestStreamsRejectNonSuccessStatuses(t *testing.T) {
+	for _, status := range []int{0, 101, 199, 300, 302, 403, 404, 500} {
+		for _, suffix := range []string{".mp4", ".m3u8", ".vtt"} {
+			candidate := browser.Candidate{URL: "https://cdn.test/opaque" + suffix, Kind: "Media", Status: status}
+			if acceptMedia(testEpisode().ShowID, "1", "sub")(candidate) {
+				t.Fatalf("accepted status %d", status)
+			}
+			streams, err := streamsFromCandidates([]browser.Candidate{candidate, playedCandidate()}, testEpisode(), "sub", "", "best")
+			if err != nil || len(streams) != 1 || streams[0].Subtitle != "" {
+				t.Fatalf("status %d survived conversion: %#v, %v", status, streams, err)
+			}
+			if _, err := streamsFromCandidates([]browser.Candidate{candidate}, testEpisode(), "sub", "", "best"); err == nil {
+				t.Fatalf("status %d returned without error", status)
+			}
+		}
+	}
+}
+
+func TestStreamsRejectCredentialHandoff(t *testing.T) {
+	for _, header := range []string{"Cookie", "cOoKiE", "Authorization", "aUtHoRiZaTiOn"} {
+		t.Run(header, func(t *testing.T) {
+			candidate := playedCandidate()
+			candidate.Headers[header] = "secret-value"
+			streams, err := streamsFromCandidates([]browser.Candidate{candidate}, testEpisode(), "sub", "", "best")
+			if len(streams) != 0 || err == nil || !strings.Contains(err.Error(), "origin-scoped") || !strings.Contains(err.Error(), "use browser playback") || strings.Contains(err.Error(), "secret-value") {
+				t.Fatalf("want actionable, secret-free credential error, got %#v, %v", streams, err)
+			}
+			subtitle := candidate
+			subtitle.URL = "https://cdn.test/subs/en.vtt"
+			streams, err = streamsFromCandidates([]browser.Candidate{candidate, subtitle, playedCandidate()}, testEpisode(), "sub", "", "best")
+			if err != nil || len(streams) != 1 || streams[0].Subtitle != "" {
+				t.Fatalf("credential media or subtitle survived: %#v, %v", streams, err)
+			}
+			for key := range playbackHeaders(candidate, "") {
+				if strings.EqualFold(key, "Cookie") || strings.EqualFold(key, "Authorization") {
+					t.Fatalf("credential header forwarded: %s", key)
+				}
+			}
+		})
 	}
 }

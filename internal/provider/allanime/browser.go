@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/url"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,13 +18,12 @@ type Resolver interface {
 	Capture(context.Context, browser.Request) ([]browser.Candidate, error)
 }
 
-// browserSettle is how long the capture keeps observing after the first match,
+// browserSettle is how long the capture keeps observing after the first media match,
 // so a subtitle track or a second quality variant requested moments later is
 // still picked up.
 const browserSettle = 2 * time.Second
 
-// UseBrowser makes the client resolve streams from a browser session first and
-// fall back to the native crypto path when the session yields nothing.
+// UseBrowser configures the browser session used to resolve streams.
 func (c *Client) UseBrowser(resolver Resolver) {
 	c.browser = resolver
 }
@@ -47,6 +45,10 @@ func (c *Client) browserStreams(ctx context.Context, episode Episode, translatio
 		PageURL: watchURL(c.origin, episode.ShowID, episode.Value, translation),
 		Settle:  browserSettle,
 		Accept:  acceptMedia(episode.ShowID, episode.Value, translation),
+		Ready: func(candidate browser.Candidate) bool {
+			class := classify(candidate, episode.ShowID, episode.Value, translation)
+			return class != mediaNone && class != mediaSubtitle
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -59,8 +61,8 @@ type mediaClass int
 const (
 	mediaNone mediaClass = iota
 	mediaSubtitle
-	mediaPlaylist
 	mediaProgressive
+	mediaPlaylist
 	// mediaPlayed is the request the player actually fed to the video
 	// element, which is the strongest evidence that a URL is the episode.
 	mediaPlayed
@@ -102,12 +104,14 @@ func acceptMedia(showID, episodeValue, translation string) func(browser.Candidat
 	}
 }
 
-// classify names what a captured request is. showID, episodeValue and
-// translation describe the episode that was asked for; passing them empty
-// re-reads the shape of an already accepted candidate without re-checking
-// which episode it belongs to.
+// classify rejects explicit identity mismatches even for played media and
+// manifests. Opaque URLs remain eligible: capture timing and request kind are
+// evidence, not proof that they belong to the requested episode.
 func classify(candidate browser.Candidate, showID, episodeValue, translation string) mediaClass {
 	parsed, kind := shapeOf(candidate)
+	if kind == mediaNone || mismatches(parsed, showID, episodeValue, translation) {
+		return mediaNone
+	}
 	switch kind {
 	case mediaNone, mediaSubtitle, mediaPlaylist, mediaPlayed:
 		return kind
@@ -122,6 +126,9 @@ func classify(candidate browser.Candidate, showID, episodeValue, translation str
 }
 
 func shapeOf(candidate browser.Candidate) (*url.URL, mediaClass) {
+	if candidate.Status < 200 || candidate.Status >= 300 {
+		return nil, mediaNone
+	}
 	parsed, err := url.Parse(candidate.URL)
 	// blob: and data: URLs only exist inside the browser and cannot be handed
 	// to an external player, so they are dropped here.
@@ -132,6 +139,7 @@ func shapeOf(candidate browser.Candidate) (*url.URL, mediaClass) {
 		return parsed, mediaNone
 	}
 	path := strings.ToLower(parsed.Path)
+	mime := strings.ToLower(strings.TrimSpace(strings.SplitN(candidate.MIME, ";", 2)[0]))
 	switch {
 	case hasAnySuffix(path, segmentSuffixes):
 		// A chunk plays for a few seconds on its own and is never the answer
@@ -139,7 +147,9 @@ func shapeOf(candidate browser.Candidate) (*url.URL, mediaClass) {
 		return parsed, mediaNone
 	case hasAnySuffix(path, subtitleSuffixes):
 		return parsed, mediaSubtitle
-	case hasAnySuffix(path, playlistSuffixes):
+	case hasAnySuffix(path, playlistSuffixes), mime == "application/vnd.apple.mpegurl",
+		mime == "application/x-mpegurl", mime == "audio/mpegurl", mime == "audio/x-mpegurl",
+		mime == "application/dash+xml":
 		return parsed, mediaPlaylist
 	case candidate.Kind == "Media":
 		return parsed, mediaPlayed
@@ -149,12 +159,35 @@ func shapeOf(candidate browser.Candidate) (*url.URL, mediaClass) {
 	return parsed, mediaNone
 }
 
+// Only the known show/translation/episode path layout gives us an explicit
+// identity. Arbitrary CDN paths and query tokens cannot be reliably decoded.
+func mismatches(parsed *url.URL, showID, episodeValue, translation string) bool {
+	segments := strings.Split(strings.ToLower(parsed.Path), "/")
+	for i, segment := range segments {
+		if (segment != "sub" && segment != "dub") || i < 2 || i+1 >= len(segments) || segments[i+1] == "" {
+			continue
+		}
+		episode := segments[i+1]
+		for _, suffixes := range [][]string{playlistSuffixes, progressiveSuffixes, subtitleSuffixes} {
+			for _, suffix := range suffixes {
+				episode = strings.TrimSuffix(episode, suffix)
+			}
+		}
+		if (showID != "" && segments[i-1] != strings.ToLower(showID)) ||
+			(translation != "" && segment != strings.ToLower(translation)) ||
+			(episodeValue != "" && episode != strings.ToLower(episodeValue)) {
+			return true
+		}
+	}
+	return false
+}
+
 // correlates reports whether a URL names the episode that was requested. It is
 // what keeps a stale player, a preview of the next episode, or an unrelated
 // autoplay from being returned as the answer.
 func correlates(parsed *url.URL, showID, episodeValue, translation string) bool {
 	path := strings.ToLower(parsed.Path)
-	if showID != "" && !strings.Contains(path, strings.ToLower(showID)) {
+	if showID != "" && !strings.Contains(path, "/"+strings.ToLower(showID)+"/") {
 		return false
 	}
 	if translation != "" && !strings.Contains(path, "/"+strings.ToLower(translation)+"/") {
@@ -167,8 +200,15 @@ func correlates(parsed *url.URL, showID, episodeValue, translation string) bool 
 	for _, segment := range strings.Split(path, "/") {
 		// Upstreams name the episode either as a bare path segment or as a
 		// file, so "1", "1.mp4" and "1.m3u8" all identify episode 1.
-		if segment == wanted || strings.TrimSuffix(segment, filepath.Ext(segment)) == wanted {
+		if segment == wanted {
 			return true
+		}
+		for _, suffixes := range [][]string{progressiveSuffixes, playlistSuffixes} {
+			for _, suffix := range suffixes {
+				if segment == wanted+suffix {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -208,8 +248,17 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 	}
 	var playable []ranked
 	var subtitle string
+	credentialsRejected := false
 	for _, candidate := range candidates {
-		parsed, class := shapeOf(candidate)
+		class := classify(candidate, episode.ShowID, episode.Value, translation)
+		if class == mediaNone {
+			continue
+		}
+		if hasCredentials(candidate) {
+			credentialsRejected = true
+			continue
+		}
+		parsed, _ := url.Parse(candidate.URL)
 		switch class {
 		case mediaNone:
 			continue
@@ -227,13 +276,26 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 		})
 	}
 	if len(playable) == 0 {
+		if credentialsRejected {
+			return nil, fmt.Errorf("browser media requires Cookie or Authorization headers; use browser playback until an origin-scoped credential handoff is available")
+		}
 		return nil, fmt.Errorf("browser session captured no playable media")
 	}
 
 	worst := strings.EqualFold(quality, "worst")
 	sort.SliceStable(playable, func(i, j int) bool {
-		// A URL that names the requested episode always beats one that only
-		// happens to have been loaded while the page was open.
+		// Correlated Media is strongest. Otherwise manifests beat speculative
+		// MP4 requests, which may be initialization or media fragments.
+		iPlayed := playable[i].class == mediaPlayed && playable[i].correlated
+		jPlayed := playable[j].class == mediaPlayed && playable[j].correlated
+		if iPlayed != jPlayed {
+			return iPlayed
+		}
+		iManifest := playable[i].class == mediaPlaylist
+		jManifest := playable[j].class == mediaPlaylist
+		if iManifest != jManifest {
+			return iManifest
+		}
 		if playable[i].correlated != playable[j].correlated {
 			return playable[i].correlated
 		}
@@ -260,12 +322,19 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 	return streams, nil
 }
 
-// playbackHeaders reduces the request Chromium made to the smallest set an
-// external player needs. Only headers the browser itself sent to that host are
-// forwarded, so no cookie or credential from an unrelated origin can leak into
-// the player command line.
+func hasCredentials(candidate browser.Candidate) bool {
+	for key := range candidate.Headers {
+		if strings.EqualFold(key, "Cookie") || strings.EqualFold(key, "Authorization") {
+			return true
+		}
+	}
+	return false
+}
+
+// playbackHeaders forwards only non-credential playback context. Global player
+// headers are not origin-scoped and may reach redirects or manifest children.
 func playbackHeaders(candidate browser.Candidate, origin string) map[string]string {
-	wanted := map[string]string{"referer": "Referer", "user-agent": "User-Agent", "origin": "Origin", "cookie": "Cookie"}
+	wanted := map[string]string{"referer": "Referer", "user-agent": "User-Agent", "origin": "Origin"}
 	headers := make(map[string]string, len(wanted))
 	for key, value := range candidate.Headers {
 		if canonical, ok := wanted[strings.ToLower(key)]; ok && value != "" {

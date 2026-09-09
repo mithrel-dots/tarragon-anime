@@ -7,12 +7,74 @@ import (
 
 	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/mpv"
+	"tarragon-anime/internal/provider"
 	"tarragon-anime/internal/provider/allanime"
 	"tarragon-anime/internal/store"
 )
 
 type cachingAniList struct {
 	getCalls int
+}
+
+type invalidationCall struct {
+	episode              provider.Episode
+	translation, quality string
+}
+
+type invalidatingProvider struct {
+	stackTestProvider
+	invalidations []invalidationCall
+}
+
+func (p *invalidatingProvider) InvalidateStreams(episode provider.Episode, translation, quality string) {
+	p.invalidations = append(p.invalidations, invalidationCall{episode, translation, quality})
+}
+
+func TestPlayInvalidatesResolvedProviderOnFailure(t *testing.T) {
+	for _, reason := range []string{"play-error", "error", "eof", "stop", "quit"} {
+		t.Run(reason, func(t *testing.T) {
+			primary := &invalidatingProvider{stackTestProvider: stackTestProvider{name: "allanime", streamErr: errors.New("unavailable")}}
+			fallback := &invalidatingProvider{stackTestProvider: stackTestProvider{name: "animepahe", streamURL: "https://video.test/expired"}}
+			session := newFakeSession()
+			player := &fakePlayer{session: session}
+			if reason == "play-error" {
+				player.err = errors.New("play failed")
+			}
+			config := DefaultConfig()
+			config.Providers = []string{"allanime", "animepahe"}
+			config.AutoNext = false
+			config.Translation, config.PreferredQuality = "dub", "worst"
+			service := NewServiceWithProviders(&cachingAniList{}, map[string]provider.Client{
+				"allanime": primary, "animepahe": fallback,
+			}, player, nil, nil, nil, config, nil)
+			defer service.Close()
+			err := service.Play(t.Context(), 154587, 1)
+			if !errors.Is(err, player.err) {
+				t.Fatalf("Play() error = %v, want %v", err, player.err)
+			}
+			if err == nil {
+				session.events <- mpv.Event{Type: mpv.EventEndFile, Reason: reason}
+				close(session.events)
+				service.workers.Wait()
+			}
+			want := 0
+			if reason == "play-error" || reason == "error" {
+				want = 1
+			}
+			if len(primary.invalidations) != 0 || len(fallback.invalidations) != want {
+				t.Fatalf("invalidations: primary=%v fallback=%v, want 0/%d", primary.invalidations, fallback.invalidations, want)
+			}
+			if want == 1 {
+				expected := invalidationCall{provider.Episode{ShowID: "animepahe-show", Number: 1, Value: "animepahe-episode"}, "dub", "worst"}
+				if fallback.invalidations[0] != expected {
+					t.Fatalf("invalidation = %#v, want %#v", fallback.invalidations[0], expected)
+				}
+			}
+			if player.plays != 1 || session.loadCount() != 0 {
+				t.Fatalf("unexpected retry: plays=%d loads=%d", player.plays, session.loadCount())
+			}
+		})
+	}
 }
 
 type offlineAniList struct{}

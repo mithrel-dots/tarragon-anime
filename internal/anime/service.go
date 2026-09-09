@@ -23,6 +23,10 @@ type aniListClient interface {
 
 type providerClient = provider.Client
 
+type streamInvalidator interface {
+	InvalidateStreams(provider.Episode, string, string)
+}
+
 type player interface {
 	Play(context.Context, mpv.Stream, string, float64) (mpv.SessionController, error)
 }
@@ -475,8 +479,10 @@ func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
 	s.logger.Printf("stream served provider=%s media_id=%d episode=%d", episode.Provider, episode.MediaID, episode.Number)
 	session, err := s.player.Play(ctx, stream, episode.Title, start)
 	if err != nil {
+		s.invalidateStreams(episode)
 		return fmt.Errorf("launch mpv: %w", err)
 	}
+	episodes[index] = episode
 	playbackCtx, cancel := context.WithCancel(s.rootCtx)
 	active := &activePlayback{
 		ctx: playbackCtx, cancel: cancel, session: session,
@@ -602,6 +608,9 @@ func (s *Service) handlePlaybackEvent(active *activePlayback, event mpv.Event) {
 			s.queueSync(active)
 		}
 	case mpv.EventEndFile:
+		if event.Reason == "error" {
+			s.invalidateStreams(active.episodes[active.index])
+		}
 		complete := event.Reason == "eof" || active.complete
 		s.saveProgress(active, complete)
 		if complete && s.config.Sync.Trigger == "eof" {
@@ -929,9 +938,11 @@ func (s *Service) navigate(active *activePlayback, delta int, saveCurrent bool) 
 func (s *Service) loadEpisode(active *activePlayback, episode Episode, stream mpv.Stream, start float64, malID int) error {
 	s.logger.Printf("stream served provider=%s media_id=%d episode=%d", episode.Provider, episode.MediaID, episode.Number)
 	if err := active.session.Load(active.ctx, stream, episode.Title, start); err != nil {
+		s.invalidateStreams(episode)
 		return err
 	}
 	active.index = episodeIndex(active.episodes, episode.Number)
+	active.episodes[active.index] = episode
 	active.stream = stream
 	active.position = start
 	active.duration = 0
@@ -1056,6 +1067,14 @@ func skipLabel(kind string) string {
 		return "outro"
 	}
 	return "intro"
+}
+
+func (s *Service) invalidateStreams(episode Episode) {
+	if client, ok := s.providers[episode.Provider].(streamInvalidator); ok {
+		client.InvalidateStreams(provider.Episode{
+			ShowID: episode.ProviderID, Number: episode.Number, Value: episode.Value,
+		}, s.config.Translation, s.config.PreferredQuality)
+	}
 }
 
 func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Stream, Episode, error) {
