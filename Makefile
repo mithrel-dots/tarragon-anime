@@ -17,12 +17,15 @@ test-race:
 	go test -race ./...
 
 # Opt-in integration tests that require network access to AniList and AllAnime.
+# The browser tests additionally need a Chromium profile that has already
+# passed the origin's bot check; see internal/browser/live_test.go.
 test-live:
-	go test -tags=live ./internal/anilist ./internal/provider/allanime
+	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/browser ./internal/provider/allanime
 
 check-deps:
 	@command -v go >/dev/null || { printf '%s\n' 'go is required' >&2; exit 1; }
 	@command -v mpv >/dev/null || { printf '%s\n' 'mpv is required' >&2; exit 1; }
+	@command -v chromium >/dev/null || printf '%s\n' 'chromium not found: stream resolution will use the native fallback' >&2
 
 install: check-deps
 	install -d "$(PLUGIN_DIR)" "$(DESKTOP_DIR)"
