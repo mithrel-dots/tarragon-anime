@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"tarragon-anime/internal/auth"
 )
@@ -25,6 +26,19 @@ type Config struct {
 	MPVArgs                  []string
 	Skip                     SkipConfig
 	Sync                     SyncConfig
+	Browser                  BrowserConfig
+}
+
+// BrowserConfig controls the managed Chromium instance used to resolve streams
+// from a provider's own player.
+type BrowserConfig struct {
+	Enabled     bool
+	Binary      string
+	ProfileDir  string
+	Headless    bool
+	Timeout     time.Duration
+	IdleTimeout time.Duration
+	MaxSessions int
 }
 
 type SkipConfig struct {
@@ -56,6 +70,10 @@ func DefaultConfig() Config {
 		},
 		AutoNextThresholdPercent: 80,
 		Skip:                     SkipConfig{Enabled: true, Intro: true, Outro: true},
+		Browser: BrowserConfig{
+			Enabled: true, Headless: true,
+			Timeout: 45 * time.Second, IdleTimeout: 2 * time.Minute, MaxSessions: 2,
+		},
 	}
 }
 
@@ -152,6 +170,20 @@ func LoadConfig(path string) (Config, error) {
 			cfg.Sync.Trigger, err = parseString(value)
 		case "sync.threshold_percent":
 			cfg.Sync.ThresholdPercent, err = strconv.ParseFloat(value, 64)
+		case "browser.enabled":
+			cfg.Browser.Enabled, err = strconv.ParseBool(value)
+		case "browser.binary":
+			cfg.Browser.Binary, err = parseString(value)
+		case "browser.profile_dir":
+			cfg.Browser.ProfileDir, err = parseString(value)
+		case "browser.headless":
+			cfg.Browser.Headless, err = strconv.ParseBool(value)
+		case "browser.timeout_seconds":
+			cfg.Browser.Timeout, err = parseDuration(value)
+		case "browser.idle_timeout_seconds":
+			cfg.Browser.IdleTimeout, err = parseDuration(value)
+		case "browser.max_sessions":
+			cfg.Browser.MaxSessions, err = strconv.Atoi(value)
 		default:
 			continue
 		}
@@ -193,7 +225,24 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.Sync.ThresholdPercent <= 0 || cfg.Sync.ThresholdPercent > 100 {
 		return Config{}, fmt.Errorf("sync.threshold_percent must be greater than 0 and at most 100")
 	}
+	if cfg.Browser.Timeout <= 0 {
+		return Config{}, fmt.Errorf("browser.timeout_seconds must be greater than 0")
+	}
+	if cfg.Browser.IdleTimeout <= 0 {
+		return Config{}, fmt.Errorf("browser.idle_timeout_seconds must be greater than 0")
+	}
+	if cfg.Browser.MaxSessions <= 0 {
+		return Config{}, fmt.Errorf("browser.max_sessions must be greater than 0")
+	}
 	return cfg, nil
+}
+
+func parseDuration(value string) (time.Duration, error) {
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
 }
 
 func TokenPath() (string, error) {

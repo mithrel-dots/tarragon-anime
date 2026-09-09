@@ -15,6 +15,7 @@ import (
 	"tarragon-anime/internal/anime"
 	"tarragon-anime/internal/aniskip"
 	"tarragon-anime/internal/auth"
+	"tarragon-anime/internal/browser"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/preview"
 	"tarragon-anime/internal/provider"
@@ -125,6 +126,42 @@ func (openBrowser) Open(url string) error {
 	return nil
 }
 
+// newBrowserResolver builds the managed Chromium resolver, or returns nil when
+// the machine has no browser. A missing browser is not fatal: providers fall
+// back to their native resolution path.
+func newBrowserResolver(config anime.BrowserConfig, logger *log.Logger) *browser.Resolver {
+	if !config.Enabled {
+		return nil
+	}
+	binary := config.Binary
+	if binary == "" {
+		found, err := browser.FindBinary()
+		if err != nil {
+			logger.Printf("browser resolution disabled: %v", err)
+			return nil
+		}
+		binary = found
+	}
+	profileDir := config.ProfileDir
+	if profileDir == "" {
+		dir, err := browser.DefaultProfileDir()
+		if err != nil {
+			logger.Printf("browser resolution disabled: %v", err)
+			return nil
+		}
+		profileDir = dir
+	}
+	return browser.New(browser.Options{
+		Binary:      binary,
+		ProfileDir:  profileDir,
+		Headless:    config.Headless,
+		Timeout:     config.Timeout,
+		IdleTimeout: config.IdleTimeout,
+		MaxSessions: config.MaxSessions,
+		Logger:      logger,
+	})
+}
+
 func run() error {
 	endpoint := os.Getenv("TARRAGON_PLUGINS_ENDPOINT")
 	if endpoint == "" {
@@ -166,8 +203,13 @@ func run() error {
 
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	aniListClient := anilist.NewClient(httpClient)
+	allAnimeClient := allanime.NewClient(httpClient).WithLogger(logger)
+	if resolver := newBrowserResolver(config.Browser, logger); resolver != nil {
+		allAnimeClient.UseBrowser(resolver)
+		defer resolver.Close()
+	}
 	providers := map[string]provider.Client{
-		"allanime":  allanime.NewClient(httpClient),
+		"allanime":  allAnimeClient,
 		"animepahe": animepahe.NewClient(httpClient),
 	}
 	player := mpv.New(config.MPVArgs, logger)

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -73,6 +74,65 @@ func TestLoadConfigMissingUsesDefaults(t *testing.T) {
 	}
 	if !got.Skip.Enabled || !got.Skip.Intro || !got.Skip.Outro || got.Skip.MarginSeconds != 0 {
 		t.Fatalf("Skip = %#v", got.Skip)
+	}
+}
+
+func TestLoadConfigBrowserSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anime.toml")
+	content := `[browser]
+enabled = false
+binary = "/usr/bin/chromium"
+profile_dir = "/tmp/anime-browser"
+headless = false
+timeout_seconds = 30
+idle_timeout_seconds = 90
+max_sessions = 3
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := BrowserConfig{
+		Enabled: false, Binary: "/usr/bin/chromium", ProfileDir: "/tmp/anime-browser",
+		Headless: false, Timeout: 30 * time.Second, IdleTimeout: 90 * time.Second, MaxSessions: 3,
+	}
+	if !reflect.DeepEqual(got.Browser, want) {
+		t.Fatalf("Browser = %#v, want %#v", got.Browser, want)
+	}
+}
+
+func TestLoadConfigBrowserDefaults(t *testing.T) {
+	got, err := LoadConfig(filepath.Join(t.TempDir(), "missing.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := BrowserConfig{
+		Enabled: true, Headless: true,
+		Timeout: 45 * time.Second, IdleTimeout: 2 * time.Minute, MaxSessions: 2,
+	}
+	if !reflect.DeepEqual(got.Browser, want) {
+		t.Fatalf("Browser = %#v, want %#v", got.Browser, want)
+	}
+}
+
+func TestLoadConfigRejectsInvalidBrowserLimits(t *testing.T) {
+	for name, content := range map[string]string{
+		"timeout":      "[browser]\ntimeout_seconds = 0\n",
+		"idle timeout": "[browser]\nidle_timeout_seconds = -1\n",
+		"max sessions": "[browser]\nmax_sessions = 0\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "anime.toml")
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadConfig(path); err == nil {
+				t.Fatalf("LoadConfig() error = nil, want a rejection of %s", name)
+			}
+		})
 	}
 }
 
