@@ -241,7 +241,32 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 		r.opts.Logger.Printf("browser session failed, restarting Chromium: %v", err)
 		r.discard(eng)
 	}
+	if errors.Is(err, ErrChallenged) {
+		return found, r.challengeError(req.PageURL)
+	}
 	return found, err
+}
+
+// challengeError explains how to clear the origin's bot check. The clearance
+// is a cookie in the persistent profile and cannot be earned headlessly, so
+// the message has to name the profile and the exact command that earns it;
+// otherwise the failure reaches the launcher with no way to act on it.
+func (r *Resolver) challengeError(pageURL string) error {
+	profile := r.opts.ProfileDir
+	if profile == "" {
+		if dir, err := DefaultProfileDir(); err == nil {
+			profile = dir
+		}
+	}
+	if profile == "" {
+		return ErrChallenged
+	}
+	bin := r.opts.Binary
+	if bin == "" {
+		bin = "chromium"
+	}
+	return fmt.Errorf("%w: pass the check once by hand, then retry: %s --user-data-dir=%s %s",
+		ErrChallenged, bin, profile, pageURL)
 }
 
 // Close shuts the browser down. It is safe to call more than once.

@@ -71,6 +71,21 @@ func TestAcceptMediaSelectsTheEpisodeMedia(t *testing.T) {
 		{"same episode by path", browser.Candidate{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/sub/1.mp4", Kind: "XHR"}, true},
 		{"other show", browser.Candidate{URL: "https://cdn.test/videos/otherShowId/sub/1.mp4", Kind: "XHR"}, false},
 		{"other translation", browser.Candidate{URL: "https://cdn.test/videos/ReHMC7TQnch3C6z8j/dub/1.mp4", Kind: "XHR"}, false},
+		// Observed upstream: the episode file carries a cache-busting suffix
+		// rather than being named after the episode alone.
+		{"episode with cache busting suffix", browser.Candidate{
+			URL:  "https://tools.fast4speed.rsvp/media9/videos/ReHMC7TQnch3C6z8j/sub/1_1788962900147-dbdw4nn0?Authorization=token",
+			Kind: "Media", MIME: "application/octet-stream",
+		}, true},
+		// Observed upstream: the player fetches animated emoji through a media
+		// element, so Chromium reports them exactly like the episode.
+		{"animated emoji played as media", browser.Candidate{
+			URL:  "https://aln.youtube-anime.com/mcovers/emojis/1490419827691749478.gif",
+			Kind: "Media", MIME: "image/gif",
+		}, false},
+		{"cover art played as media", browser.Candidate{
+			URL: "https://aln.youtube-anime.com/mcovers/art.webp", Kind: "Media", MIME: "image/webp",
+		}, false},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -79,6 +94,51 @@ func TestAcceptMediaSelectsTheEpisodeMedia(t *testing.T) {
 				t.Fatalf("acceptMedia()(%q) = %t, want %t", test.candidate.URL, got, test.want)
 			}
 		})
+	}
+}
+
+// TestStreamsFromCandidatesPrefersTheEpisodeOverPlayedDecoys reproduces the
+// capture that handed mpv a three second emoji loop: the page plays both the
+// episode and an animated emoji through a media element, and the episode file
+// is named with a cache-busting suffix.
+func TestStreamsFromCandidatesPrefersTheEpisodeOverPlayedDecoys(t *testing.T) {
+	episode := Episode{ShowID: "SyR2K6bGYfKSE6YMm", Number: 16, Value: "16"}
+	want := "https://tools.fast4speed.rsvp/media9/videos/SyR2K6bGYfKSE6YMm/sub/16_1788962900147-dbdw4nn0?Authorization=token"
+	candidates := []browser.Candidate{
+		{URL: want, Kind: "Media", MIME: "application/octet-stream", Status: 206, Observed: 2 * time.Second},
+		{
+			URL:  "https://aln.youtube-anime.com/mcovers/emojis/1490419827691749478.gif",
+			Kind: "Media", MIME: "image/gif", Status: 206, Observed: time.Second,
+		},
+	}
+	streams, err := streamsFromCandidates(candidates, episode, "sub", "https://mkissa.to", "best")
+	if err != nil {
+		t.Fatalf("streamsFromCandidates() error = %v", err)
+	}
+	if len(streams) != 1 || streams[0].URL != want {
+		t.Fatalf("streams = %#v, want only the episode media", streams)
+	}
+}
+
+func TestNamesEpisodeRequiresASeparator(t *testing.T) {
+	cases := []struct {
+		segment, episode string
+		want             bool
+	}{
+		{"16", "16", true},
+		{"16.mp4", "16", true},
+		{"16_1788962900147-dbdw4nn0", "16", true},
+		{"16-1080p.m3u8", "16", true},
+		{"160", "16", false},
+		{"160_1788962900147", "16", false},
+		{"1", "16", false},
+		{"", "16", false},
+		{"16", "", false},
+	}
+	for _, test := range cases {
+		if got := namesEpisode(test.segment, test.episode); got != test.want {
+			t.Fatalf("namesEpisode(%q, %q) = %t, want %t", test.segment, test.episode, got, test.want)
+		}
 	}
 }
 

@@ -95,6 +95,11 @@ var subtitleSuffixes = []string{".vtt", ".srt", ".ass", ".ssa"}
 
 var progressiveSuffixes = []string{".mp4", ".mkv", ".webm", ".m4v"}
 
+// imageSuffixes cover the covers, icons and animated emoji the page loads.
+// Some of them are fetched through a media element, so Chromium reports them
+// as "Media" and only their type tells them apart from an episode.
+var imageSuffixes = []string{".gif", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".ico", ".avif", ".bmp"}
+
 // acceptMedia builds the predicate handed to the browser. It is deliberately
 // permissive about which of the episode's own URLs it lets through and strict
 // about everything else; ranking happens later, on the full candidate set.
@@ -140,6 +145,12 @@ func shapeOf(candidate browser.Candidate) (*url.URL, mediaClass) {
 	}
 	path := strings.ToLower(parsed.Path)
 	mime := strings.ToLower(strings.TrimSpace(strings.SplitN(candidate.MIME, ";", 2)[0]))
+	// The page fetches animated emoji through a media element, so Chromium
+	// reports them as "Media" exactly like the episode. Their type is what
+	// keeps a three second emoji loop from being handed to the player.
+	if strings.HasPrefix(mime, "image/") || hasAnySuffix(path, imageSuffixes) {
+		return parsed, mediaNone
+	}
 	switch {
 	case hasAnySuffix(path, segmentSuffixes):
 		// A chunk plays for a few seconds on its own and is never the answer
@@ -167,15 +178,9 @@ func mismatches(parsed *url.URL, showID, episodeValue, translation string) bool 
 		if (segment != "sub" && segment != "dub") || i < 2 || i+1 >= len(segments) || segments[i+1] == "" {
 			continue
 		}
-		episode := segments[i+1]
-		for _, suffixes := range [][]string{playlistSuffixes, progressiveSuffixes, subtitleSuffixes} {
-			for _, suffix := range suffixes {
-				episode = strings.TrimSuffix(episode, suffix)
-			}
-		}
 		if (showID != "" && segments[i-1] != strings.ToLower(showID)) ||
 			(translation != "" && segment != strings.ToLower(translation)) ||
-			(episodeValue != "" && episode != strings.ToLower(episodeValue)) {
+			(episodeValue != "" && !namesEpisode(segments[i+1], episodeValue)) {
 			return true
 		}
 	}
@@ -196,22 +201,31 @@ func correlates(parsed *url.URL, showID, episodeValue, translation string) bool 
 	if episodeValue == "" {
 		return true
 	}
-	wanted := strings.ToLower(episodeValue)
 	for _, segment := range strings.Split(path, "/") {
-		// Upstreams name the episode either as a bare path segment or as a
-		// file, so "1", "1.mp4" and "1.m3u8" all identify episode 1.
-		if segment == wanted {
+		if namesEpisode(segment, episodeValue) {
 			return true
-		}
-		for _, suffixes := range [][]string{progressiveSuffixes, playlistSuffixes} {
-			for _, suffix := range suffixes {
-				if segment == wanted+suffix {
-					return true
-				}
-			}
 		}
 	}
 	return false
+}
+
+// namesEpisode reports whether a path segment names the requested episode.
+// Upstreams write the episode as a bare segment, as a file, or with a
+// cache-busting suffix, so "16", "16.mp4" and "16_1788962900147-dbdw4nn0" all
+// identify episode 16. The separator is required so "160" never matches "16".
+func namesEpisode(segment, episodeValue string) bool {
+	segment, episodeValue = strings.ToLower(segment), strings.ToLower(episodeValue)
+	if episodeValue == "" {
+		return false
+	}
+	if segment == episodeValue {
+		return true
+	}
+	rest, ok := strings.CutPrefix(segment, episodeValue)
+	if !ok || rest == "" {
+		return false
+	}
+	return rest[0] == '_' || rest[0] == '-' || rest[0] == '.'
 }
 
 func isAdHost(host string) bool {

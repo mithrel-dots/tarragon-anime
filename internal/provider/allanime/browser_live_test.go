@@ -5,8 +5,12 @@ package allanime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +95,7 @@ func TestLiveBrowserStreamsAcrossTitles(t *testing.T) {
 			if streams[0].Headers["Referer"] == "" {
 				t.Fatalf("stream has no Referer, mpv would be refused: %#v", streams[0])
 			}
+			probeHandoff(ctx, t, streams[0])
 			t.Logf("%s ep %d resolved in %s: %s", title.name, episodes[0].Number,
 				time.Since(start).Round(time.Millisecond), streams[0].URL)
 		})
@@ -151,3 +156,44 @@ func contextWithTimeout(t *testing.T, d time.Duration) (context.Context, context
 	t.Helper()
 	return context.WithTimeout(t.Context(), d)
 }
+
+// probeHandoff replays the captured stream outside the browser with only the
+// headers the resolver returned. A reachable URL is not enough: the page also
+// plays covers and animated emoji through a media element, and those are valid
+// media to a probe, so the result has to look like a full episode.
+func probeHandoff(ctx context.Context, t *testing.T, stream Stream) {
+	t.Helper()
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skipf("ffprobe is required to verify the handoff: %v", err)
+	}
+	// ffmpeg takes one header block; repeating -headers replaces it.
+	var headers strings.Builder
+	for key, value := range stream.Headers {
+		fmt.Fprintf(&headers, "%s: %s\r\n", key, value)
+	}
+	out, err := exec.CommandContext(ctx, "ffprobe", "-v", "error",
+		"-headers", headers.String(),
+		"-show_entries", "format=duration:stream=codec_type",
+		"-of", "default=nw=1", stream.URL).CombinedOutput()
+	if err != nil {
+		t.Fatalf("handoff is not playable outside the browser: %v\n%s", err, out)
+	}
+	report := string(out)
+	if !strings.Contains(report, "codec_type=video") {
+		t.Fatalf("handoff carries no video stream:\n%s", report)
+	}
+	var seconds float64
+	for line := range strings.SplitSeq(report, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "duration="); ok {
+			seconds, _ = strconv.ParseFloat(value, 64)
+		}
+	}
+	if seconds < minEpisodeSeconds {
+		t.Fatalf("handoff duration = %.1fs, want a full episode; a decoy asset was selected:\n%s", seconds, report)
+	}
+	t.Logf("handoff verified: %.0fs of video", seconds)
+}
+
+// minEpisodeSeconds is below any real episode and far above the bumpers,
+// previews and emoji loops the page also plays.
+const minEpisodeSeconds = 600

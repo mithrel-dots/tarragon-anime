@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -84,6 +85,38 @@ func TestResolverStartsBrowserLazily(t *testing.T) {
 	}
 	if got := started.Load(); got != 1 {
 		t.Fatalf("browser starts = %d, want 1 reused instance", got)
+	}
+}
+
+func TestChallengeErrorNamesTheProfileAndCommand(t *testing.T) {
+	eng := &fakeEngine{err: ErrChallenged}
+	resolver := newTestResolver(t, Options{
+		Binary: "/usr/bin/chromium", ProfileDir: "/state/anime/browser", IdleTimeout: time.Hour,
+	}, func(context.Context, Options) (engine, error) { return eng, nil })
+
+	_, err := resolver.Capture(t.Context(), testRequest())
+	if !errors.Is(err, ErrChallenged) {
+		t.Fatalf("Capture() = %v, want ErrChallenged", err)
+	}
+	for _, want := range []string{"/usr/bin/chromium", "--user-data-dir=/state/anime/browser", testRequest().PageURL} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("challenge error %q does not tell the user to %q", err, want)
+		}
+	}
+}
+
+func TestChallengeErrorFallsBackToTheDefaultProfile(t *testing.T) {
+	profile, err := DefaultProfileDir()
+	if err != nil {
+		t.Skipf("no default profile dir: %v", err)
+	}
+	eng := &fakeEngine{err: ErrChallenged}
+	resolver := newTestResolver(t, Options{IdleTimeout: time.Hour},
+		func(context.Context, Options) (engine, error) { return eng, nil })
+
+	_, captureErr := resolver.Capture(t.Context(), testRequest())
+	if !strings.Contains(captureErr.Error(), profile) {
+		t.Fatalf("challenge error %q does not name the default profile %q", captureErr, profile)
 	}
 }
 
