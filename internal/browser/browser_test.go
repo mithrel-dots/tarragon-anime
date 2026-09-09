@@ -24,6 +24,9 @@ type fakeEngine struct {
 	block    chan struct{}
 	err      error
 	result   []Candidate
+	// hook decides each capture's outcome when set, so a challenge followed
+	// by a successful retry can be expressed.
+	hook func() error
 }
 
 func (e *fakeEngine) capture(ctx context.Context, _ Request) ([]Candidate, error) {
@@ -31,7 +34,12 @@ func (e *fakeEngine) capture(ctx context.Context, _ Request) ([]Candidate, error
 	e.captures++
 	block := e.block
 	err, result := e.err, e.result
+	hook := e.hook
 	e.mu.Unlock()
+
+	if hook != nil {
+		err = hook()
+	}
 
 	if block != nil {
 		select {
@@ -98,7 +106,7 @@ func TestChallengeErrorNamesTheProfileAndCommand(t *testing.T) {
 	if !errors.Is(err, ErrChallenged) {
 		t.Fatalf("Capture() = %v, want ErrChallenged", err)
 	}
-	for _, want := range []string{"/usr/bin/chromium", "--user-data-dir=/state/anime/browser", testRequest().PageURL} {
+	for _, want := range []string{"/usr/bin/chromium", "--user-data-dir='/state/anime/browser'", testRequest().PageURL, UserAgent} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("challenge error %q does not tell the user to %q", err, want)
 		}

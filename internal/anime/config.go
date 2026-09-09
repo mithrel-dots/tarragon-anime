@@ -39,6 +39,14 @@ type BrowserConfig struct {
 	Timeout     time.Duration
 	IdleTimeout time.Duration
 	MaxSessions int
+	// AutoClearance opens a visible window when the origin serves a bot
+	// check, instead of only reporting how to pass it by hand.
+	AutoClearance bool
+	// ClearanceWait is how long resolution waits for the check to clear
+	// before reporting that the window needs attention.
+	ClearanceWait time.Duration
+	// ClearanceTimeout is how long that window stays open.
+	ClearanceTimeout time.Duration
 }
 
 type SkipConfig struct {
@@ -73,6 +81,7 @@ func DefaultConfig() Config {
 		Browser: BrowserConfig{
 			Enabled: true, Headless: true,
 			Timeout: 45 * time.Second, IdleTimeout: 2 * time.Minute, MaxSessions: 2,
+			AutoClearance: true, ClearanceWait: 20 * time.Second, ClearanceTimeout: 5 * time.Minute,
 		},
 	}
 }
@@ -184,6 +193,12 @@ func LoadConfig(path string) (Config, error) {
 			cfg.Browser.IdleTimeout, err = parseDuration(value)
 		case "browser.max_sessions":
 			cfg.Browser.MaxSessions, err = strconv.Atoi(value)
+		case "browser.auto_clearance":
+			cfg.Browser.AutoClearance, err = strconv.ParseBool(value)
+		case "browser.clearance_wait_seconds":
+			cfg.Browser.ClearanceWait, err = parseDuration(value)
+		case "browser.clearance_timeout_seconds":
+			cfg.Browser.ClearanceTimeout, err = parseDuration(value)
 		default:
 			continue
 		}
@@ -233,6 +248,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Browser.MaxSessions <= 0 {
 		return Config{}, fmt.Errorf("browser.max_sessions must be greater than 0")
+	}
+	if cfg.Browser.ClearanceWait <= 0 {
+		return Config{}, fmt.Errorf("browser.clearance_wait_seconds must be greater than 0")
+	}
+	if cfg.Browser.ClearanceTimeout < cfg.Browser.ClearanceWait {
+		return Config{}, fmt.Errorf("browser.clearance_timeout_seconds must be at least browser.clearance_wait_seconds")
 	}
 	return cfg, nil
 }

@@ -152,13 +152,16 @@ func newBrowserResolver(config anime.BrowserConfig, logger *log.Logger) *browser
 		profileDir = dir
 	}
 	return browser.New(browser.Options{
-		Binary:      binary,
-		ProfileDir:  profileDir,
-		Headless:    config.Headless,
-		Timeout:     config.Timeout,
-		IdleTimeout: config.IdleTimeout,
-		MaxSessions: config.MaxSessions,
-		Logger:      logger,
+		Binary:           binary,
+		ProfileDir:       profileDir,
+		Headless:         config.Headless,
+		Timeout:          config.Timeout,
+		IdleTimeout:      config.IdleTimeout,
+		MaxSessions:      config.MaxSessions,
+		AutoClearance:    config.AutoClearance,
+		ClearanceWait:    config.ClearanceWait,
+		ClearanceTimeout: config.ClearanceTimeout,
+		Logger:           logger,
 	})
 }
 

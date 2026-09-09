@@ -4,7 +4,6 @@ package allanime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,9 +16,8 @@ import (
 	"tarragon-anime/internal/browser"
 )
 
-// liveResolver builds the managed resolver the daemon would build. See
-// internal/browser/live_test.go for the one-off manual step the origin's bot
-// check requires.
+// liveResolver matches the daemon's automatic clearance workflow. Set
+// ANIME_LIVE_FRESH=1 to require clearance in a fresh, temporary profile.
 func liveResolver(t *testing.T) *browser.Resolver {
 	t.Helper()
 	binary, err := browser.FindBinary()
@@ -27,6 +25,9 @@ func liveResolver(t *testing.T) *browser.Resolver {
 		t.Skipf("no Chromium available: %v", err)
 	}
 	profile := os.Getenv("ANIME_LIVE_PROFILE")
+	if os.Getenv("ANIME_LIVE_FRESH") != "" {
+		profile = t.TempDir()
+	}
 	if profile == "" {
 		profile, err = browser.DefaultProfileDir()
 		if err != nil {
@@ -40,10 +41,14 @@ func liveResolver(t *testing.T) *browser.Resolver {
 		Binary:      binary,
 		ProfileDir:  profile,
 		Headless:    os.Getenv("ANIME_LIVE_HEADFUL") == "",
-		Timeout:     60 * time.Second,
+		Timeout:     90 * time.Second,
 		IdleTimeout: time.Minute,
 		MaxSessions: 2,
-		Logger:      log.New(os.Stderr, "browser: ", 0),
+		// Match the daemon: a challenged capture opens a window and retries.
+		AutoClearance:    true,
+		ClearanceWait:    45 * time.Second,
+		ClearanceTimeout: 2 * time.Minute,
+		Logger:           log.New(os.Stderr, "browser: ", 0),
 	})
 	t.Cleanup(resolver.Close)
 	return resolver
@@ -83,9 +88,6 @@ func TestLiveBrowserStreamsAcrossTitles(t *testing.T) {
 			client.InvalidateStreams(episodes[0], "sub", "best")
 			start := time.Now()
 			streams, err := client.Streams(ctx, episodes[0], "sub", "best")
-			if errors.Is(err, browser.ErrChallenged) {
-				t.Skip("origin served a bot challenge; pass it once by hand")
-			}
 			if err != nil {
 				t.Fatalf("Streams() error = %v", err)
 			}
@@ -123,9 +125,6 @@ func TestLiveBrowserPrefetchReusesOneBrowser(t *testing.T) {
 
 	cold := time.Now()
 	if _, err := client.Streams(ctx, episodes[0], "sub", "best"); err != nil {
-		if errors.Is(err, browser.ErrChallenged) {
-			t.Skip("origin served a bot challenge; pass it once by hand")
-		}
 		t.Fatalf("Streams() error = %v", err)
 	}
 	coldDuration := time.Since(cold)

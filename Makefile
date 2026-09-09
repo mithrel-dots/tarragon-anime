@@ -17,8 +17,10 @@ test-race:
 	go test -race ./...
 
 # Opt-in integration tests that require network access to AniList and AllAnime.
-# The browser tests additionally need a Chromium profile that has already
-# passed the origin's bot check; see internal/browser/live_test.go.
+# Browser tests need Chromium and network access; AllAnime opens a visible
+# clearance window when needed. ANIME_LIVE_FRESH=1 uses a temporary profile for
+# AllAnime. ANIME_LIVE_CLEARANCE=1 also enables the local real-Chromium
+# clearance/restart regression test (requires a display).
 test-live:
 	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/browser ./internal/provider/allanime
 

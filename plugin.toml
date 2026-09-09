@@ -10,3 +10,45 @@ require_prefix = true
 provides_general_suggestions = false
 capabilities = ["suggest", "icon"]
 build_dependencies = ["go", "mpv", "chromium"]
+
+# Runtime browser configuration belongs in $XDG_CONFIG_HOME/tarragon/anime.toml
+# (default: ~/.config/tarragon/anime.toml), NOT in this plugin manifest.
+# The commented example below shows the defaults; missing files and omitted
+# settings use these values. Empty binary/profile_dir select Chromium from PATH
+# and $XDG_STATE_HOME/tarragon/anime/browser (default:
+# ~/.local/state/tarragon/anime/browser), respectively.
+#
+# [browser]
+# enabled = true
+# binary = ""
+# profile_dir = ""
+# headless = true
+# timeout_seconds = 45
+# idle_timeout_seconds = 120
+# max_sessions = 2
+# auto_clearance = true
+# clearance_wait_seconds = 20
+# clearance_timeout_seconds = 300
+#
+# browser.auto_clearance opens a visible Chromium window for an origin's bot
+# check, even when headless = true. This opens the check; it does not bypass it.
+# Resolution waits up to clearance_wait_seconds for the check to clear. If it
+# clears promptly, resolution retries automatically. Otherwise it reports that
+# clearance is pending and leaves the window open: complete the check there,
+# then manually retry the episode. Retrying while pending does not open another
+# window. Clearance is retained in the dedicated profile for later requests.
+# The window closes when clearance is detected, on plugin shutdown, or after
+# clearance_timeout_seconds (300 seconds total, not an extra 300 after the wait).
+# Both clearance durations accept fractional seconds; wait must be greater than
+# zero and timeout must be at least wait, even when auto_clearance is false.
+#
+# With auto_clearance = false, no clearance window opens automatically; the
+# challenge error gives a manual Chromium command. Stop the plugin to release
+# its profile before running that command, pass the check, close that browser,
+# then restart the plugin and retry. Use the indicated dedicated profile, not
+# your normal browser profile, and never open it in two processes at once.
+# With neither DISPLAY nor WAYLAND_DISPLAY set, automatic clearance reports no
+# display and provides the same manual guidance instead of opening a window.
+# Run the plugin/browser in a graphical session on the same machine/network;
+# copying clearance from another machine or network is not a reliable workaround.
+# With enabled = false, browser resolution (including automatic clearance) is off.

@@ -18,8 +18,10 @@
 //	    https://mkissa.to/anime/<showId>/p-1-sub
 //
 // Tick the check and wait for the player. Captures then run headless in the
-// same profile. When the origin retires the clearance, Capture reports
-// ErrChallenged and the step has to be repeated.
+// same profile. With AutoClearance enabled, Capture opens the visible window
+// automatically and retries once after clearance. Otherwise it returns manual
+// instructions. A check that needs more time returns ErrClearancePending while
+// the window remains open; complete it and retry playback.
 //
 // # Known limitations
 //
@@ -56,6 +58,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -144,15 +147,28 @@ type Options struct {
 	IdleTimeout time.Duration
 	// MaxSessions bounds concurrent captures.
 	MaxSessions int
+	// AutoClearance opens a visible browser window when the origin serves a
+	// bot check, so the clearance can be earned without a terminal. Without a
+	// display, the caller receives ErrNoDisplay and manual instructions.
+	AutoClearance bool
+	// ClearanceWait is how long a capture waits inline for the check to
+	// clear. Origins commonly clear themselves within seconds, which keeps
+	// playback going without anyone touching the window.
+	ClearanceWait time.Duration
+	// ClearanceTimeout is how long the window stays open waiting for a human
+	// before it is closed again.
+	ClearanceTimeout time.Duration
 	// Logger receives lifecycle messages.
 	Logger *log.Logger
 }
 
 const (
-	defaultTimeout     = 45 * time.Second
-	defaultIdleTimeout = 2 * time.Minute
-	defaultMaxSessions = 2
-	defaultSettle      = 1500 * time.Millisecond
+	defaultTimeout          = 45 * time.Second
+	defaultIdleTimeout      = 2 * time.Minute
+	defaultMaxSessions      = 2
+	defaultSettle           = 1500 * time.Millisecond
+	defaultClearanceWait    = 20 * time.Second
+	defaultClearanceTimeout = 5 * time.Minute
 )
 
 // engine abstracts the browser process so the resolver's lifecycle can be
@@ -165,11 +181,17 @@ type engine interface {
 // Resolver owns a lazily started Chromium process and hands out bounded,
 // cancellable capture sessions on it.
 type Resolver struct {
-	opts      Options
-	sem       chan struct{}
-	newEngine func(context.Context, Options) (engine, error)
+	opts         Options
+	sem          chan struct{}
+	newEngine    func(context.Context, Options) (engine, error)
+	newClearance func(context.Context, Options, string) (clearance, error)
+
+	// Serialize process transitions so a new Chromium never races a shutdown
+	// for ownership of the persistent profile.
+	process chan struct{}
 
 	mu          sync.Mutex
+	clearing    *clearanceSession
 	eng         engine
 	active      int
 	idle        *time.Timer
@@ -191,14 +213,22 @@ func New(opts Options) *Resolver {
 	if opts.MaxSessions <= 0 {
 		opts.MaxSessions = defaultMaxSessions
 	}
+	if opts.ClearanceWait <= 0 {
+		opts.ClearanceWait = defaultClearanceWait
+	}
+	if opts.ClearanceTimeout <= 0 {
+		opts.ClearanceTimeout = defaultClearanceTimeout
+	}
 	if opts.Logger == nil {
 		opts.Logger = log.New(io.Discard, "", 0)
 	}
 	return &Resolver{
-		opts:      opts,
-		sem:       make(chan struct{}, opts.MaxSessions),
-		newEngine: newChromeEngine,
-		done:      make(chan struct{}),
+		opts:         opts,
+		sem:          make(chan struct{}, opts.MaxSessions),
+		process:      make(chan struct{}, 1),
+		newEngine:    newChromeEngine,
+		newClearance: newChromeClearance,
+		done:         make(chan struct{}),
 	}
 }
 
@@ -218,6 +248,31 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 
 	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
 	defer cancel()
+
+	found, err := r.captureOnce(ctx, req)
+	if !errors.Is(err, ErrChallenged) {
+		return found, err
+	}
+	// The clearance cannot be earned headlessly, so put a window on the check.
+	// Origins commonly clear themselves within seconds, which turns this into
+	// a short pause instead of a failed playback.
+	if clearErr := r.Clear(ctx, req.PageURL); clearErr != nil {
+		return nil, clearErr
+	}
+	r.opts.Logger.Printf("bot check cleared, resolving again")
+	found, err = r.captureOnce(ctx, req)
+	if errors.Is(err, ErrChallenged) {
+		return nil, r.challengeError(req.PageURL)
+	}
+	return found, err
+}
+
+func (r *Resolver) captureOnce(ctx context.Context, req Request) ([]Candidate, error) {
+	// A visible bot-check window owns the profile directory, which Chromium
+	// refuses to share, so there is nothing to capture with until it closes.
+	if r.clearancePending() {
+		return nil, ErrClearancePending
+	}
 
 	select {
 	case r.sem <- struct{}{}:
@@ -241,9 +296,6 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 		r.opts.Logger.Printf("browser session failed, restarting Chromium: %v", err)
 		r.discard(eng)
 	}
-	if errors.Is(err, ErrChallenged) {
-		return found, r.challengeError(req.PageURL)
-	}
 	return found, err
 }
 
@@ -265,8 +317,9 @@ func (r *Resolver) challengeError(pageURL string) error {
 	if bin == "" {
 		bin = "chromium"
 	}
-	return fmt.Errorf("%w: pass the check once by hand, then retry: %s --user-data-dir=%s %s",
-		ErrChallenged, bin, profile, pageURL)
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+	return fmt.Errorf("%w: stop the anime plugin to release its browser profile, pass the check with %s --user-data-dir=%s --user-agent=%s %s, then close Chromium, restart the plugin and retry",
+		ErrChallenged, quote(bin), quote(profile), quote(UserAgent), quote(pageURL))
 }
 
 // Close shuts the browser down. It is safe to call more than once.
@@ -285,12 +338,21 @@ func (r *Resolver) Close() {
 		r.idle.Stop()
 		r.idle = nil
 	}
+	session := r.clearing
+	if session != nil {
+		session.cancel()
+		r.mu.Unlock()
+		<-session.done
+		r.mu.Lock()
+	}
 	eng := r.eng
 	r.eng = nil
 	r.mu.Unlock()
 
 	if eng != nil {
+		r.process <- struct{}{}
 		eng.close()
+		<-r.process
 	}
 }
 
@@ -300,6 +362,10 @@ func (r *Resolver) acquire(ctx context.Context) (engine, error) {
 		if r.closed {
 			r.mu.Unlock()
 			return nil, ErrClosed
+		}
+		if r.clearing != nil {
+			r.mu.Unlock()
+			return nil, ErrClearancePending
 		}
 		if err := ctx.Err(); err != nil {
 			r.mu.Unlock()
@@ -324,6 +390,8 @@ func (r *Resolver) acquire(ctx context.Context) (engine, error) {
 			r.startCancel = cancel
 			result = make(chan error, 1)
 			go func() {
+				r.process <- struct{}{}
+				defer func() { <-r.process }()
 				eng, err := r.newEngine(startCtx, r.opts)
 				r.mu.Lock()
 				if err == nil {
@@ -331,6 +399,8 @@ func (r *Resolver) acquire(ctx context.Context) (engine, error) {
 				}
 				if r.closed {
 					err = ErrClosed
+				} else if r.clearing != nil {
+					err = ErrClearancePending
 				}
 				if err == nil {
 					r.eng = eng
@@ -375,6 +445,8 @@ func (r *Resolver) release() {
 }
 
 func (r *Resolver) shutdownIdle() {
+	r.process <- struct{}{}
+	defer func() { <-r.process }()
 	r.mu.Lock()
 	if r.active > 0 || r.closed || r.eng == nil {
 		r.mu.Unlock()
@@ -391,6 +463,8 @@ func (r *Resolver) shutdownIdle() {
 // discard drops eng only if it is still the current engine, so a slow failing
 // session cannot tear down a browser a later session already replaced.
 func (r *Resolver) discard(eng engine) {
+	r.process <- struct{}{}
+	defer func() { <-r.process }()
 	r.mu.Lock()
 	if r.eng != eng {
 		r.mu.Unlock()
@@ -530,15 +604,30 @@ func newChromeEngine(ctx context.Context, opts Options) (engine, error) {
 	return &chromeEngine{launcher: l, browser: b, cancel: cancel}, nil
 }
 
+// Wait for clean exit before releasing profile ownership so Chromium can flush
+// its cookie store. Kill is a backstop, not the normal shutdown path.
 func (e *chromeEngine) close() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	defer e.cancel()
 	_ = e.browser.Context(ctx).Close()
-	e.cancel()
-	// launcher.Cleanup would delete the user data directory. The profile is
-	// persistent and holds the origin's clearance cookie, so the process is
-	// killed without touching it.
+	pid := e.launcher.PID()
+	for pid > 0 && ctx.Err() == nil {
+		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// launcher.Cleanup would delete the persistent profile.
 	e.launcher.Kill()
+	// Kill sends a signal but does not wait for Chromium to release its lock.
+	deadline := time.Now().Add(2 * time.Second)
+	for pid > 0 && time.Now().Before(deadline) {
+		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, error) {
