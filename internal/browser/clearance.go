@@ -4,13 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
-
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 )
 
 var (
@@ -34,9 +33,9 @@ func hasDisplay() bool {
 	return os.Getenv("WAYLAND_DISPLAY") != "" || os.Getenv("DISPLAY") != ""
 }
 
-// Clear opens a visible browser at pageURL and waits a bounded time for the
-// check. If it needs longer, the window stays open and callers retry later.
-// Cancellation stops waiting; Close or ClearanceTimeout closes the window.
+// Clear opens an ordinary visible browser at pageURL and waits a bounded time
+// for it to exit. The user must complete the check and close that window;
+// Chromium's normal shutdown then persists the clearance cookie.
 func (r *Resolver) Clear(ctx context.Context, pageURL string) error {
 	if pageURL == "" {
 		return errors.New("browser clearance: page URL is required")
@@ -205,80 +204,88 @@ func isClearanceCookie(name string) bool {
 	return name == "cf_clearance"
 }
 
-type chromeClearance struct {
-	engine  *chromeEngine
-	page    *rod.Page
-	pageURL string
-	mu      sync.Mutex
-	loaded  bool
-	cancel  context.CancelFunc
+// processClearance deliberately launches Chromium without a DevTools
+// connection. Cloudflare rejects the CDP-controlled launch even when the
+// window is visible; a normal browser process accepts the human checkbox.
+type processClearance struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	err  error
 }
 
 func newChromeClearance(ctx context.Context, opts Options, pageURL string) (clearance, error) {
-	opts.Headless = false
-	eng, err := newChromeEngine(ctx, opts)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	chrome := eng.(*chromeEngine)
-	page, err := chrome.browser.Context(ctx).Page(proto.TargetCreateTarget{URL: "about:blank"})
-	if err != nil {
-		eng.close()
-		return nil, fmt.Errorf("open the challenged page: %w", err)
+	bin := opts.Binary
+	if bin == "" {
+		var err error
+		bin, err = FindBinary()
+		if err != nil {
+			return nil, err
+		}
 	}
-	observe, cancel := context.WithCancel(ctx)
-	page = page.Context(observe)
-	c := &chromeClearance{engine: chrome, page: page, pageURL: pageURL, cancel: cancel}
-	go page.EachEvent(
-		func(ev *proto.NetworkRequestWillBeSent) {
-			if ev.Type == proto.NetworkResourceTypeDocument && ev.FrameID == page.FrameID {
-				c.mu.Lock()
-				c.loaded = false
-				c.pageURL = ev.Request.URL
-				c.mu.Unlock()
-			}
-		},
-		func(ev *proto.NetworkResponseReceived) {
-			if ev.Type == proto.NetworkResourceTypeDocument && ev.FrameID == page.FrameID {
-				c.mu.Lock()
-				c.loaded = ev.Response.Status >= 200 && ev.Response.Status < 300
-				for name, value := range ev.Response.Headers {
-					if strings.EqualFold(name, "cf-mitigated") && value.Str() == "challenge" {
-						c.loaded = false
-					}
-				}
-				c.pageURL = ev.Response.URL
-				c.mu.Unlock()
-			}
-		},
-	)()
-	if err := page.Navigate(pageURL); err != nil {
-		c.close()
-		return nil, fmt.Errorf("navigate to the challenged page: %w", err)
+	profile := opts.ProfileDir
+	if profile == "" {
+		var err error
+		profile, err = DefaultProfileDir()
+		if err != nil {
+			return nil, err
+		}
 	}
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		return nil, fmt.Errorf("prepare browser profile: %w", err)
+	}
+	cmd := exec.Command(bin,
+		"--user-data-dir="+profile,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--new-window",
+		pageURL,
+	)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		if isProfileLocked(err) {
+			return nil, fmt.Errorf("%w: %s", ErrProfileLocked, profile)
+		}
+		return nil, fmt.Errorf("open Chromium for the bot check: %w", err)
+	}
+	c := &processClearance{cmd: cmd, done: make(chan struct{})}
+	go func() {
+		c.err = cmd.Wait()
+		close(c.done)
+	}()
 	return c, nil
 }
 
-func (c *chromeClearance) cleared(ctx context.Context) (bool, error) {
-	c.mu.Lock()
-	pageURL, loaded := c.pageURL, c.loaded
-	c.mu.Unlock()
-	cookies, err := (proto.NetworkGetCookies{Urls: []string{pageURL}}).Call(c.page.Context(ctx))
-	if err != nil {
-		return false, err
-	}
-	// A stale clearance alone is not proof that the check passed: the watch
-	// document must also load successfully. DDoS-Guard's tracking cookies do
-	// not establish clearance, so they deliberately do not qualify.
-	for _, cookie := range cookies.Cookies {
-		if isClearanceCookie(cookie.Name) && loaded {
-			return true, nil
+func (c *processClearance) cleared(ctx context.Context) (bool, error) {
+	select {
+	case <-c.done:
+		if c.err != nil {
+			return false, fmt.Errorf("clearance browser exited: %w", c.err)
 		}
+		return true, nil
+	case <-ctx.Done():
+		// The watcher uses a short context for polling. An open browser is
+		// expected here, not an error; the outer timeout handles cancellation.
+		return false, nil
 	}
-	return false, nil
 }
 
-func (c *chromeClearance) close() {
-	c.cancel()
-	c.engine.close()
+func (c *processClearance) close() {
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+	if c.cmd.Process != nil {
+		_ = c.cmd.Process.Signal(syscall.SIGTERM)
+	}
+	select {
+	case <-c.done:
+	case <-time.After(5 * time.Second):
+		_ = c.cmd.Process.Kill()
+		<-c.done
+	}
 }

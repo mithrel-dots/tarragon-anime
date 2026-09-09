@@ -8,9 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 )
 
 // fakeClearance stands in for the visible window so the challenge workflow can
@@ -402,45 +399,4 @@ func TestCloseDuringClearanceDoesNotWaitForStalledCaptureStartup(t *testing.T) {
 	}
 	finish <- struct{}{}
 	<-startup
-}
-
-func TestChromeClearanceRequiresCookieAndSuccessfulDocument(t *testing.T) {
-	for _, tt := range []struct {
-		name, cookies string
-		loaded, want  bool
-	}{
-		{"cleared", `{"cookies":[{"name":"cf_clearance"}]}`, true, true},
-		{"stale clearance", `{"cookies":[{"name":"cf_clearance"}]}`, false, false},
-		{"tracking cookie", `{"cookies":[{"name":"__ddg1_"}]}`, true, false},
-		{"no cookie", `{"cookies":[]}`, true, false},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			client := lifecycleCDP{call: func(_ context.Context, method string, params interface{}) ([]byte, error) {
-				switch method {
-				case "Target.createTarget":
-					return []byte(`{"targetId":"tab"}`), nil
-				case "Target.attachToTarget":
-					return []byte(`{"sessionId":"session"}`), nil
-				case "Network.getCookies":
-					if urls := params.(proto.NetworkGetCookies).Urls; len(urls) != 1 || urls[0] != "https://example.test/redirected" {
-						t.Errorf("cookie URLs = %v, want final document URL", urls)
-					}
-					return []byte(tt.cookies), nil
-				}
-				return []byte(`{}`), nil
-			}}
-			b := rod.New().Context(t.Context()).Client(client).NoDefaultDevice()
-			if err := b.Connect(); err != nil {
-				t.Fatal(err)
-			}
-			page, err := b.Page(proto.TargetCreateTarget{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			c := &chromeClearance{page: page, pageURL: "https://example.test/redirected", loaded: tt.loaded}
-			if got, err := c.cleared(t.Context()); err != nil || got != tt.want {
-				t.Fatalf("cleared() = %v, %v; want %v", got, err, tt.want)
-			}
-		})
-	}
 }

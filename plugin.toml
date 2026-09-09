@@ -32,20 +32,22 @@ build_dependencies = ["go", "mpv", "chromium"]
 #
 # browser.auto_clearance opens a visible Chromium window for an origin's bot
 # check, even when headless = true. This opens the check; it does not bypass it.
-# Resolution waits up to clearance_wait_seconds for the check to clear. If it
-# clears promptly, resolution retries automatically. Otherwise it reports that
-# clearance is pending and leaves the window open: complete the check there,
-# then manually retry the episode. Retrying while pending does not open another
-# window. Clearance is retained in the dedicated profile for later requests.
-# The window closes when clearance is detected, on plugin shutdown, or after
-# clearance_timeout_seconds (300 seconds total, not an extra 300 after the wait).
+# Resolution waits up to clearance_wait_seconds for the check to finish. The
+# window is an ordinary Chromium process, not a CDP-controlled browser, because
+# Cloudflare rejects the latter. Complete the check there and close the window;
+# resolution retries automatically if that happens promptly. Otherwise it
+# reports that clearance is pending and leaves the window open. Finish the
+# check and close the window, then retry the episode. Retrying while pending
+# does not open another window. Clearance is retained in the dedicated profile.
+# The window closes on plugin shutdown or after clearance_timeout_seconds (300
+# seconds total, not an extra 300 after the wait).
 # Both clearance durations accept fractional seconds; wait must be greater than
 # zero and timeout must be at least wait, even when auto_clearance is false.
 #
 # With auto_clearance = false, no clearance window opens automatically; the
-# challenge error gives a manual Chromium command. Stop the plugin to release
-# its profile before running that command, pass the check, close that browser,
-# then restart the plugin and retry. Use the indicated dedicated profile, not
+# challenge error gives a manual plain-Chromium command. Stop the plugin to
+# release its profile before running that command, pass the check, close that
+# browser, then restart the plugin and retry. Use the indicated dedicated profile, not
 # your normal browser profile, and never open it in two processes at once.
 # With neither DISPLAY nor WAYLAND_DISPLAY set, automatic clearance reports no
 # display and provides the same manual guidance instead of opening a window.

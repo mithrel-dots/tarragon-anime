@@ -318,8 +318,8 @@ func (r *Resolver) challengeError(pageURL string) error {
 		bin = "chromium"
 	}
 	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
-	return fmt.Errorf("%w: stop the anime plugin to release its browser profile, pass the check with %s --user-data-dir=%s --user-agent=%s %s, then close Chromium, restart the plugin and retry",
-		ErrChallenged, quote(bin), quote(profile), quote(UserAgent), quote(pageURL))
+	return fmt.Errorf("%w: stop the anime plugin to release its browser profile, pass the check with %s --user-data-dir=%s %s, then close Chromium, restart the plugin and retry",
+		ErrChallenged, quote(bin), quote(profile), quote(pageURL))
 }
 
 // Close shuts the browser down. It is safe to call more than once.

@@ -106,7 +106,7 @@ func TestChallengeErrorNamesTheProfileAndCommand(t *testing.T) {
 	if !errors.Is(err, ErrChallenged) {
 		t.Fatalf("Capture() = %v, want ErrChallenged", err)
 	}
-	for _, want := range []string{"/usr/bin/chromium", "--user-data-dir='/state/anime/browser'", testRequest().PageURL, UserAgent} {
+	for _, want := range []string{"/usr/bin/chromium", "--user-data-dir='/state/anime/browser'", testRequest().PageURL} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("challenge error %q does not tell the user to %q", err, want)
 		}
