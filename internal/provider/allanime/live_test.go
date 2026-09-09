@@ -4,11 +4,15 @@ package allanime
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
 
-func TestLiveVerticalProviderSlice(t *testing.T) {
+// TestLiveMetadataSlice covers the operations that are still resolved natively
+// against the provider's GraphQL API. Stream resolution needs a browser and is
+// covered by browser_live_test.go.
+func TestLiveMetadataSlice(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
 	client := NewClient(nil)
@@ -23,23 +27,16 @@ func TestLiveVerticalProviderSlice(t *testing.T) {
 	if len(episodes) == 0 {
 		t.Fatal("AllAnime returned no episodes")
 	}
-	streams, err := client.Streams(ctx, episodes[0], "sub", "best")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(streams) == 0 || streams[0].URL == "" {
-		t.Fatal("AllAnime returned no playable streams")
-	}
 }
 
-func TestLiveCryptoProfileRefresh(t *testing.T) {
+// TestLiveStreamsNeedABrowser records the deliberate consequence of retiring
+// the native crypto path: without a browser session there is no stream.
+func TestLiveStreamsNeedABrowser(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
-	profiles, err := NewClient(nil).refreshProfiles(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(profiles) == 0 || profiles[0].BuildID == "" || len(profiles[0].MaskHex) != 64 {
-		t.Fatalf("refreshed profiles = %#v", profiles)
+	client := NewClient(nil)
+	_, err := client.Streams(ctx, Episode{ShowID: "ReHMC7TQnch3C6z8j", Number: 1, Value: "1"}, "sub", "best")
+	if !errors.Is(err, ErrBrowserRequired) {
+		t.Fatalf("Streams() error = %v, want ErrBrowserRequired", err)
 	}
 }
