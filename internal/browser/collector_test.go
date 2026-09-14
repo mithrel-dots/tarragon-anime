@@ -72,6 +72,35 @@ func TestCollectorGivesUpAfterLoadWithoutMedia(t *testing.T) {
 	}
 }
 
+// Split-track origins fetch a small initialisation segment from every quality
+// before committing to one, and those probes are identical in shape to the
+// track itself. Only the volume that follows separates them, so the byte count
+// has to accumulate and re-open acceptance as it grows.
+func TestCollectorAccumulatesTransferredBytes(t *testing.T) {
+	const threshold = 64 << 10
+	c := newCollector(Request{
+		Accept: func(c Candidate) bool { return c.Bytes >= threshold },
+		Settle: time.Hour,
+	})
+	c.request(&proto.NetworkRequestWillBeSent{RequestID: "t", Request: &proto.NetworkRequest{URL: "https://cdn.test/t.m4s"}})
+	c.response(&proto.NetworkResponseReceived{RequestID: "t", Response: &proto.NetworkResponse{Status: 200}})
+	if len(c.matches()) != 0 {
+		t.Fatal("accepted a track before any of it had arrived")
+	}
+	c.data(&proto.NetworkDataReceived{RequestID: "t", DataLength: 6515})
+	if len(c.matches()) != 0 {
+		t.Fatal("accepted an initialisation probe as a whole track")
+	}
+	c.data(&proto.NetworkDataReceived{RequestID: "t", DataLength: threshold})
+	matches := c.matches()
+	if len(matches) != 1 {
+		t.Fatalf("matches = %d, want the track accepted once it grew past the threshold", len(matches))
+	}
+	if want := int64(6515 + threshold); matches[0].Bytes != want {
+		t.Fatalf("Bytes = %d, want the accumulated total %d", matches[0].Bytes, want)
+	}
+}
+
 // A capture that matched media must never be cut short by the grace period.
 func TestCollectorGraceDoesNotDiscardMatchedMedia(t *testing.T) {
 	c := newCollector(Request{Accept: func(Candidate) bool { return true }, Settle: time.Hour})

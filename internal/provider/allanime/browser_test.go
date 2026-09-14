@@ -106,6 +106,66 @@ func TestAcceptMediaSelectsTheEpisodeMedia(t *testing.T) {
 	}
 }
 
+// Some origins serve adaptive video and audio as independent files and build
+// the URLs in script, so no manifest is ever requested. Handing mpv the video
+// alone plays it silently, and the eight initialisation probes that precede it
+// are the same shape as the track itself.
+func TestStreamsFromCandidatesPairsSplitTracks(t *testing.T) {
+	episode := Episode{ShowID: "srGrP23qJnjsHrRYD", Number: 1, Value: "1"}
+	base := "https://upos.cdn.test/iup/1r/fb/track-1-"
+	video := base + "261210110000.m4s"
+	audio := base + "2d1301000023.m4s"
+	candidates := []browser.Candidate{
+		{URL: base + "2f1210110000.m4s", Kind: "XHR", Status: 200, Bytes: 6515, Observed: time.Second},
+		{URL: base + "2a1301000023.m4s", Kind: "XHR", Status: 200, Bytes: 6527, Observed: time.Second},
+		{URL: video, Kind: "XHR", Status: 200, Bytes: 5823719, Observed: 2 * time.Second},
+		{URL: audio, Kind: "XHR", Status: 200, Bytes: 225932, Observed: 2 * time.Second},
+	}
+
+	streams, err := streamsFromCandidates(candidates, episode, "sub", "https://mkissa.to", "best")
+	if err != nil {
+		t.Fatalf("streamsFromCandidates() error = %v", err)
+	}
+	if len(streams) != 1 {
+		t.Fatalf("streams = %d, want only the paired video; got %+v", len(streams), streams)
+	}
+	if streams[0].URL != video {
+		t.Fatalf("streams[0].URL = %q, want the track that was played %q", streams[0].URL, video)
+	}
+	if streams[0].Audio != audio {
+		t.Fatalf("streams[0].Audio = %q, want the companion audio track %q", streams[0].Audio, audio)
+	}
+}
+
+// Content type names the audio half outright when the origin sends one, which
+// must win over picking the largest remaining track.
+func TestAudioCompanionPrefersDeclaredAudio(t *testing.T) {
+	video := browser.Candidate{URL: "https://cdn.test/t/v.m4s", Bytes: 9 << 20}
+	tracks := []browser.Candidate{
+		video,
+		{URL: "https://cdn.test/t/other-video.m4s", Bytes: 4 << 20},
+		{URL: "https://cdn.test/t/a.m4s", MIME: "audio/mp4", Bytes: 1 << 20},
+	}
+	if got := audioCompanion(video, tracks); got != "https://cdn.test/t/a.m4s" {
+		t.Fatalf("audioCompanion() = %q, want the declared audio track", got)
+	}
+}
+
+// A source that is not split must never gain a phantom audio track.
+func TestStreamsFromCandidatesLeavesSingleFileSourcesAlone(t *testing.T) {
+	episode := Episode{ShowID: "SyR2K6bGYfKSE6YMm", Number: 16, Value: "16"}
+	url := "https://tools.fast4speed.rsvp/media9/videos/SyR2K6bGYfKSE6YMm/sub/16"
+	streams, err := streamsFromCandidates([]browser.Candidate{
+		{URL: url, Kind: "Media", MIME: "video/mp4", Status: 206, Observed: time.Second},
+	}, episode, "sub", "https://mkissa.to", "best")
+	if err != nil {
+		t.Fatalf("streamsFromCandidates() error = %v", err)
+	}
+	if len(streams) != 1 || streams[0].Audio != "" {
+		t.Fatalf("streams = %+v, want one stream with no separate audio", streams)
+	}
+}
+
 // TestStreamsFromCandidatesPrefersTheEpisodeOverPlayedDecoys reproduces the
 // capture that handed mpv a three second emoji loop: the page plays both the
 // episode and an animated emoji through a media element, and the episode file
