@@ -61,6 +61,9 @@ type mediaClass int
 const (
 	mediaNone mediaClass = iota
 	mediaSubtitle
+	// mediaTrack is one half of a split-track source: a whole video or audio
+	// stream in its own file, playable only when paired with its counterpart.
+	mediaTrack
 	mediaProgressive
 	mediaPlaylist
 	// mediaPlayed is the request the player actually fed to the video
@@ -87,7 +90,18 @@ var adHosts = []string{
 
 // segmentSuffixes identify individual HLS or DASH chunks. A chunk plays for a
 // few seconds on its own and is never the answer to "where is this episode".
-var segmentSuffixes = []string{".ts", ".m4s", ".aac", ".key", ".init", ".cmfv", ".cmfa"}
+var segmentSuffixes = []string{".ts", ".aac", ".key", ".init", ".cmfv", ".cmfa"}
+
+// trackSuffixes are the fragmented-MP4 extensions a split-track origin uses
+// for a whole stream rather than for a chunk of one. The extension alone
+// cannot tell the two apart, so trackMinBytes does the real work.
+var trackSuffixes = []string{".m4s"}
+
+// trackMinBytes separates a real track from the initialisation segment the
+// player fetches for every quality before committing to one. Those probes are
+// a few kilobytes and identical in shape to the track they describe; the track
+// that is actually being played keeps growing well past this.
+const trackMinBytes = 64 << 10
 
 var playlistSuffixes = []string{".m3u8", ".mpd"}
 
@@ -118,7 +132,11 @@ func classify(candidate browser.Candidate, showID, episodeValue, translation str
 		return mediaNone
 	}
 	switch kind {
-	case mediaNone, mediaSubtitle, mediaPlaylist, mediaPlayed:
+	case mediaNone, mediaSubtitle, mediaPlaylist, mediaPlayed, mediaTrack:
+		// A track is held to the same standard as played media: the volume
+		// already transferred is the evidence. Split-track CDNs address
+		// streams by opaque identifiers that carry no show or episode, so
+		// demanding correlation here would reject every one of them.
 		return kind
 	}
 	// A progressive URL that the player never loaded is only the episode when
@@ -156,6 +174,14 @@ func shapeOf(candidate browser.Candidate) (*url.URL, mediaClass) {
 		// A chunk plays for a few seconds on its own and is never the answer
 		// to "where is this episode".
 		return parsed, mediaNone
+	case hasAnySuffix(path, trackSuffixes):
+		// Same extension whether it is a whole stream or a chunk of one. Only
+		// the volume actually transferred distinguishes the track being played
+		// from the initialisation segment fetched for every other quality.
+		if candidate.Bytes < trackMinBytes {
+			return parsed, mediaNone
+		}
+		return parsed, mediaTrack
 	case hasAnySuffix(path, subtitleSuffixes):
 		return parsed, mediaSubtitle
 	case hasAnySuffix(path, playlistSuffixes), mime == "application/vnd.apple.mpegurl",
@@ -325,15 +351,61 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 		return playable[i].candidate.Observed < playable[j].candidate.Observed
 	})
 
+	// A split-track source plays silently unless its audio is loaded with it,
+	// so the counterpart is attached to the video and withheld from the list:
+	// offering a bare audio track as a playback option is never useful.
+	var tracks []browser.Candidate
+	for _, item := range playable {
+		if item.class == mediaTrack {
+			tracks = append(tracks, item.candidate)
+		}
+	}
+	audio := ""
+	if len(playable) > 0 && playable[0].class == mediaTrack {
+		audio = audioCompanion(playable[0].candidate, tracks)
+	}
+
 	streams := make([]Stream, 0, len(playable))
 	for _, item := range playable {
-		streams = append(streams, Stream{
+		if audio != "" && item.candidate.URL == audio {
+			continue
+		}
+		stream := Stream{
 			URL:      item.candidate.URL,
 			Headers:  playbackHeaders(item.candidate, origin),
 			Subtitle: subtitle,
-		})
+		}
+		if item.class == mediaTrack {
+			stream.Audio = audio
+		}
+		streams = append(streams, stream)
 	}
 	return streams, nil
+}
+
+// audioCompanion picks the audio half of a split-track source. Content type
+// names it outright when the origin sends one; otherwise the remaining track
+// carrying the most data is it, since every other candidate at this point is a
+// quality the player probed and abandoned.
+func audioCompanion(video browser.Candidate, tracks []browser.Candidate) string {
+	best, bestBytes, bestTyped := "", int64(0), false
+	for _, track := range tracks {
+		if track.URL == video.URL {
+			continue
+		}
+		typed := strings.HasPrefix(strings.ToLower(track.MIME), "audio/")
+		if bestTyped && !typed {
+			continue
+		}
+		if typed && !bestTyped {
+			best, bestBytes, bestTyped = track.URL, track.Bytes, true
+			continue
+		}
+		if best == "" || track.Bytes > bestBytes {
+			best, bestBytes = track.URL, track.Bytes
+		}
+	}
+	return best
 }
 
 func hasCredentials(candidate browser.Candidate) bool {

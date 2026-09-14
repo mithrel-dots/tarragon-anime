@@ -62,6 +62,15 @@ func TestAcceptMediaSelectsTheEpisodeMedia(t *testing.T) {
 		{"subtitle track", browser.Candidate{URL: "https://cdn.test/subs/en.vtt", Kind: "Fetch"}, true},
 		{"hls segment", browser.Candidate{URL: "https://cdn.test/hls/seg-12.ts", Kind: "XHR"}, false},
 		{"dash segment", browser.Candidate{URL: "https://cdn.test/dash/chunk-3.m4s", Kind: "XHR"}, false},
+		// A split-track origin uses the same extension for a whole stream and
+		// for the initialisation segment it fetches from every quality before
+		// picking one, so only the transferred volume tells them apart.
+		{"track initialisation probe", browser.Candidate{
+			URL: "https://cdn.test/iup/1r/fb/track-1-2f1210110000.m4s", Kind: "XHR", Bytes: 6515,
+		}, false},
+		{"whole track being played", browser.Candidate{
+			URL: "https://cdn.test/iup/1r/fb/track-1-261210110000.m4s", Kind: "XHR", Bytes: 5 << 20,
+		}, true},
 		{"blob url", browser.Candidate{URL: "blob:https://mkissa.to/9f92-4a86", Kind: "Media"}, false},
 		{"data url", browser.Candidate{URL: "data:image/gif;base64,R0lGODlh", Kind: "Image"}, false},
 		{"ad video", browser.Candidate{URL: "https://s0.2mdn.net/creative/spot.mp4", Kind: "Media"}, false},

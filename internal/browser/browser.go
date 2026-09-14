@@ -157,6 +157,12 @@ type Candidate struct {
 	// Frame identifies the frame that issued the request, so requests from
 	// the player frame can be told apart from the host page.
 	Frame string
+	// Bytes is how much of the response body has arrived so far. Split-track
+	// sources fetch a small initialisation segment for every quality they
+	// might pick before committing to one, and those probes are
+	// indistinguishable from the real track by URL alone; only the volume
+	// that follows tells them apart.
+	Bytes int64
 	// Observed is the delay between navigation and the request.
 	Observed time.Duration
 }
@@ -740,6 +746,7 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 		func(ev *proto.NetworkResponseReceived) { col.response(ev) },
 		func(ev *proto.NetworkRequestWillBeSentExtraInfo) { col.extraInfo(ev) },
 		func(ev *proto.NetworkLoadingFailed) { col.failed(ev) },
+		func(ev *proto.NetworkDataReceived) { col.data(ev) },
 		func(*proto.PageLoadEventFired) { col.loaded() },
 	)
 	go stop()
@@ -891,6 +898,21 @@ func (c *collector) mergeExtraLocked(chain *requestChain) {
 		hop.hasExtra = true
 		c.evaluateLocked(hop)
 	}
+}
+
+// data accumulates the response volume for a request. A candidate's byte
+// count is re-evaluated as it grows, so a predicate can hold off on a track
+// until enough of it has arrived to prove it is not an init-segment probe.
+func (c *collector) data(ev *proto.NetworkDataReceived) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	chain := c.pending[string(ev.RequestID)]
+	if chain == nil || len(chain.hops) == 0 {
+		return
+	}
+	hop := chain.hops[len(chain.hops)-1]
+	hop.Bytes += int64(ev.DataLength)
+	c.evaluateLocked(hop)
 }
 
 func (c *collector) failed(ev *proto.NetworkLoadingFailed) {

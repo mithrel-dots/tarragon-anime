@@ -19,8 +19,12 @@ type Episode struct {
 }
 
 type Stream struct {
-	URL      string
-	Headers  map[string]string
+	URL     string
+	Headers map[string]string
+	// Audio is a separate audio track to play alongside URL, set when the
+	// origin serves adaptive video and audio as independent files. Empty
+	// when the video already carries its audio.
+	Audio    string
 	Subtitle string
 }
 
