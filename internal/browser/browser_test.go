@@ -3,6 +3,10 @@ package browser
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -73,6 +77,71 @@ func newTestResolver(t *testing.T, opts Options, factory func(context.Context, O
 	resolver.newEngine = factory
 	t.Cleanup(resolver.Close)
 	return resolver
+}
+
+// fakeBrowserBin writes a stub that answers --version like the real browser,
+// so user agent derivation can be tested without one installed.
+func fakeBrowserBin(t *testing.T, output string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "chromium")
+	script := "#!/bin/sh\n"
+	if output == "" {
+		script += "exit 1\n"
+	} else {
+		script += "printf '%s\\n' " + strconv.Quote(output) + "\n"
+	}
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The clearance cookie is bound to the user agent and cross-checked against
+// the client hints of the real build, so a version pinned in the source stops
+// working the moment the browser is upgraded past it: the visible window earns
+// a clearance the headless capture is then refused.
+func TestUserAgentFollowsTheInstalledBrowser(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		version string
+		want    string
+	}{
+		{"installed version", "Chromium 153.0.8010.36 Arch Linux", "Chrome/153.0.0.0"},
+		{"branded build", "Google Chrome 161.0.1234.5", "Chrome/161.0.0.0"},
+		{"unreadable version", "Chromium unknown", "Chrome/" + userAgentFallbackMajor + ".0.0.0"},
+		{"binary fails", "", "Chrome/" + userAgentFallbackMajor + ".0.0.0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agent := userAgentFor(fakeBrowserBin(t, test.version))
+			if !strings.Contains(agent, test.want) {
+				t.Fatalf("userAgentFor() = %q, want it to carry %q", agent, test.want)
+			}
+			if strings.Contains(agent, "Headless") {
+				t.Fatalf("userAgentFor() = %q, must not advertise headless", agent)
+			}
+		})
+	}
+}
+
+// A stale pin is invisible in unit tests, so assert against the browser that
+// is actually installed when there is one.
+func TestUserAgentMatchesTheInstalledBrowser(t *testing.T) {
+	bin, err := FindBinary()
+	if err != nil {
+		t.Skip("no browser installed")
+	}
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		t.Skip("browser did not report a version")
+	}
+	match := chromeMajorRe.FindSubmatch(out)
+	if match == nil {
+		t.Skip("browser version is not parseable")
+	}
+	want := "Chrome/" + string(match[1]) + ".0.0.0"
+	if agent := userAgentFor(bin); !strings.Contains(agent, want) {
+		t.Fatalf("userAgentFor() = %q, want it to carry %q from %q", agent, want, out)
+	}
 }
 
 func TestResolverStartsBrowserLazily(t *testing.T) {

@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"errors"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,6 +92,32 @@ func TestChallengeOpensAWindowAndRetriesOnceCleared(t *testing.T) {
 	}
 	if window.closes() == 0 {
 		t.Fatal("clearance window was left open after the check passed")
+	}
+}
+
+// A clearance that does not transfer to the capture is the hardest failure to
+// diagnose: the window shows no challenge, the user closes it, and playback
+// stops with the log ending at "browser started". It must say what happened.
+func TestChallengeAfterClearanceIsReported(t *testing.T) {
+	withDisplay(t)
+	var logged strings.Builder
+	opts := clearanceOptions()
+	opts.Logger = log.New(&logged, "", 0)
+	window := &fakeClearance{ok: true}
+	eng := &fakeEngine{err: ErrChallenged}
+	resolver := newTestResolver(t, opts, func(context.Context, Options) (engine, error) {
+		return eng, nil
+	})
+	resolver.newClearance = func(context.Context, Options, string) (clearance, error) {
+		return window, nil
+	}
+
+	_, err := resolver.Capture(t.Context(), testRequest())
+	if !errors.Is(err, ErrChallenged) {
+		t.Fatalf("Capture() error = %v, want a challenge", err)
+	}
+	if !strings.Contains(logged.String(), "challenged again after clearance") {
+		t.Fatalf("logger recorded %q, want the repeated challenge reported", logged.String())
 	}
 }
 

@@ -29,9 +29,12 @@
 //     2.9s cold, including Chromium start-up, and about 2.9s warm, of which
 //     2s is the deliberate settle window. Next-episode prefetch and the
 //     provider's stream cache are what keep this off the critical path.
-//   - The clearance cookie is bound to the profile, the pinned UserAgent and,
-//     in practice, the client's address. Copying the profile to another
-//     machine or network does not carry it over.
+//   - The clearance cookie is bound to the profile, the user agent and, in
+//     practice, the client's address. Copying the profile to another machine
+//     or network does not carry it over. The user agent follows the installed
+//     browser's version for the same reason: a version pinned in the source
+//     stops matching the moment the browser is upgraded past it, and the
+//     clearance the visible window earns is then refused to the capture.
 //   - Only the source the page loads by itself is captured. The alternate
 //     sources behind the site's player tabs are third party embeds that need
 //     UI interaction and serve ads, so they are out of reach and out of
@@ -55,6 +58,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -84,10 +88,54 @@ var (
 	ErrProfileLocked = errors.New("browser profile is already in use by another process")
 )
 
-// UserAgent is the user agent presented to the site. It is pinned rather than
-// derived from the Chromium build so a captured URL keeps working when the
-// header set is replayed by another client.
-const UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+// UserAgent is the user agent presented to the site when the installed
+// browser's version cannot be read. A capture must send one: headless
+// Chromium otherwise advertises itself as headless and is challenged on sight.
+const UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + userAgentFallbackMajor + ".0.0.0 Safari/537.36"
+
+const userAgentFallbackMajor = "153"
+
+// userAgentTemplate is Chromium's own reduced desktop user agent. Everything
+// but the major version has been frozen upstream since the user agent
+// reduction, so the major version is the only part worth deriving.
+const userAgentTemplate = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36"
+
+var (
+	userAgentOnce  sync.Map // binary path -> user agent
+	chromeMajorRe  = regexp.MustCompile(`(\d+)\.\d+\.\d+\.\d+`)
+	versionTimeout = 5 * time.Second
+)
+
+// userAgentFor builds the user agent from the installed browser's own version.
+//
+// The clearance cookie is bound to the user agent, and the origin cross-checks
+// that user agent against the client hints Chromium derives from the real
+// build. A pinned version therefore stops working the moment the browser is
+// upgraded past it: the visible window earns a clearance under the real
+// version, and the headless capture is challenged again presenting the stale
+// one, which fails playback with no visible cause.
+func userAgentFor(bin string) string {
+	if cached, ok := userAgentOnce.Load(bin); ok {
+		return cached.(string)
+	}
+	agent := fmt.Sprintf(userAgentTemplate, chromeMajor(bin))
+	userAgentOnce.Store(bin, agent)
+	return agent
+}
+
+func chromeMajor(bin string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), versionTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").Output()
+	if err != nil {
+		return userAgentFallbackMajor
+	}
+	match := chromeMajorRe.FindSubmatch(out)
+	if match == nil {
+		return userAgentFallbackMajor
+	}
+	return string(match[1])
+}
 
 // windowSize must describe a desktop-sized viewport: players are commonly
 // mounted lazily when they scroll into view, and a small headless window
@@ -261,7 +309,12 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 	r.opts.Logger.Printf("bot check cleared, resolving again")
 	found, err = r.captureAttempt(ctx, req)
 	if errors.Is(err, ErrChallenged) {
-		return nil, r.challengeError(req.PageURL)
+		// A check that passed in the window but not here means the clearance
+		// did not transfer, which is a configuration fault rather than a
+		// challenge the user can pass by trying again. Say so.
+		err = r.challengeError(req.PageURL)
+		r.opts.Logger.Printf("browser challenged again after clearance url=%s: %v", req.PageURL, err)
+		return nil, err
 	}
 	return found, err
 }
@@ -578,7 +631,9 @@ func newChromeEngine(ctx context.Context, opts Options) (engine, error) {
 		Set("mute-audio").
 		Set("autoplay-policy", "no-user-gesture-required").
 		Set("window-size", windowSize).
-		Set("user-agent", UserAgent).
+		// Must match what the visible clearance window sends, or the cookie it
+		// earned is rejected here and the capture is challenged all over again.
+		Set("user-agent", userAgentFor(bin)).
 		// Keeping player iframes in the host process means a single Network
 		// session observes the whole player stack, with no race against
 		// attaching to out-of-process frame targets.
