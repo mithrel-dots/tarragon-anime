@@ -213,10 +213,15 @@ type Options struct {
 }
 
 const (
-	defaultTimeout          = 45 * time.Second
-	defaultIdleTimeout      = 2 * time.Minute
-	defaultMaxSessions      = 2
-	defaultSettle           = 1500 * time.Millisecond
+	defaultTimeout     = 45 * time.Second
+	defaultIdleTimeout = 2 * time.Minute
+	defaultMaxSessions = 2
+	defaultSettle      = 1500 * time.Millisecond
+	// noMediaGrace is how long after the load event a page is given to start
+	// requesting media before the capture gives up on it. A player that
+	// autoplays has asked well inside this; waiting the whole capture budget
+	// only delays the same answer.
+	noMediaGrace            = 12 * time.Second
 	defaultClearanceWait    = 20 * time.Second
 	defaultClearanceTimeout = 5 * time.Minute
 )
@@ -721,6 +726,11 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 	if err := (proto.NetworkEnable{}).Call(page); err != nil {
 		return nil, engineFailure{fmt.Errorf("observe browser network: %w", err)}
 	}
+	// The load event is what makes "the player never asked for media"
+	// distinguishable from "the page is still loading".
+	if err := (proto.PageEnable{}).Call(page); err != nil {
+		return nil, engineFailure{fmt.Errorf("observe browser page: %w", err)}
+	}
 
 	col := newCollector(req)
 	// Observers are attached to a blank page before navigating so requests
@@ -730,6 +740,7 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 		func(ev *proto.NetworkResponseReceived) { col.response(ev) },
 		func(ev *proto.NetworkRequestWillBeSentExtraInfo) { col.extraInfo(ev) },
 		func(ev *proto.NetworkLoadingFailed) { col.failed(ev) },
+		func(*proto.PageLoadEventFired) { col.loaded() },
 	)
 	go stop()
 
@@ -752,9 +763,12 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 			}
 			if found, done := col.settled(); done {
 				if len(found) == 0 {
-					return nil, ErrNoMedia
+					return nil, fmt.Errorf("%w: %s", ErrNoMedia, col.observed())
 				}
 				return found, nil
+			}
+			if col.exhausted() {
+				return nil, fmt.Errorf("%w: %s", ErrNoMedia, col.observed())
 			}
 		}
 	}
@@ -771,6 +785,7 @@ type collector struct {
 	accepted   []*Candidate
 	firstMatch time.Time
 	docStatus  int
+	loadedAt   time.Time
 }
 
 type requestHop struct {
@@ -913,6 +928,66 @@ func (c *collector) evaluateLocked(hop *requestHop) {
 		}
 	}
 	c.firstMatch = time.Time{}
+}
+
+func (c *collector) loaded() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.loadedAt.IsZero() {
+		c.loadedAt = time.Now()
+	}
+}
+
+// exhausted reports that the page finished loading and then stayed quiet long
+// enough that no media is coming. Without it a page that loads but never plays
+// can only ever fail on the capture deadline, which is both slow and mute:
+// settled never fires while nothing has matched, so ErrNoMedia is unreachable.
+func (c *collector) exhausted() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.firstMatch.IsZero() && !c.loadedAt.IsZero() && time.Since(c.loadedAt) >= noMediaGrace
+}
+
+// observed summarises what the page actually requested. A capture that
+// matched nothing is otherwise undiagnosable: the log cannot distinguish a
+// player that never started from one whose media the predicate rejected.
+func (c *collector) observed() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kinds := map[string]int{}
+	total := 0
+	for _, chain := range c.pending {
+		if len(chain.hops) == 0 {
+			continue
+		}
+		hop := chain.hops[len(chain.hops)-1]
+		total++
+		kind := hop.Kind
+		if kind == "" {
+			kind = "pending"
+		}
+		kinds[kind]++
+	}
+	names := make([]string, 0, len(kinds))
+	for kind := range kinds {
+		names = append(names, kind)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if kinds[names[i]] != kinds[names[j]] {
+			return kinds[names[i]] > kinds[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	parts := make([]string, 0, len(names))
+	for _, kind := range names {
+		parts = append(parts, fmt.Sprintf("%s:%d", kind, kinds[kind]))
+	}
+	breakdown := strings.Join(parts, ",")
+	if breakdown == "" {
+		breakdown = "none"
+	}
+	return fmt.Sprintf("document=%d requests=%d accepted=%d kinds=%s",
+		c.docStatus, total, len(c.accepted), breakdown)
 }
 
 func (c *collector) challenged() bool {

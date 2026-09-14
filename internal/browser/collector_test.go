@@ -2,6 +2,7 @@ package browser
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,62 @@ func TestCollectorRequiresSuccessfulResponse(t *testing.T) {
 				t.Fatalf("accepted = %t, want %t", got, want)
 			}
 		})
+	}
+}
+
+// settled never fires while nothing has matched, so a page that loads and then
+// requests no media has no way to end a capture except the deadline. The load
+// event plus a grace period is what makes that answer both reachable and fast.
+func TestCollectorGivesUpAfterLoadWithoutMedia(t *testing.T) {
+	c := newCollector(Request{
+		PageURL: "https://example.test/watch",
+		Accept:  func(Candidate) bool { return false },
+		Settle:  time.Hour,
+	})
+	c.request(&proto.NetworkRequestWillBeSent{
+		RequestID: "doc", Type: proto.NetworkResourceTypeDocument,
+		Request: &proto.NetworkRequest{URL: "https://example.test/watch"},
+	})
+	c.response(&proto.NetworkResponseReceived{
+		RequestID: "doc", Type: proto.NetworkResourceTypeDocument,
+		Response: &proto.NetworkResponse{Status: 200, URL: "https://example.test/watch"},
+	})
+	if c.exhausted() {
+		t.Fatal("gave up before the page finished loading")
+	}
+	c.loaded()
+	if c.exhausted() {
+		t.Fatal("gave up without giving the player its grace period")
+	}
+	c.mu.Lock()
+	c.loadedAt = time.Now().Add(-noMediaGrace - time.Second)
+	c.mu.Unlock()
+	if !c.exhausted() {
+		t.Fatal("kept waiting for media the page was never going to request")
+	}
+	if _, done := c.settled(); done {
+		t.Fatal("settled reported a result with nothing matched")
+	}
+	// The summary is the whole point: it has to say what the page did instead.
+	summary := c.observed()
+	for _, want := range []string{"document=200", "requests=1", "accepted=0", "Document:1"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("observed() = %q, want it to report %q", summary, want)
+		}
+	}
+}
+
+// A capture that matched media must never be cut short by the grace period.
+func TestCollectorGraceDoesNotDiscardMatchedMedia(t *testing.T) {
+	c := newCollector(Request{Accept: func(Candidate) bool { return true }, Settle: time.Hour})
+	c.request(&proto.NetworkRequestWillBeSent{RequestID: "m", Request: &proto.NetworkRequest{URL: "https://cdn.test/a.mp4"}})
+	c.response(&proto.NetworkResponseReceived{RequestID: "m", Response: &proto.NetworkResponse{Status: 200}})
+	c.loaded()
+	c.mu.Lock()
+	c.loadedAt = time.Now().Add(-noMediaGrace - time.Second)
+	c.mu.Unlock()
+	if c.exhausted() {
+		t.Fatal("discarded a capture that had already matched media")
 	}
 }
 
