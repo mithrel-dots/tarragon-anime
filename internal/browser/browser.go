@@ -44,6 +44,13 @@
 //   - Media that a page only ever exposes as a blob: URL cannot be handed to
 //     an external player at all; such requests are rejected rather than
 //     returned as an unusable answer.
+//   - An origin that streams adaptive tracks without ever requesting a
+//     manifest is out of reach for the same reason. Every quality is its own
+//     file, the audio is separate files again, and nothing on the wire names
+//     which is which, so a capture can see the tracks but cannot tell a
+//     1.6 Mbps video from a 50 kbps one or from the audio. Callers are
+//     expected to refuse such a source rather than pick from it; a wrong pick
+//     plays silently or at the worst quality and looks like a broken player.
 //   - Chromium is required. Without it stream resolution is unavailable and
 //     callers must degrade to another provider.
 package browser

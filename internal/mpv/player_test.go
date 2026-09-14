@@ -46,12 +46,7 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 	if err := session.Load(t.Context(), Stream{URL: "https://video.test/next.m3u8"}, "Frieren - Episode 5", 0); err != nil {
 		t.Fatal(err)
 	}
-	// A split-track source plays silently unless its audio is loaded with it.
-	if err := session.Load(t.Context(), Stream{
-		URL: "https://video.test/video.m4s", Audio: "https://video.test/audio.m4s",
-	}, "Frieren - Episode 6", 0); err != nil {
-		t.Fatal(err)
-	}
+
 	if err := session.AddSubtitle(t.Context(), "https://sub.test/next.ass"); err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +88,7 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{"mpv-version", "define-section", "Shift+N", "Shift+P", "Shift+S", "loadfile", "next.m3u8", "sub-add", "show-text", "audio-add", "audio.m4s"} {
+	for _, expected := range []string{"mpv-version", "define-section", "Shift+N", "Shift+P", "Shift+S", "loadfile", "next.m3u8", "sub-add", "show-text"} {
 		if !strings.Contains(string(commands), expected) {
 			t.Errorf("mpv commands %q do not contain %q", commands, expected)
 		}

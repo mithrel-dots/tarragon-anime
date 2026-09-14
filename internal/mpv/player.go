@@ -20,12 +20,8 @@ import (
 )
 
 type Stream struct {
-	URL     string
-	Headers map[string]string
-	// Audio is a separate audio track to play alongside URL. Some origins
-	// serve adaptive video and audio as independent files, in which case URL
-	// alone plays silently. Empty when the video already carries its audio.
-	Audio    string
+	URL      string
+	Headers  map[string]string
 	Subtitle string
 }
 
@@ -228,13 +224,6 @@ func (s *Session) Load(ctx context.Context, stream Stream, title string, start f
 	}
 	if _, err := s.command(ctx, "loadfile", stream.URL, "replace"); err != nil {
 		return err
-	}
-	// audio-add must follow loadfile: mpv attaches external tracks to the
-	// file that is currently loaded, and replacing the file drops them.
-	if stream.Audio != "" {
-		if _, err := s.command(ctx, "audio-add", stream.Audio, "select"); err != nil {
-			return err
-		}
 	}
 	return nil
 }

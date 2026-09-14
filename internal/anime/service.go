@@ -1121,7 +1121,7 @@ func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Strea
 			continue
 		}
 		stream := streams[0]
-		return mpv.Stream{URL: stream.URL, Headers: stream.Headers, Audio: stream.Audio, Subtitle: stream.Subtitle}, candidate, nil
+		return mpv.Stream{URL: stream.URL, Headers: stream.Headers, Subtitle: stream.Subtitle}, candidate, nil
 	}
 	if len(failures) == 0 {
 		return mpv.Stream{}, episode, fmt.Errorf("no configured provider can serve episode %d", episode.Number)

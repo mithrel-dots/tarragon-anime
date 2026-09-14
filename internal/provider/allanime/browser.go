@@ -62,7 +62,11 @@ const (
 	mediaNone mediaClass = iota
 	mediaSubtitle
 	// mediaTrack is one half of a split-track source: a whole video or audio
-	// stream in its own file, playable only when paired with its counterpart.
+	// stream in its own file. It is recognised but deliberately never
+	// playable. Such an origin publishes every quality as its own file and
+	// names none of them, so choosing between them from the network alone
+	// means guessing, and a wrong guess is silent video or the worst quality
+	// on offer rather than an honest failure. See splitTrackError.
 	mediaTrack
 	mediaProgressive
 	mediaPlaylist
@@ -92,9 +96,10 @@ var adHosts = []string{
 // few seconds on its own and is never the answer to "where is this episode".
 var segmentSuffixes = []string{".ts", ".aac", ".key", ".init", ".cmfv", ".cmfa"}
 
-// trackSuffixes are the fragmented-MP4 extensions a split-track origin uses
-// for a whole stream rather than for a chunk of one. The extension alone
-// cannot tell the two apart, so trackMinBytes does the real work.
+// trackSuffixes are the fragmented-MP4 extensions an adaptive origin uses for
+// a whole stream rather than for a chunk of one. Such a stream is recognised
+// only so the failure can name itself; see mediaTrack for why one is never
+// offered for playback.
 var trackSuffixes = []string{".m4s"}
 
 // trackMinBytes separates a real track from the initialisation segment the
@@ -351,61 +356,30 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 		return playable[i].candidate.Observed < playable[j].candidate.Observed
 	})
 
-	// A split-track source plays silently unless its audio is loaded with it,
-	// so the counterpart is attached to the video and withheld from the list:
-	// offering a bare audio track as a playback option is never useful.
-	var tracks []browser.Candidate
-	for _, item := range playable {
-		if item.class == mediaTrack {
-			tracks = append(tracks, item.candidate)
-		}
-	}
-	audio := ""
-	if len(playable) > 0 && playable[0].class == mediaTrack {
-		audio = audioCompanion(playable[0].candidate, tracks)
-	}
-
 	streams := make([]Stream, 0, len(playable))
 	for _, item := range playable {
-		if audio != "" && item.candidate.URL == audio {
+		if item.class == mediaTrack {
 			continue
 		}
-		stream := Stream{
+		streams = append(streams, Stream{
 			URL:      item.candidate.URL,
 			Headers:  playbackHeaders(item.candidate, origin),
 			Subtitle: subtitle,
-		}
-		if item.class == mediaTrack {
-			stream.Audio = audio
-		}
-		streams = append(streams, stream)
+		})
+	}
+	if len(streams) == 0 {
+		return nil, splitTrackError(len(playable))
 	}
 	return streams, nil
 }
 
-// audioCompanion picks the audio half of a split-track source. Content type
-// names it outright when the origin sends one; otherwise the remaining track
-// carrying the most data is it, since every other candidate at this point is a
-// quality the player probed and abandoned.
-func audioCompanion(video browser.Candidate, tracks []browser.Candidate) string {
-	best, bestBytes, bestTyped := "", int64(0), false
-	for _, track := range tracks {
-		if track.URL == video.URL {
-			continue
-		}
-		typed := strings.HasPrefix(strings.ToLower(track.MIME), "audio/")
-		if bestTyped && !typed {
-			continue
-		}
-		if typed && !bestTyped {
-			best, bestBytes, bestTyped = track.URL, track.Bytes, true
-			continue
-		}
-		if best == "" || track.Bytes > bestBytes {
-			best, bestBytes = track.URL, track.Bytes
-		}
-	}
-	return best
+// splitTrackError reports a source whose only media is adaptive tracks. It is
+// a refusal, not a fallback: handing over one of them plays the episode
+// silently or at whichever quality happened to be observed, and both look like
+// a broken player rather than an unsupported source.
+func splitTrackError(tracks int) error {
+	return fmt.Errorf("origin serves the episode as %d separate adaptive tracks with no manifest; "+
+		"picking one would play silently or at an arbitrary quality, so this source needs a provider that publishes a playlist", tracks)
 }
 
 func hasCredentials(candidate browser.Candidate) bool {
