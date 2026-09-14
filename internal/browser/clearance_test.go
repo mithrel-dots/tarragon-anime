@@ -94,6 +94,42 @@ func TestChallengeOpensAWindowAndRetriesOnceCleared(t *testing.T) {
 	}
 }
 
+// The bot check is paced by a human, so it must not be charged to the capture
+// budget. Sharing one deadline across both attempts leaves the retry with
+// whatever the check did not consume, and the playback then dies of a deadline
+// moments after the log says the check passed.
+func TestClearanceDoesNotSpendTheRetryBudget(t *testing.T) {
+	withDisplay(t)
+	var captures atomic.Int32
+	opts := clearanceOptions()
+	opts.Timeout = 300 * time.Millisecond
+	window := &fakeClearance{}
+	eng := &fakeEngine{}
+	resolver := newTestResolver(t, opts, func(context.Context, Options) (engine, error) {
+		return eng, nil
+	})
+	resolver.newClearance = func(context.Context, Options, string) (clearance, error) {
+		// A human takes longer than a single capture budget to pass the check.
+		time.Sleep(2 * opts.Timeout)
+		window.pass()
+		return window, nil
+	}
+	eng.hook = func() error {
+		if captures.Add(1) == 1 {
+			return ErrChallenged
+		}
+		return nil
+	}
+
+	_, err := resolver.Capture(t.Context(), testRequest())
+	if err != nil {
+		t.Fatalf("Capture() error = %v, want the retry to get a fresh capture budget", err)
+	}
+	if got := captures.Load(); got != 2 {
+		t.Fatalf("captures = %d, want the challenged capture and one retry", got)
+	}
+}
+
 func TestChallengeReportsPendingWhileAHumanIsNeeded(t *testing.T) {
 	withDisplay(t)
 	window := &fakeClearance{}

@@ -141,7 +141,9 @@ type Options struct {
 	ProfileDir string
 	// Headless runs Chromium without a visible window.
 	Headless bool
-	// Timeout bounds a single capture.
+	// Timeout bounds a single capture attempt, covering queueing, startup,
+	// navigation and settle. A bot check does not spend it; the retry after
+	// clearance is given a fresh budget.
 	Timeout time.Duration
 	// IdleTimeout shuts the browser down after this long without work.
 	IdleTimeout time.Duration
@@ -246,10 +248,7 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 		req.Settle = defaultSettle
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
-	defer cancel()
-
-	found, err := r.captureOnce(ctx, req)
+	found, err := r.captureAttempt(ctx, req)
 	if !errors.Is(err, ErrChallenged) {
 		return found, err
 	}
@@ -260,9 +259,27 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 		return nil, clearErr
 	}
 	r.opts.Logger.Printf("bot check cleared, resolving again")
-	found, err = r.captureOnce(ctx, req)
+	found, err = r.captureAttempt(ctx, req)
 	if errors.Is(err, ErrChallenged) {
 		return nil, r.challengeError(req.PageURL)
+	}
+	return found, err
+}
+
+// captureAttempt bounds one page load by Timeout. The budget is per attempt on
+// purpose: the bot check between attempts is paced by a human, and charging it
+// to the capture leaves the retry too little time to start Chromium and load
+// the page, which fails the playback silently right after the check passed.
+func (r *Resolver) captureAttempt(ctx context.Context, req Request) ([]Candidate, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
+	defer cancel()
+
+	found, err := r.captureOnce(ctx, req)
+	// A capture that fails on a deadline or a dropped page is otherwise
+	// invisible: the provider folds it into a fallback message and the
+	// challenge path in particular leaves the log ending at "browser started".
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrChallenged) {
+		r.opts.Logger.Printf("browser capture failed url=%s: %v", req.PageURL, err)
 	}
 	return found, err
 }
