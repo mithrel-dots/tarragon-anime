@@ -427,9 +427,11 @@ func playbackHeaders(candidate browser.Candidate, origin string) map[string]stri
 			headers[canonical] = value
 		}
 	}
-	if headers["Referer"] == "" && origin != "" {
-		headers["Referer"] = strings.TrimRight(origin, "/") + "/"
-	}
+	// Never invent a Referer the browser did not send. A media CDN that signs
+	// its URLs validates the referrer against what it issued the token for,
+	// and a fabricated one is rejected outright: origins whose player fetches
+	// media with no referrer answer 403 to exactly the header added to help
+	// them. If the browser needed one, it is already in the captured headers.
 	if headers["User-Agent"] == "" {
 		headers["User-Agent"] = browser.UserAgent
 	}

@@ -235,14 +235,33 @@ func TestPlaybackHeadersNeverLeakForeignCredentials(t *testing.T) {
 	}
 }
 
-func TestPlaybackHeadersFallBackToTheSiteOrigin(t *testing.T) {
+// A signed media URL is issued against the referrer the player used, so a
+// Referer invented on the player's behalf is rejected. Observed against a
+// token-signing CDN: the request succeeds with no Referer and answers 403 with
+// the site origin, which is exactly the value this once supplied.
+func TestPlaybackHeadersNeverInventAReferer(t *testing.T) {
 	candidate := browser.Candidate{URL: "https://cdn.test/a.mp4", Kind: "Media"}
 	got := playbackHeaders(candidate, "https://mkissa.to/")
-	if got["Referer"] != "https://mkissa.to/" {
-		t.Fatalf("Referer = %q, want the site origin", got["Referer"])
+	if _, ok := got["Referer"]; ok {
+		t.Fatalf("Referer = %q, want none when the browser sent none", got["Referer"])
 	}
 	if got["User-Agent"] != browser.UserAgent {
 		t.Fatalf("User-Agent = %q, want the browser user agent", got["User-Agent"])
+	}
+}
+
+// A Referer the browser did send is playback context and must survive.
+func TestPlaybackHeadersForwardTheObservedReferer(t *testing.T) {
+	candidate := browser.Candidate{
+		URL: "https://cdn.test/a.mp4", Kind: "Media",
+		Headers: map[string]string{"Referer": "https://player.test/embed", "Origin": "https://player.test"},
+	}
+	got := playbackHeaders(candidate, "https://mkissa.to/")
+	if got["Referer"] != "https://player.test/embed" {
+		t.Fatalf("Referer = %q, want the referer the browser sent", got["Referer"])
+	}
+	if got["Origin"] != "https://player.test" {
+		t.Fatalf("Origin = %q, want the origin the browser sent", got["Origin"])
 	}
 }
 
