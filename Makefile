@@ -22,7 +22,7 @@ test-race:
 # AllAnime. ANIME_LIVE_CLEARANCE=1 also enables the local real-Chromium
 # clearance/restart regression test (requires a display).
 test-live:
-	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/browser ./internal/provider/allanime
+	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/browser ./internal/provider/allanime ./internal/provider/anipub
 
 check-deps:
 	@command -v go >/dev/null || { printf '%s\n' 'go is required' >&2; exit 1; }

@@ -63,6 +63,15 @@ type SyncConfig struct {
 	ThresholdPercent float64
 }
 
+// supportedProviders are the provider names a configuration may name. A
+// provider absent from a user's list is never consulted, so this set is what
+// bounds the names rather than what enables them.
+var supportedProviders = map[string]bool{
+	"allanime":  true,
+	"animepahe": true,
+	"anipub":    true,
+}
+
 func DefaultConfig() Config {
 	return Config{
 		Provider:         "allanime",
@@ -212,7 +221,7 @@ func LoadConfig(path string) (Config, error) {
 	for index, name := range cfg.Providers {
 		name = strings.ToLower(strings.TrimSpace(name))
 		cfg.Providers[index] = name
-		if name != "allanime" && name != "animepahe" {
+		if !supportedProviders[name] {
 			return Config{}, fmt.Errorf("unsupported provider %q", name)
 		}
 	}

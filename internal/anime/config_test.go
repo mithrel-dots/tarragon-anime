@@ -208,6 +208,27 @@ func TestLoadConfigProviderOrder(t *testing.T) {
 	}
 }
 
+// Ordering is what enables a provider: one absent from the list is never
+// consulted, so a newly supported name has to be accepted here or naming it
+// stops the daemon from starting at all.
+func TestLoadConfigAcceptsEverySupportedProvider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anime.toml")
+	if err := os.WriteFile(path, []byte("providers = [\"anipub\", \"allanime\", \"animepahe\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	want := []string{"anipub", "allanime", "animepahe"}
+	if !reflect.DeepEqual(config.Providers, want) {
+		t.Fatalf("Providers = %#v, want %#v", config.Providers, want)
+	}
+	if config.Provider != "anipub" {
+		t.Fatalf("Provider = %q, want the first configured provider", config.Provider)
+	}
+}
+
 func TestLoadConfigRejectsUnknownProvider(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "anime.toml")
 	if err := os.WriteFile(path, []byte("providers = [\"unknown\"]\n"), 0o600); err != nil {
