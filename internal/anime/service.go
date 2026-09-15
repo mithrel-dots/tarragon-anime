@@ -1245,10 +1245,14 @@ func (s *Service) providerEpisodes(ctx context.Context, media anilist.Media, nam
 		if item.Number <= 0 {
 			continue
 		}
+		providerID := providerAnime.ID
+		if item.ShowID != "" {
+			providerID = item.ShowID
+		}
 		result = append(result, Episode{
 			MediaID: media.ID, Number: item.Number,
 			Title:    fmt.Sprintf("%s - Episode %d", media.Title, item.Number),
-			Provider: name, ProviderID: providerAnime.ID, Value: item.Value,
+			Provider: name, ProviderID: providerID, Value: item.Value,
 		})
 	}
 	if len(result) == 0 {
