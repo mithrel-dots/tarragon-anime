@@ -984,6 +984,32 @@ func (c *collector) observed() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	kinds := map[string]int{}
+	media := map[string]int{}
+	knownExt := map[string]bool{
+		"aac": true, "flac": true, "m4a": true, "m4s": true, "m3u8": true,
+		"mkv": true, "mov": true, "mp3": true, "mp4": true, "mpd": true,
+		"oga": true, "ogg": true, "ts": true, "wav": true, "webm": true,
+	}
+	mimeBucket := func(mime string) string {
+		switch mime {
+		case "image/gif", "image/png", "image/jpeg", "image/webp",
+			"video/mp4", "video/webm", "video/ogg", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/webm":
+			return mime
+		case "application/dash+xml":
+			return "playlist/dash"
+		case "application/vnd.apple.mpegurl", "application/x-mpegurl":
+			return "playlist/hls"
+		case "":
+			return "-"
+		}
+		if strings.HasPrefix(mime, "video/") {
+			return "video/other"
+		}
+		if strings.HasPrefix(mime, "audio/") {
+			return "audio/other"
+		}
+		return "other"
+	}
 	total := 0
 	for _, chain := range c.pending {
 		if len(chain.hops) == 0 {
@@ -996,6 +1022,36 @@ func (c *collector) observed() string {
 			kind = "pending"
 		}
 		kinds[kind]++
+
+		retained := false
+		for _, candidate := range c.accepted {
+			if candidate == &hop.Candidate {
+				retained = true
+				break
+			}
+		}
+		mime := strings.ToLower(strings.TrimSpace(strings.SplitN(hop.MIME, ";", 2)[0]))
+		path := strings.ToLower(strings.SplitN(strings.SplitN(hop.URL, "?", 2)[0], "#", 2)[0])
+		ext := ""
+		if dot := strings.LastIndex(path, "."); dot >= 0 && dot+1 < len(path) && !strings.Contains(path[dot+1:], "/") {
+			ext = path[dot+1:]
+		}
+		relevant := kind == "Media" || strings.HasPrefix(mime, "video/") ||
+			strings.HasPrefix(mime, "audio/") || mime == "application/dash+xml" ||
+			mime == "application/vnd.apple.mpegurl" || mime == "application/x-mpegurl" || knownExt[ext]
+		if relevant && !retained {
+			mime = mimeBucket(mime)
+			if ext == "" || (!knownExt[ext] && !(kind == "Media" && ext == "gif")) {
+				ext = "-"
+			}
+			bytes := "small"
+			if hop.Bytes >= 64<<10 {
+				bytes = "large"
+			}
+			signature := fmt.Sprintf("status=%d,type=%s,mime=%s,ext=%s,bytes=%s,discarded=%t,awaiting-extra=%t",
+				hop.Status, kind, mime, ext, bytes, hop.discarded, hop.wantsExtra && !hop.hasExtra)
+			media[signature]++
+		}
 	}
 	names := make([]string, 0, len(kinds))
 	for kind := range kinds {
@@ -1014,6 +1070,34 @@ func (c *collector) observed() string {
 	breakdown := strings.Join(parts, ",")
 	if breakdown == "" {
 		breakdown = "none"
+	}
+	if len(media) > 0 {
+		names := make([]string, 0, len(media))
+		for signature := range media {
+			names = append(names, signature)
+		}
+		sort.Slice(names, func(i, j int) bool {
+			if media[names[i]] != media[names[j]] {
+				return media[names[i]] > media[names[j]]
+			}
+			return names[i] < names[j]
+		})
+		shown := len(names)
+		if shown > 8 {
+			shown = 8
+		}
+		parts := make([]string, 0, shown+1)
+		for _, signature := range names[:shown] {
+			parts = append(parts, fmt.Sprintf("%s:%d", signature, media[signature]))
+		}
+		if len(names) > shown {
+			other := 0
+			for _, signature := range names[shown:] {
+				other += media[signature]
+			}
+			parts = append(parts, fmt.Sprintf("other:%d", other))
+		}
+		breakdown += " media=" + strings.Join(parts, ";")
 	}
 	return fmt.Sprintf("document=%d requests=%d accepted=%d kinds=%s",
 		c.docStatus, total, len(c.accepted), breakdown)

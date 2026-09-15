@@ -72,6 +72,64 @@ func TestCollectorGivesUpAfterLoadWithoutMedia(t *testing.T) {
 	}
 }
 
+func TestCollectorObservedSummarizesRejectedMediaWithoutSecrets(t *testing.T) {
+	c := newCollector(Request{Accept: func(Candidate) bool { return false }})
+	add := func(id, kind, mime, url string, status int) {
+		c.request(&proto.NetworkRequestWillBeSent{RequestID: proto.NetworkRequestID(id), Type: proto.NetworkResourceType(kind), Request: &proto.NetworkRequest{URL: url,
+			Headers: proto.NetworkHeaders{"Authorization": gson.New("secret-header")}}})
+		c.response(&proto.NetworkResponseReceived{RequestID: proto.NetworkRequestID(id), Type: proto.NetworkResourceType(kind), Response: &proto.NetworkResponse{Status: status, MIMEType: mime}})
+	}
+	add("image", "Image", "image/gif", "https://cdn.test/cover.gif?token=secret-query", 200)
+	add("gif-ok", "Media", "image/gif", "https://cdn.test/image.gif?token=secret-query", 200)
+	add("gif-denied", "Media", "image/gif", "https://cdn.test/image.gif?token=secret-query", 403)
+	add("segment-small", "Media", "video/x-secret-mime", "https://cdn.test/segment.m4s?path=secret-path", 200)
+	c.data(&proto.NetworkDataReceived{RequestID: "segment-small", DataLength: 1})
+	add("segment-large", "Media", "video/mp4", "https://cdn.test/segment.m4s?path=secret-path", 200)
+	c.data(&proto.NetworkDataReceived{RequestID: "segment-large", DataLength: 64 << 10})
+	// HasExtraInfo without a matching ExtraInfo event leaves this response awaiting it.
+	c.request(&proto.NetworkRequestWillBeSent{RequestID: "awaiting", Type: proto.NetworkResourceTypeMedia,
+		Request: &proto.NetworkRequest{URL: "https://cdn.test/await.m4s"}})
+	c.response(&proto.NetworkResponseReceived{RequestID: "awaiting", Type: proto.NetworkResourceTypeMedia, HasExtraInfo: true,
+		Response: &proto.NetworkResponse{Status: 200, MIMEType: "video/mp4"}})
+	add("failed", "Media", "video/mp4", "https://cdn.test/failed.mp4", 200)
+	c.failed(&proto.NetworkLoadingFailed{RequestID: "failed"})
+
+	got := c.observed()
+	want := "document=0 requests=7 accepted=0 kinds=Media:6,Image:1 media=status=200,type=Media,mime=image/gif,ext=gif,bytes=small,discarded=false,awaiting-extra=false:1;status=200,type=Media,mime=video/mp4,ext=m4s,bytes=large,discarded=false,awaiting-extra=false:1;status=200,type=Media,mime=video/mp4,ext=m4s,bytes=small,discarded=false,awaiting-extra=true:1;status=200,type=Media,mime=video/mp4,ext=mp4,bytes=small,discarded=true,awaiting-extra=false:1;status=200,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=403,type=Media,mime=image/gif,ext=gif,bytes=small,discarded=false,awaiting-extra=false:1"
+	if got != want {
+		t.Fatalf("observed() = %q, want %q", got, want)
+	}
+	for _, secret := range []string{"secret-query", "secret-path", "secret-header", "cdn.test", "https://"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("observed() leaked %q: %s", secret, got)
+		}
+	}
+}
+
+func TestCollectorObservedBoundsMediaSummary(t *testing.T) {
+	c := newCollector(Request{Accept: func(Candidate) bool { return false }})
+	for status := 400; status < 410; status++ {
+		id := proto.NetworkRequestID(fmt.Sprintf("media-%d", status))
+		c.request(&proto.NetworkRequestWillBeSent{RequestID: id, Type: proto.NetworkResourceTypeMedia,
+			Request: &proto.NetworkRequest{URL: fmt.Sprintf("https://secret.host/media-%d.m4s?token=secret", status), Headers: proto.NetworkHeaders{"X-Secret": gson.New("secret-header")}}})
+		c.response(&proto.NetworkResponseReceived{RequestID: id, Type: proto.NetworkResourceTypeMedia,
+			Response: &proto.NetworkResponse{Status: status, MIMEType: fmt.Sprintf("video/x-secret-%d", status)}})
+	}
+	want := "document=0 requests=10 accepted=0 kinds=Media:10 media=status=400,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=401,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=402,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=403,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=404,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=405,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=406,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;status=407,type=Media,mime=video/other,ext=m4s,bytes=small,discarded=false,awaiting-extra=false:1;other:2"
+	first := c.observed()
+	if first != want || len(first) > 1200 {
+		t.Fatalf("observed() = %q, want exact bounded summary (length=%d)", first, len(first))
+	}
+	if second := c.observed(); second != first {
+		t.Fatalf("observed() was not deterministic: %q then %q", first, second)
+	}
+	for _, secret := range []string{"secret.host", "secret", "X-Secret", "video/x-secret"} {
+		if strings.Contains(first, secret) {
+			t.Fatalf("observed() leaked %q: %s", secret, first)
+		}
+	}
+}
+
 // Split-track origins fetch a small initialisation segment from every quality
 // before committing to one, and those probes are identical in shape to the
 // track itself. Only the volume that follows separates them, so the byte count
