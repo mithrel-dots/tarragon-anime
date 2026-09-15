@@ -213,14 +213,14 @@ func TestLoadConfigProviderOrder(t *testing.T) {
 // stops the daemon from starting at all.
 func TestLoadConfigAcceptsEverySupportedProvider(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "anime.toml")
-	if err := os.WriteFile(path, []byte("providers = [\"anipub\", \"allanime\", \"animepahe\"]\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("providers = [\"anipub\", \"anineko\", \"allanime\", \"animepahe\", \"animeflix\"]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	config, err := LoadConfig(path)
 	if err != nil {
 		t.Fatalf("LoadConfig() error = %v", err)
 	}
-	want := []string{"anipub", "allanime", "animepahe"}
+	want := []string{"anipub", "anineko", "allanime", "animepahe", "animeflix"}
 	if !reflect.DeepEqual(config.Providers, want) {
 		t.Fatalf("Providers = %#v, want %#v", config.Providers, want)
 	}

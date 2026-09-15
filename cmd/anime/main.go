@@ -20,7 +20,9 @@ import (
 	"tarragon-anime/internal/preview"
 	"tarragon-anime/internal/provider"
 	"tarragon-anime/internal/provider/allanime"
+	"tarragon-anime/internal/provider/animeflix"
 	"tarragon-anime/internal/provider/animepahe"
+	"tarragon-anime/internal/provider/anineko"
 	"tarragon-anime/internal/provider/anipub"
 	"tarragon-anime/internal/store"
 	"tarragon-anime/internal/tarragon"
@@ -208,7 +210,11 @@ func run() error {
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	aniListClient := anilist.NewClient(httpClient)
 	allAnimeClient := allanime.NewClient(httpClient).WithLogger(logger)
+	animeFlixClient := animeflix.NewClient(httpClient)
+	aniNekoClient := anineko.NewClient(httpClient).WithLogger(logger)
 	aniPubClient := anipub.NewClient(httpClient).WithLogger(logger)
+	defer aniNekoClient.Close()
+	defer animeFlixClient.Close()
 	if resolver := newBrowserResolver(config.Browser, logger); resolver != nil {
 		// One resolver is shared: it owns a single Chromium and serialises
 		// captures itself, so a second would only contend for the profile.
@@ -218,7 +224,9 @@ func run() error {
 	}
 	providers := map[string]provider.Client{
 		"allanime":  allAnimeClient,
+		"animeflix": animeFlixClient,
 		"animepahe": animepahe.NewClient(httpClient),
+		"anineko":   aniNekoClient,
 		"anipub":    aniPubClient,
 	}
 	player := mpv.New(config.MPVArgs, logger)

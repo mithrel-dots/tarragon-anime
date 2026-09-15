@@ -68,7 +68,9 @@ type SyncConfig struct {
 // bounds the names rather than what enables them.
 var supportedProviders = map[string]bool{
 	"allanime":  true,
+	"animeflix": true,
 	"animepahe": true,
+	"anineko":   true,
 	"anipub":    true,
 }
 

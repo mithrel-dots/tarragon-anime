@@ -16,13 +16,14 @@ check:
 test-race:
 	go test -race ./...
 
-# Opt-in integration tests that require network access to AniList and AllAnime.
+# Opt-in integration tests that require network access to AniList and providers.
 # Browser tests need Chromium and network access; AllAnime opens a visible
 # clearance window when needed. ANIME_LIVE_FRESH=1 uses a temporary profile for
 # AllAnime. ANIME_LIVE_CLEARANCE=1 also enables the local real-Chromium
 # clearance/restart regression test (requires a display).
+# ANIME_LIVE_MEDIA=1 also decodes one MyStream video frame with headless mpv.
 test-live:
-	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/browser ./internal/provider/allanime ./internal/provider/anipub
+	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/browser ./internal/provider/allanime ./internal/provider/animeflix ./internal/provider/animepahe ./internal/provider/anineko ./internal/provider/anipub
 
 check-deps:
 	@command -v go >/dev/null || { printf '%s\n' 'go is required' >&2; exit 1; }
