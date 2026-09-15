@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -23,24 +22,25 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://animepahe.pw"
-	userAgent      = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+	defaultBaseURL   = "https://animepahe.pw"
+	userAgent        = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+	challengeTimeout = 20 * time.Second
 )
 
 var (
-	buttonRE = regexp.MustCompile(`(?is)<button\b[^>]*>`)
-	attrRE   = regexp.MustCompile(`(?i)(data-src|data-audio|data-resolution)\s*=\s*["']([^"']*)["']`)
-	packerRE = regexp.MustCompile(`eval\(function\(p,a,c,k,e,d\).*?\}\('([^']*)',([0-9]+),([0-9]+),'([^']*)'`)
-	m3u8RE   = regexp.MustCompile(`https?://[^\s"'\\]+\.m3u8[^\s"'\\]*`)
+	buttonRE  = regexp.MustCompile(`(?is)<button\b[^>]*>`)
+	attrRE    = regexp.MustCompile(`(?i)(data-src|data-audio|data-resolution)\s*=\s*["']([^"']*)["']`)
+	packerRE  = regexp.MustCompile(`(?is)eval\(function\(p,a,c,k,e,d\).*?\}\('([^']*)',([0-9]+),([0-9]+),'([^']*)'`)
+	m3u8RE    = regexp.MustCompile(`https?://[^\s"'\\]+\.m3u8[^\s"'\\]*`)
+	kwikHosts = map[string]bool{"kwik.cx": true, "kwik.si": true, "kwik.click": true}
 )
 
 type Client struct {
 	http *http.Client
 	base string
 
-	accessMu sync.Mutex
-	bypassed bool
-	solver   func() ([]*http.Cookie, error)
+	accessMu chan struct{}
+	solver   func(context.Context, string) ([]*http.Cookie, error)
 }
 
 var _ provider.Client = (*Client)(nil)
@@ -53,14 +53,18 @@ func NewClientWithBaseURL(httpClient *http.Client, baseURL string) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
+	if baseURL == "" {
+		baseURL = defaultBaseURL
+	}
 	client := *httpClient
 	if client.Jar == nil {
 		client.Jar, _ = cookiejar.New(nil)
 	}
 	return &Client{
-		http:   &client,
-		base:   strings.TrimRight(baseURL, "/"),
-		solver: func() ([]*http.Cookie, error) { return solveChallenge(baseURL) },
+		http:     &client,
+		base:     strings.TrimRight(baseURL, "/"),
+		accessMu: make(chan struct{}, 1),
+		solver:   func(ctx context.Context, origin string) ([]*http.Cookie, error) { return solveChallenge(ctx, origin) },
 	}
 }
 
@@ -76,8 +80,8 @@ type releaseResponse struct {
 	CurrentPage int `json:"current_page"`
 	LastPage    int `json:"last_page"`
 	Data        []struct {
-		Episode int    `json:"episode"`
-		Session string `json:"session"`
+		Episode json.Number `json:"episode"`
+		Session string      `json:"session"`
 	} `json:"data"`
 }
 
@@ -173,6 +177,7 @@ func (c *Client) Episodes(ctx context.Context, anime provider.Anime, _ string) (
 		return nil, fmt.Errorf("AnimePahe provider id %q is invalid", anime.ID)
 	}
 	var result []provider.Episode
+	seen := make(map[int]string)
 	for page := 1; ; page++ {
 		endpoint := fmt.Sprintf("%s/api?m=release&id=%s&sort=episode_asc&page=%d", c.base, url.QueryEscape(ref.apiID()), page)
 		body, err := c.get(ctx, endpoint, false)
@@ -184,9 +189,21 @@ func (c *Client) Episodes(ctx context.Context, anime provider.Anime, _ string) (
 			return nil, fmt.Errorf("parse AnimePahe episodes: %w", err)
 		}
 		for _, item := range payload.Data {
-			if item.Episode > 0 {
-				result = append(result, provider.Episode{ShowID: anime.ID, Number: item.Episode, Value: item.Session})
+			number, err := strconv.Atoi(item.Episode.String())
+			if err != nil || number <= 0 || item.Session == "" {
+				continue
 			}
+			if prior, found := seen[number]; found {
+				if prior != item.Session {
+					return nil, fmt.Errorf("AnimePahe episode %d has conflicting session ids", number)
+				}
+				continue
+			}
+			seen[number] = item.Session
+			result = append(result, provider.Episode{ShowID: anime.ID, Number: number, Value: item.Session})
+		}
+		if payload.LastPage > 0 && payload.CurrentPage != page {
+			return nil, fmt.Errorf("AnimePahe returned release page %d instead of %d", payload.CurrentPage, page)
 		}
 		if payload.LastPage == 0 || payload.CurrentPage >= payload.LastPage {
 			break
@@ -199,7 +216,7 @@ func (c *Client) Episodes(ctx context.Context, anime provider.Anime, _ string) (
 	return result, nil
 }
 
-func (c *Client) Streams(ctx context.Context, episode provider.Episode, translation, _ string) ([]provider.Stream, error) {
+func (c *Client) Streams(ctx context.Context, episode provider.Episode, translation, quality string) ([]provider.Stream, error) {
 	ref := parseAnimeID(episode.ShowID)
 	if ref.session == "" {
 		return nil, fmt.Errorf("AnimePahe provider id %q is missing a session id", episode.ShowID)
@@ -211,7 +228,7 @@ func (c *Client) Streams(ctx context.Context, episode provider.Episode, translat
 	if err != nil {
 		return nil, fmt.Errorf("load AnimePahe player page: %w", err)
 	}
-	links := parsePlayerLinks(string(body), translation)
+	links := parsePlayerLinks(string(body), translation, quality)
 	if len(links) == 0 {
 		return nil, fmt.Errorf("AnimePahe returned no %s streams for episode %d", translation, episode.Number)
 	}
@@ -219,7 +236,8 @@ func (c *Client) Streams(ctx context.Context, episode provider.Episode, translat
 	for _, link := range links {
 		streamURL, err := c.extractKwik(ctx, link)
 		if err == nil {
-			result = append(result, provider.Stream{URL: streamURL, Headers: map[string]string{"Referer": c.base + "/"}})
+			result = append(result, provider.Stream{URL: streamURL, Headers: map[string]string{"Referer": kwikOrigin(link)}})
+			break
 		}
 	}
 	if len(result) == 0 {
@@ -233,14 +251,14 @@ type playerLink struct {
 	res int
 }
 
-func parsePlayerLinks(html, translation string) []string {
+func parsePlayerLinks(html, translation, quality string) []string {
 	var sub, dub []playerLink
 	for _, button := range buttonRE.FindAllString(html, -1) {
 		attributes := make(map[string]string)
 		for _, match := range attrRE.FindAllStringSubmatch(button, -1) {
 			attributes[strings.ToLower(match[1])] = match[2]
 		}
-		if !strings.Contains(attributes["data-src"], "kwik.cx") {
+		if !isKwikURL(attributes["data-src"]) {
 			continue
 		}
 		item := playerLink{url: attributes["data-src"]}
@@ -253,6 +271,10 @@ func parsePlayerLinks(html, translation string) []string {
 	}
 	sort.SliceStable(sub, func(i, j int) bool { return sub[i].res > sub[j].res })
 	sort.SliceStable(dub, func(i, j int) bool { return dub[i].res > dub[j].res })
+	if strings.EqualFold(strings.TrimSpace(quality), "worst") {
+		sort.SliceStable(sub, func(i, j int) bool { return sub[i].res < sub[j].res })
+		sort.SliceStable(dub, func(i, j int) bool { return dub[i].res < dub[j].res })
+	}
 	selected := sub
 	if strings.EqualFold(translation, "dub") {
 		selected = dub
@@ -264,6 +286,31 @@ func parsePlayerLinks(html, translation string) []string {
 	return result
 }
 
+func isKwikURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || !strings.HasPrefix(parsed.Path, "/e/") {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if kwikHosts[host] {
+		return true
+	}
+	for known := range kwikHosts {
+		if strings.HasSuffix(host, "."+known) {
+			return true
+		}
+	}
+	return false
+}
+
+func kwikOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host + "/"
+}
+
 func (c *Client) extractKwik(ctx context.Context, link string) (string, error) {
 	body, err := c.get(ctx, link, true)
 	if err != nil {
@@ -273,7 +320,7 @@ func (c *Client) extractKwik(ctx context.Context, link string) (string, error) {
 		base, _ := strconv.Atoi(match[2])
 		count, _ := strconv.Atoi(match[3])
 		words := strings.Split(match[4], "|")
-		if base <= 1 || count <= 0 || count > len(words) {
+		if base < 2 || base > 62 || count <= 0 || count > len(words) {
 			continue
 		}
 		if streamURL := m3u8RE.FindString(unpackPacker(match[1], base, count, words)); streamURL != "" {
@@ -284,6 +331,9 @@ func (c *Client) extractKwik(ctx context.Context, link string) (string, error) {
 }
 
 func unpackPacker(value string, base, count int, words []string) string {
+	if base < 2 || base > 62 || count <= 0 || count > len(words) {
+		return ""
+	}
 	encode := func(value int) string {
 		if value == 0 {
 			return "0"
@@ -341,9 +391,9 @@ func (c *Client) get(ctx context.Context, endpoint string, page bool) ([]byte, e
 		}
 		if isChallenge(resp, body) {
 			if attempt == 1 {
-				return nil, fmt.Errorf("AnimePahe request remains blocked by DDoS-Guard")
+				return nil, fmt.Errorf("AnimePahe request remains blocked by Cloudflare/DDoS challenge")
 			}
-			if err := c.bypass(); err != nil {
+			if err := c.bypass(ctx, endpoint); err != nil {
 				return nil, err
 			}
 			continue
@@ -356,52 +406,83 @@ func (c *Client) get(ctx context.Context, endpoint string, page bool) ([]byte, e
 	return nil, fmt.Errorf("AnimePahe request failed")
 }
 
-func (c *Client) bypass() error {
-	c.accessMu.Lock()
-	defer c.accessMu.Unlock()
-	if c.bypassed {
-		return nil
+func (c *Client) bypass(ctx context.Context, endpoint string) error {
+	select {
+	case c.accessMu <- struct{}{}:
+		defer func() { <-c.accessMu }()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	if c.solver == nil {
-		return fmt.Errorf("AnimePahe DDoS-Guard challenge requires Chromium")
+		return fmt.Errorf("AnimePahe Cloudflare/DDoS challenge requires browser clearance")
 	}
-	cookies, err := c.solver()
+	parsedEndpoint, err := url.Parse(endpoint)
+	if err != nil || parsedEndpoint.Scheme == "" || parsedEndpoint.Host == "" {
+		return fmt.Errorf("solve AnimePahe challenge: invalid challenged URL")
+	}
+	origin := parsedEndpoint.Scheme + "://" + parsedEndpoint.Host
+	cookies, err := c.solver(ctx, origin)
 	if err != nil {
-		return fmt.Errorf("solve AnimePahe DDoS-Guard challenge: %w", err)
+		return fmt.Errorf("solve AnimePahe browser challenge: %w", err)
 	}
-	parsed, err := url.Parse(c.base)
-	if err != nil {
-		return err
+	if len(cookies) == 0 {
+		return fmt.Errorf("solve AnimePahe browser challenge: no clearance cookies returned")
 	}
-	c.http.Jar.SetCookies(parsed, cookies)
-	c.bypassed = true
+	c.http.Jar.SetCookies(parsedEndpoint, cookies)
 	return nil
 }
 
-func solveChallenge(baseURL string) ([]*http.Cookie, error) {
+func solveChallenge(ctx context.Context, baseURL string) ([]*http.Cookie, error) {
 	var result []*http.Cookie
+	ctx, cancel := context.WithTimeout(ctx, challengeTimeout)
+	defer cancel()
+	binary, ok := launcher.LookPath()
+	if !ok {
+		return nil, fmt.Errorf("Chromium executable not found; refusing managed browser download")
+	}
 	err := rod.Try(func() {
-		browserLauncher := launcher.New().Headless(true)
-		defer browserLauncher.Cleanup()
-		browser := rod.New().ControlURL(browserLauncher.MustLaunch()).MustConnect()
-		defer browser.MustClose()
-		page := browser.MustPage(strings.TrimRight(baseURL, "/") + "/")
+		browserLauncher := launcher.New().Bin(binary).Headless(true).Context(ctx).Set("user-agent", userAgent)
+		defer func() {
+			browserLauncher.Kill()
+			browserLauncher.Cleanup()
+		}()
+		browser := rod.New().Context(ctx).ControlURL(browserLauncher.MustLaunch()).MustConnect()
+		defer func() {
+			closeCtx, stop := context.WithTimeout(context.Background(), 2*time.Second)
+			defer stop()
+			_ = browser.Context(closeCtx).Close()
+		}()
+		page := browser.Timeout(challengeTimeout).MustPage(strings.TrimRight(baseURL, "/") + "/")
 		page.MustWaitLoad()
 		for range 30 {
 			info, err := page.Info()
 			if err == nil && info.Title != "DDoS-Guard" && info.Title != "Just a moment..." && info.Title != "" {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				panic(ctx.Err())
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 		cookies, err := page.Cookies(nil)
 		if err != nil {
 			panic(err)
 		}
 		for _, cookie := range cookies {
-			result = append(result, &http.Cookie{Name: cookie.Name, Value: cookie.Value})
+			var expires time.Time
+			if cookie.Expires > 0 {
+				expires = time.Unix(int64(cookie.Expires), 0)
+			}
+			result = append(result, &http.Cookie{
+				Name: cookie.Name, Value: cookie.Value, Domain: cookie.Domain, Path: cookie.Path,
+				Secure: cookie.Secure, HttpOnly: cookie.HTTPOnly, Expires: expires,
+			})
 		}
 	})
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	return result, err
 }
 
