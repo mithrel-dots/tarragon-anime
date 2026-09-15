@@ -15,6 +15,19 @@ import (
 
 const maxSearchPages = 100
 
+// Provider season numbers do not generally match AniList releases (split cours
+// are a counterexample). Only individually checked mappings may select one.
+var verifiedSeasons = map[int]struct {
+	slug, season, name, title string
+}{
+	182205: {
+		slug:   "that-time-i-got-reincarnated-as-a-slime",
+		season: "4",
+		name:   "That Time I Got Reincarnated as a Slime",
+		title:  "That Time I Got Reincarnated as a Slime Season 4",
+	},
+}
+
 type searchPage struct {
 	NextPageAvailable bool `json:"nextpageavailable"`
 	AnimeList         []struct {
@@ -38,9 +51,19 @@ type infoPage struct {
 // Match resolves an AniList title conservatively. Search results are fully
 // paged because the API does not carry AniList IDs; the info request confirms
 // that a candidate slug is real before it is returned.
-func (c *Client) Match(ctx context.Context, mediaID int, aliases []string, _ string) (provider.Anime, error) {
+func (c *Client) Match(ctx context.Context, mediaID int, aliases []string, translation string) (provider.Anime, error) {
 	if mediaID <= 0 {
 		return provider.Anime{}, errors.New("AnimeFlix AniList id is invalid")
+	}
+	if mapping, ok := verifiedSeasons[mediaID]; ok {
+		anime := provider.Anime{
+			ID:   mapping.slug + "#season=" + mapping.season,
+			Name: mapping.title, English: mapping.title, AniListID: mediaID,
+		}
+		if _, err := c.Episodes(ctx, anime, translation); err != nil {
+			return provider.Anime{}, fmt.Errorf("validate AnimeFlix season mapping for AniList %d: %w", mediaID, err)
+		}
+		return anime, nil
 	}
 
 	for _, alias := range uniqueAnimeFlixTitles(aliases) {
@@ -73,7 +96,7 @@ func (c *Client) Match(ctx context.Context, mediaID int, aliases []string, _ str
 				if err := c.apiJSON(ctx, "/info/"+url.PathEscape(anime.ID), &info); err != nil {
 					return provider.Anime{}, fmt.Errorf("validate AnimeFlix match %q: %w", anime.ID, err)
 				}
-				if _, err := animeFlixEpisodes(anime.ID, info); err != nil {
+				if _, err := animeFlixEpisodes(anime.ID, info, ""); err != nil {
 					return provider.Anime{}, fmt.Errorf("validate AnimeFlix match %q: %w", anime.ID, err)
 				}
 				return anime, nil
@@ -90,22 +113,47 @@ func (c *Client) Episodes(ctx context.Context, anime provider.Anime, _ string) (
 	if id == "" {
 		return nil, errors.New("AnimeFlix episodes: show id is required")
 	}
+	slug, season, expectedName := id, "", ""
+	for mediaID, mapping := range verifiedSeasons {
+		if id == mapping.slug+"#season="+mapping.season {
+			if anime.AniListID != 0 && anime.AniListID != mediaID {
+				return nil, errors.New("AnimeFlix season mapping belongs to a different AniList release")
+			}
+			slug, season, expectedName = mapping.slug, mapping.season, mapping.name
+			break
+		}
+	}
+	if strings.Contains(id, "#") && season == "" {
+		return nil, errors.New("AnimeFlix season mapping has not been verified")
+	}
 	var info infoPage
-	if err := c.apiJSON(ctx, "/info/"+url.PathEscape(id), &info); err != nil {
+	if err := c.apiJSON(ctx, "/info/"+url.PathEscape(slug), &info); err != nil {
 		return nil, fmt.Errorf("list AnimeFlix episodes: %w", err)
 	}
-	return animeFlixEpisodes(id, info)
+	if expectedName != "" && (len(info.InfoX) != 1 || normalizeAnimeFlixTitle(info.InfoX[0].Name) != normalizeAnimeFlixTitle(expectedName)) {
+		return nil, errors.New("AnimeFlix season mapping catalogue identity changed")
+	}
+	return animeFlixEpisodes(id, info, season)
 }
 
-func animeFlixEpisodes(id string, info infoPage) ([]provider.Episode, error) {
+func animeFlixEpisodes(id string, info infoPage, season string) ([]provider.Episode, error) {
 	if len(info.InfoX) == 0 {
 		return nil, errors.New("missing info")
 	}
 	byNumber := make(map[int]provider.Episode)
 	for _, item := range info.EpisodeTown {
+		if season != "" && strings.TrimSpace(item.Season) != season {
+			continue
+		}
 		number, err := strconv.Atoi(strings.TrimSpace(item.Episode))
 		if err != nil || number <= 0 || strings.TrimSpace(item.EpID) == "" {
 			continue
+		}
+		if season != "" {
+			slug, _, _ := strings.Cut(id, "#season=")
+			if item.EpID != fmt.Sprintf("%s-%sx%d", slug, season, number) {
+				return nil, errors.New("AnimeFlix season mapping episode identity changed")
+			}
 		}
 		ep := provider.Episode{ShowID: id, Number: number, Value: item.EpID}
 		if prior, ok := byNumber[number]; ok {

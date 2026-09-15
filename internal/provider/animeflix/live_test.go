@@ -13,11 +13,20 @@ import (
 )
 
 func TestLiveMyStream(t *testing.T) {
+	testLiveMyStream(t, 1735, []string{"Naruto: Shippuden", "Naruto Shippuden"}, 1)
+}
+
+func TestLiveMyStreamSlimeSeason4(t *testing.T) {
+	testLiveMyStream(t, 182205, []string{"That Time I Got Reincarnated as a Slime Season 4"}, 5)
+}
+
+func testLiveMyStream(t *testing.T, mediaID int, aliases []string, number int) {
+	t.Helper()
 	client := NewClient(&http.Client{Timeout: 20 * time.Second})
 	defer client.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
 	defer cancel()
-	anime, err := client.Match(ctx, 1735, []string{"Naruto: Shippuden", "Naruto Shippuden"}, "sub")
+	anime, err := client.Match(ctx, mediaID, aliases, "sub")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,9 +35,19 @@ func TestLiveMyStream(t *testing.T) {
 		t.Fatalf("Episodes: count=%d error=%v", len(episodes), err)
 	}
 	t.Logf("matched %s, %d episodes", anime.ID, len(episodes))
+	index := -1
+	for i, episode := range episodes {
+		if episode.Number == number {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		t.Fatalf("episode %d is unavailable", number)
+	}
 	for _, mode := range []string{"sub", "dub"} {
 		t.Run(mode, func(t *testing.T) {
-			streams, err := client.Streams(ctx, episodes[0], mode, "worst")
+			streams, err := client.Streams(ctx, episodes[index], mode, "worst")
 			if err != nil || len(streams) != 1 {
 				t.Fatalf("Streams: count=%d error=%v", len(streams), err)
 			}
