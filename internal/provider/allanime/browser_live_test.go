@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"tarragon-anime/internal/browser"
+	"tarragon-anime/internal/mpv"
 )
 
 // liveResolver matches the daemon's automatic clearance workflow. Set
@@ -94,13 +95,65 @@ func TestLiveBrowserStreamsAcrossTitles(t *testing.T) {
 			if len(streams) == 0 || streams[0].URL == "" {
 				t.Fatalf("Streams() = %#v, want a playable URL", streams)
 			}
-			if streams[0].Headers["Referer"] == "" {
-				t.Fatalf("stream has no Referer, mpv would be refused: %#v", streams[0])
-			}
 			probeHandoff(ctx, t, streams[0])
 			t.Logf("%s ep %d resolved in %s: %s", title.name, episodes[0].Number,
 				time.Since(start).Round(time.Millisecond), streams[0].URL)
 		})
+	}
+}
+
+// Exercise the production mpv launch path, not just ffprobe's header handling.
+func TestLiveSlimeSeason4MPVHandoff(t *testing.T) {
+	if _, err := exec.LookPath("mpv"); err != nil {
+		t.Skipf("mpv is required to verify decoding: %v", err)
+	}
+	resolver := liveResolver(t)
+	client := NewClient(nil)
+	client.UseBrowser(resolver)
+	ctx, cancel := contextWithTimeout(t, 2*time.Minute)
+	defer cancel()
+	show, err := client.Match(ctx, 182205, []string{"That Time I Got Reincarnated as a Slime Season 4"}, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, err := client.Streams(ctx, Episode{ShowID: show.ID, Number: 18, Value: "18"}, "sub", "best")
+	if err != nil || len(streams) == 0 {
+		t.Fatalf("Streams() count=%d error=%v", len(streams), err)
+	}
+	// Keep the user's scripts, shaders, display and audio devices out of the probe.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	player := mpv.New([]string{
+		"--vo=null", "--ao=null", "--frames=1", "--load-scripts=no",
+		"--ytdl=no", "--network-timeout=10",
+	}, log.New(os.Stderr, "mpv: ", 0))
+	probeCtx, stop := context.WithTimeout(ctx, 30*time.Second)
+	defer stop()
+	stream := streams[0]
+	session, err := player.Play(probeCtx, mpv.Stream{URL: stream.URL, Headers: stream.Headers}, "Episode 18 handoff test", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	loaded := false
+	for {
+		select {
+		case event, ok := <-session.Events():
+			if !ok {
+				t.Fatal("mpv closed before decoding a frame")
+			}
+			if event.Type == mpv.EventFileLoaded {
+				loaded = true
+			}
+			if event.Type == mpv.EventEndFile {
+				if !loaded || event.Reason != "eof" {
+					t.Fatalf("mpv did not decode the episode: loaded=%t reason=%s error=%s", loaded, event.Reason, event.Error)
+				}
+				t.Log("episode 18 decoded one frame through the production mpv handoff")
+				return
+			}
+		case <-probeCtx.Done():
+			t.Fatal(probeCtx.Err())
+		}
 	}
 }
 

@@ -9,9 +9,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -37,12 +40,18 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 	player := New([]string{"--profile=anime"}, log.New(io.Discard, "", 0))
 	player.timeout = 2 * time.Second
 	session, err := player.Play(t.Context(), Stream{
-		URL: "https://video.test/master.m3u8", Headers: map[string]string{"Referer": "https://mkissa.to/"},
+		URL: "https://video.test/master.m3u8",
+		Headers: map[string]string{
+			"Referer":         "https://mkissa.to/watch?ids=4,5",
+			"User-Agent":      "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+			"X-Playback-Test": "first, second",
+		},
 		Subtitle: "https://sub.test/en.ass",
 	}, "Frieren - Episode 4", 15)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(session.Close)
 	if err := session.Load(t.Context(), Stream{URL: "https://video.test/next.m3u8"}, "Frieren - Episode 5", 0); err != nil {
 		t.Fatal(err)
 	}
@@ -76,13 +85,27 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 		"--force-window=yes",
 		"--start=15.000",
 		"--input-ipc-server=",
-		"--http-header-fields=Referer: https://mkissa.to/",
 		"--sub-file=https://sub.test/en.ass",
 		"https://video.test/master.m3u8",
 	} {
 		if !strings.Contains(joined, expected) {
 			t.Errorf("mpv args %q do not contain %q", joined, expected)
 		}
+	}
+	var headerArgs []string
+	for _, arg := range strings.Split(joined, "\n") {
+		if strings.HasPrefix(arg, "--http-header-fields") {
+			headerArgs = append(headerArgs, arg)
+		}
+	}
+	wantHeaders := []string{
+		"--http-header-fields-clr",
+		"--http-header-fields-append=Referer: https://mkissa.to/watch?ids=4,5",
+		"--http-header-fields-append=User-Agent: Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"--http-header-fields-append=X-Playback-Test: first, second",
+	}
+	if !slices.Equal(headerArgs, wantHeaders) {
+		t.Errorf("mpv header args = %q, want %q", headerArgs, wantHeaders)
 	}
 	commands, err := os.ReadFile(commandsFile)
 	if err != nil {
@@ -93,10 +116,66 @@ func TestPlayerRequiresAndUsesIPC(t *testing.T) {
 			t.Errorf("mpv commands %q do not contain %q", commands, expected)
 		}
 	}
+	if !strings.Contains(string(commands), `"command":["set_property","http-header-fields",[]]`) {
+		t.Errorf("Load did not reset headers with a JSON array: %s", commands)
+	}
+}
+
+func TestPlayerPreservesHTTPHeadersWithRealMPV(t *testing.T) {
+	if _, err := exec.LookPath("mpv"); err != nil {
+		t.Skip("mpv is not installed")
+	}
+	for _, name := range []string{"http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"} {
+		t.Setenv(name, "")
+	}
+	requests := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requests <- r.Header.Clone():
+		default:
+		}
+		// Only the request matters; do not load or play any media.
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	headers := map[string]string{
+		"Referer":         server.URL + "/watch?ids=4,5",
+		"User-Agent":      "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		"X-Playback-Test": "first, second",
+	}
+	player := New([]string{
+		"--vo=null", "--ao=null", "--no-video", "--no-audio",
+		"--load-scripts=no", "--ytdl=no", "--network-timeout=2",
+		"--http-header-fields=X-Stale: stale",
+	}, nil)
+	player.configDir = t.TempDir()
+	player.timeout = 3 * time.Second
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	session, err := player.Play(ctx, Stream{URL: server.URL + "/media", Headers: headers}, "Header regression", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	select {
+	case got := <-requests:
+		for name, want := range headers {
+			if values := got.Values(name); !slices.Equal(values, []string{want}) {
+				t.Errorf("HTTP %s = %q, want [%q]", name, values, want)
+			}
+		}
+		if values := got.Values("X-Stale"); len(values) != 0 {
+			t.Errorf("previous HTTP headers were not reset: X-Stale = %q", values)
+		}
+	case <-ctx.Done():
+		t.Fatalf("waiting for local mpv HTTP request: %v", ctx.Err())
+	}
 }
 
 func TestSessionMapsIPCEvents(t *testing.T) {
 	session, server := protocolSession(t)
+	var logs bytes.Buffer
+	session.logger.SetOutput(&logs)
 	encoder := json.NewEncoder(server)
 	tests := []struct {
 		name    string
@@ -105,6 +184,7 @@ func TestSessionMapsIPCEvents(t *testing.T) {
 	}{
 		{name: "file loaded", message: map[string]any{"event": "file-loaded"}, want: Event{Type: EventFileLoaded}},
 		{name: "end file", message: map[string]any{"event": "end-file", "reason": "eof"}, want: Event{Type: EventEndFile, Reason: "eof"}},
+		{name: "end file error", message: map[string]any{"event": "end-file", "reason": "error", "error": "loading failed"}, want: Event{Type: EventEndFile, Reason: "error", Error: "loading failed"}},
 		{name: "shutdown", message: map[string]any{"event": "shutdown"}, want: Event{Type: EventShutdown}},
 		{name: "next", message: map[string]any{"event": "client-message", "args": []string{"tarragon-next"}}, want: Event{Type: EventNext}},
 		{name: "previous", message: map[string]any{"event": "client-message", "args": []string{"tarragon-previous"}}, want: Event{Type: EventPrevious}},
@@ -126,6 +206,9 @@ func TestSessionMapsIPCEvents(t *testing.T) {
 				t.Fatal("timed out waiting for event")
 			}
 		})
+	}
+	if !strings.Contains(logs.String(), `mpv event=end-file reason=error error="loading failed"`) {
+		t.Errorf("end-file log does not include the IPC error: %q", logs.String())
 	}
 }
 

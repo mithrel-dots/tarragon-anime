@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -41,6 +40,7 @@ const (
 type Event struct {
 	Type   EventType
 	Reason string
+	Error  string
 	Value  float64
 }
 
@@ -88,7 +88,11 @@ func (p *Player) Play(ctx context.Context, stream Stream, title string, start fl
 		args = append(args, fmt.Sprintf("--start=%.3f", start))
 	}
 	if fields := headerFields(stream.Headers); len(fields) > 0 {
-		args = append(args, "--http-header-fields="+strings.Join(fields, ","))
+		// An empty assignment leaves a blank header, so clear the list explicitly.
+		args = append(args, "--http-header-fields-clr")
+		for _, field := range fields {
+			args = append(args, "--http-header-fields-append="+field)
+		}
 	}
 	if stream.Subtitle != "" {
 		args = append(args, "--sub-file="+stream.Subtitle)
@@ -362,19 +366,19 @@ func (s *Session) readIPC() {
 				response <- ipcResponse{data: message.Data, err: err}
 			}
 		}
-		s.handleEvent(message.Event, message.Name, message.Reason, message.Args, message.Data)
+		s.handleEvent(message.Event, message.Name, message.Reason, message.Error, message.Args, message.Data)
 	}
 	s.finish()
 }
 
-func (s *Session) handleEvent(event, name, reason string, args []string, data json.RawMessage) {
+func (s *Session) handleEvent(event, name, reason, eventError string, args []string, data json.RawMessage) {
 	switch event {
 	case "file-loaded":
 		s.logger.Printf("mpv event=file-loaded")
 		s.emit(Event{Type: EventFileLoaded})
 	case "end-file":
-		s.logger.Printf("mpv event=end-file reason=%s", reason)
-		s.emit(Event{Type: EventEndFile, Reason: reason})
+		s.logger.Printf("mpv event=end-file reason=%s error=%q", reason, eventError)
+		s.emit(Event{Type: EventEndFile, Reason: reason, Error: eventError})
 	case "shutdown":
 		s.logger.Printf("mpv event=shutdown")
 		s.emit(Event{Type: EventShutdown})
