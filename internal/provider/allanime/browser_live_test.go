@@ -104,6 +104,15 @@ func TestLiveBrowserStreamsAcrossTitles(t *testing.T) {
 
 // Exercise the production mpv launch path, not just ffprobe's header handling.
 func TestLiveSlimeSeason4MPVHandoff(t *testing.T) {
+	testLiveMPVHandoff(t, 182205, "That Time I Got Reincarnated as a Slime Season 4", 18)
+}
+
+func TestLiveKaijuSeason2MPVHandoff(t *testing.T) {
+	testLiveMPVHandoff(t, 178754, "Kaiju No. 8 Season 2", 8)
+}
+
+func testLiveMPVHandoff(t *testing.T, mediaID int, title string, number int) {
+	t.Helper()
 	if _, err := exec.LookPath("mpv"); err != nil {
 		t.Skipf("mpv is required to verify decoding: %v", err)
 	}
@@ -112,14 +121,15 @@ func TestLiveSlimeSeason4MPVHandoff(t *testing.T) {
 	client.UseBrowser(resolver)
 	ctx, cancel := contextWithTimeout(t, 2*time.Minute)
 	defer cancel()
-	show, err := client.Match(ctx, 182205, []string{"That Time I Got Reincarnated as a Slime Season 4"}, "sub")
+	show, err := client.Match(ctx, mediaID, []string{title}, "sub")
 	if err != nil {
 		t.Fatal(err)
 	}
-	streams, err := client.Streams(ctx, Episode{ShowID: show.ID, Number: 18, Value: "18"}, "sub", "best")
+	streams, err := client.Streams(ctx, Episode{ShowID: show.ID, Number: number, Value: strconv.Itoa(number)}, "sub", "best")
 	if err != nil || len(streams) == 0 {
 		t.Fatalf("Streams() count=%d error=%v", len(streams), err)
 	}
+	probeHandoff(ctx, t, streams[0])
 	// Keep the user's scripts, shaders, display and audio devices out of the probe.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	player := mpv.New([]string{
@@ -129,7 +139,7 @@ func TestLiveSlimeSeason4MPVHandoff(t *testing.T) {
 	probeCtx, stop := context.WithTimeout(ctx, 30*time.Second)
 	defer stop()
 	stream := streams[0]
-	session, err := player.Play(probeCtx, mpv.Stream{URL: stream.URL, Headers: stream.Headers}, "Episode 18 handoff test", 0)
+	session, err := player.Play(probeCtx, mpv.Stream{URL: stream.URL, Headers: stream.Headers, Subtitle: stream.Subtitle}, fmt.Sprintf("Episode %d handoff test", number), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +158,7 @@ func TestLiveSlimeSeason4MPVHandoff(t *testing.T) {
 				if !loaded || event.Reason != "eof" {
 					t.Fatalf("mpv did not decode the episode: loaded=%t reason=%s error=%s", loaded, event.Reason, event.Error)
 				}
-				t.Log("episode 18 decoded one frame through the production mpv handoff")
+				t.Logf("episode %d decoded one frame through the production mpv handoff", number)
 				return
 			}
 		case <-probeCtx.Done():
@@ -231,8 +241,8 @@ func probeHandoff(ctx context.Context, t *testing.T, stream Stream) {
 		t.Fatalf("handoff is not playable outside the browser: %v\n%s", err, out)
 	}
 	report := string(out)
-	if !strings.Contains(report, "codec_type=video") {
-		t.Fatalf("handoff carries no video stream:\n%s", report)
+	if !strings.Contains(report, "codec_type=video") || !strings.Contains(report, "codec_type=audio") {
+		t.Fatalf("handoff does not carry both video and audio:\n%s", report)
 	}
 	var seconds float64
 	for line := range strings.SplitSeq(report, "\n") {

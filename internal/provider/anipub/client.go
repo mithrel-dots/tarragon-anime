@@ -22,7 +22,9 @@ import (
 	"strings"
 	"sync"
 
+	"tarragon-anime/internal/browser"
 	"tarragon-anime/internal/provider"
+	"tarragon-anime/internal/streamlog"
 )
 
 // Anime, Episode and Stream are the provider-neutral values exchanged with the
@@ -270,21 +272,36 @@ func watchURL(base, showID, episodeValue, translation string) string {
 
 // Streams resolves playable URLs for an episode. Results are cached briefly
 // because the captured URLs are signed and a capture costs a page load.
-func (c *Client) Streams(ctx context.Context, episode Episode, translation, quality string) ([]Stream, error) {
+func (c *Client) Streams(ctx context.Context, episode Episode, translation, quality string) (streams []Stream, err error) {
+	ctx = streamlog.WithProvider(ctx, "anipub")
+	finish := streamlog.Start(ctx, "browser", "streams")
+	defer func() {
+		if ctx.Err() != nil {
+			streams, err = nil, ctx.Err()
+		}
+		finish(browser.Outcome(ctx, err))
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(episode.ShowID) == "" {
 		return nil, errors.New("AniPub streams: show id is required")
 	}
 	if cached, ok := c.cachedStreams(episode, translation, quality); ok {
+		finishCache := streamlog.Start(ctx, browser.SourceID(cached[0].Source), "cache")
+		finishCache("resolved", "validated_cache")
 		return cached, nil
 	}
 	if c.browser == nil {
 		return nil, ErrBrowserRequired
 	}
-	streams, err := c.browserStreams(ctx, episode, translation, quality)
+	streams, err = c.browserStreams(ctx, episode, translation, quality)
 	if err != nil {
 		return nil, fmt.Errorf("resolve AniPub episode %d: %w", episode.Number, err)
 	}
-	c.cacheStreams(episode, translation, quality, streams)
+	if err := c.cacheStreams(ctx, episode, translation, quality, streams); err != nil {
+		return nil, err
+	}
 	return streams, nil
 }
 

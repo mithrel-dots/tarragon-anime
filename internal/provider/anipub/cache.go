@@ -1,7 +1,9 @@
 package anipub
 
 import (
+	"context"
 	"fmt"
+	"maps"
 	"time"
 )
 
@@ -29,19 +31,33 @@ func (c *Client) cachedStreams(episode Episode, translation, quality string) ([]
 		delete(c.streamCache, key)
 		return nil, false
 	}
-	return append([]Stream(nil), entry.streams...), true
+	return cloneStreams(entry.streams), true
 }
 
-func (c *Client) cacheStreams(episode Episode, translation, quality string, streams []Stream) {
+func (c *Client) cacheStreams(ctx context.Context, episode Episode, translation, quality string, streams []Stream) error {
 	if len(streams) == 0 {
-		return
+		return ctx.Err()
 	}
 	c.cacheMu.Lock()
 	defer c.cacheMu.Unlock()
-	c.streamCache[streamKey(episode, translation, quality)] = streamEntry{
-		streams: append([]Stream(nil), streams...),
+	entry := streamEntry{
+		streams: cloneStreams(streams),
 		expires: time.Now().Add(streamTTL),
 	}
+	// A cancelled loser must neither replace nor invalidate a winner's entry.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.streamCache[streamKey(episode, translation, quality)] = entry
+	return nil
+}
+
+func cloneStreams(streams []Stream) []Stream {
+	out := append([]Stream(nil), streams...)
+	for i := range out {
+		out[i].Headers = maps.Clone(out[i].Headers)
+	}
+	return out
 }
 
 // InvalidateStreams drops a cached capture. The service calls it when playback

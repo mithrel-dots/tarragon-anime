@@ -1,10 +1,11 @@
 // Package browser resolves media URLs by driving a managed Chromium instance
 // and recording the requests a site's own player makes.
 //
-// Only network traffic is interpreted: the package never reads, rewrites or
-// evaluates site JavaScript, so it does not depend on minified identifiers or
-// bundle layout. Callers describe which requests they want with a predicate
-// and receive the observed requests together with the headers Chromium
+// Media is resolved only from network traffic: the package never reads,
+// rewrites or evaluates site JavaScript, so it does not depend on minified
+// identifiers or bundle layout. Callers describe which requests they want with
+// a predicate and may opt into clicking explicitly selected source/play buttons.
+// They receive the observed requests together with the headers Chromium
 // actually sent, which is the minimum context needed to replay the media
 // outside the browser.
 //
@@ -35,10 +36,11 @@
 //     browser's version for the same reason: a version pinned in the source
 //     stops matching the moment the browser is upgraded past it, and the
 //     clearance the visible window earns is then refused to the capture.
-//   - Only the source the page loads by itself is captured. The alternate
-//     sources behind the site's player tabs are third party embeds that need
-//     UI interaction and serve ads, so they are out of reach and out of
-//     scope.
+//   - By default, only the source the page loads by itself is captured.
+//     Providers may opt into at most three source-button retries with
+//     Request.FallbackSelector and one play-button attempt per source with
+//     Request.PlayButtonPath, within the existing capture deadline. Other
+//     player, embed, ad and challenge interactions remain out of scope.
 //   - Captured URLs carry signed, expiring tokens. They are cached briefly
 //     and must be re-resolved rather than persisted.
 //   - Media that a page only ever exposes as a blob: URL cannot be handed to
@@ -72,6 +74,8 @@ import (
 	"syscall"
 	"time"
 
+	"tarragon-anime/internal/streamlog"
+
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
@@ -86,6 +90,8 @@ var (
 	ErrChallenged = errors.New("origin served a bot challenge")
 	// ErrNoMedia reports that the page loaded but made no matching request.
 	ErrNoMedia = errors.New("no media request observed")
+	// ErrClickFailed distinguishes a failed source/play interaction from silence.
+	ErrClickFailed = errors.New("browser button interaction failed")
 	// ErrClosed reports use of a resolver that has been shut down.
 	ErrClosed = errors.New("browser resolver is closed")
 	// ErrProfileLocked reports that another process already holds the browser
@@ -151,6 +157,8 @@ const windowSize = "1920,1080"
 
 // Candidate is a single request observed while the page was open.
 type Candidate struct {
+	// Source is the capture-local ordinal, never a URL or a site's button text.
+	Source string
 	// URL is the fully qualified request URL.
 	URL string
 	// Kind is the Chromium resource type, for example "Media" or "XHR".
@@ -170,8 +178,36 @@ type Candidate struct {
 	// indistinguishable from the real track by URL alone; only the volume
 	// that follows tells them apart.
 	Bytes int64
-	// Observed is the delay between navigation and the request.
+	// Observed is the delay from navigation or the latest source/play retry to the request.
 	Observed time.Duration
+}
+
+// SourceID restricts source provenance to identifiers assigned by the collector.
+// Resolver implementations must not turn arbitrary upstream labels into log data.
+func SourceID(source string) string {
+	switch source {
+	case "source-1", "source-2", "source-3":
+		return source
+	default:
+		return "default"
+	}
+}
+
+// Outcome classifies browser failures without exposing CDP errors or URLs.
+func Outcome(ctx context.Context, err error) (string, string) {
+	status, reason := streamlog.Outcome(ctx, err)
+	if status != "failed" {
+		return status, reason
+	}
+	switch {
+	case errors.Is(err, ErrClickFailed):
+		return "failed", "button_interaction_failed"
+	case errors.Is(err, ErrChallenged), errors.Is(err, ErrClearancePending):
+		return "unavailable", "clearance_required"
+	case errors.Is(err, ErrNoMedia):
+		return "unavailable", "no_matching_media"
+	}
+	return status, reason
 }
 
 // Request describes one capture.
@@ -190,6 +226,20 @@ type Request struct {
 	// not missed. The window resets when no ready candidates remain.
 	// Non-positive values use the resolver's default settle window.
 	Settle time.Duration
+	// FallbackSelector optionally identifies safe top-level source buttons by
+	// CSS selector. After the no-media grace period, capture clicks the next
+	// visible, enabled button with an untried nonempty text label, including
+	// the active source if it matches. At most three labels are tried within
+	// the existing deadline. Empty disables all source-button interaction.
+	FallbackSelector string
+	// PlayButtonPath optionally locates a safe play button: the last CSS
+	// selector matches buttons, and each preceding selector must uniquely
+	// match a visible iframe (at most three frames). The final frame must
+	// contain exactly one HTML video, paused. After no-media grace, capture
+	// tries play once per source before switching sources, within the same
+	// deadline. Empty disables play-button interaction; no site player APIs
+	// are called and no other frames are searched.
+	PlayButtonPath []string
 }
 
 // Options configure a Resolver. The zero value is usable; see New.
@@ -203,8 +253,8 @@ type Options struct {
 	// Headless runs Chromium without a visible window.
 	Headless bool
 	// Timeout bounds a single capture attempt, covering queueing, startup,
-	// navigation and settle. A bot check does not spend it; the retry after
-	// clearance is given a fresh budget.
+	// navigation, source/play-button fallbacks and settle. A bot check does not
+	// spend it; the retry after clearance is given a fresh budget.
 	Timeout time.Duration
 	// IdleTimeout shuts the browser down after this long without work.
 	IdleTimeout time.Duration
@@ -231,10 +281,12 @@ const (
 	defaultMaxSessions = 2
 	defaultSettle      = 1500 * time.Millisecond
 	// noMediaGrace is how long after the load event a page is given to start
-	// requesting media before the capture gives up on it. A player that
-	// autoplays has asked well inside this; waiting the whole capture budget
-	// only delays the same answer.
+	// requesting media before giving up or trying an explicit source/play button.
+	// A player that autoplays has asked well inside this; waiting the whole
+	// capture budget only delays the same answer.
 	noMediaGrace            = 12 * time.Second
+	maxSourceAttempts       = 3
+	maxPlayFrames           = 3
 	defaultClearanceWait    = 20 * time.Second
 	defaultClearanceTimeout = 5 * time.Minute
 )
@@ -315,13 +367,13 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 	}
 
 	found, err := r.captureAttempt(ctx, req)
-	if !errors.Is(err, ErrChallenged) {
+	if !errors.Is(err, ErrChallenged) && !errors.Is(err, ErrClearancePending) {
 		return found, err
 	}
 	// The clearance cannot be earned headlessly, so put a window on the check.
 	// Origins commonly clear themselves within seconds, which turns this into
 	// a short pause instead of a failed playback.
-	if clearErr := r.Clear(ctx, req.PageURL); clearErr != nil {
+	if clearErr := r.clear(ctx, req.PageURL, !errors.Is(err, ErrClearancePending)); clearErr != nil {
 		return nil, clearErr
 	}
 	r.opts.Logger.Printf("bot check cleared, resolving again")
@@ -331,7 +383,7 @@ func (r *Resolver) Capture(ctx context.Context, req Request) ([]Candidate, error
 		// did not transfer, which is a configuration fault rather than a
 		// challenge the user can pass by trying again. Say so.
 		err = r.challengeError(req.PageURL)
-		r.opts.Logger.Printf("browser challenged again after clearance url=%s: %v", req.PageURL, err)
+		r.opts.Logger.Print("browser challenged again after clearance reason=clearance_required")
 		return nil, err
 	}
 	return found, err
@@ -345,12 +397,15 @@ func (r *Resolver) captureAttempt(ctx context.Context, req Request) ([]Candidate
 	ctx, cancel := context.WithTimeout(ctx, r.opts.Timeout)
 	defer cancel()
 
+	finish := streamlog.Start(ctx, "browser", "capture")
 	found, err := r.captureOnce(ctx, req)
+	finish(Outcome(ctx, err))
 	// A capture that fails on a deadline or a dropped page is otherwise
 	// invisible: the provider folds it into a fallback message and the
 	// challenge path in particular leaves the log ending at "browser started".
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrChallenged) {
-		r.opts.Logger.Printf("browser capture failed url=%s: %v", req.PageURL, err)
+		status, reason := Outcome(ctx, err)
+		r.opts.Logger.Printf("browser capture status=%s reason=%s", status, reason)
 	}
 	return found, err
 }
@@ -378,10 +433,13 @@ func (r *Resolver) captureOnce(ctx context.Context, req Request) ([]Candidate, e
 	defer r.release()
 
 	found, err := eng.capture(ctx, req)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if err != nil && isEngineFailure(err) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		// The browser itself is unusable; drop it so the next capture starts
 		// a fresh process instead of reusing a dead connection.
-		r.opts.Logger.Printf("browser session failed, restarting Chromium: %v", err)
+		r.opts.Logger.Print("browser session failed, restarting Chromium reason=engine_failure")
 		r.discard(eng)
 	}
 	return found, err
@@ -612,6 +670,9 @@ type chromeEngine struct {
 	launcher *launcher.Launcher
 	browser  *rod.Browser
 	cancel   context.CancelFunc
+	logger   *log.Logger
+	// Channels remain shared when the engine is copied for per-capture logging.
+	interactions chan struct{}
 }
 
 func newChromeEngine(ctx context.Context, opts Options) (engine, error) {
@@ -691,7 +752,7 @@ func newChromeEngine(ctx context.Context, opts Options) (engine, error) {
 		return nil, ctx.Err()
 	}
 	opts.Logger.Printf("browser started bin=%s profile=%s headless=%t", bin, profile, opts.Headless)
-	return &chromeEngine{launcher: l, browser: b, cancel: cancel}, nil
+	return &chromeEngine{launcher: l, browser: b, cancel: cancel, logger: opts.Logger, interactions: make(chan struct{}, 1)}, nil
 }
 
 // Wait for clean exit before releasing profile ownership so Chromium can flush
@@ -720,8 +781,20 @@ func (e *chromeEngine) close() {
 	}
 }
 
-func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, error) {
-	target, err := (proto.TargetCreateTarget{URL: "about:blank"}).Call(e.browser.Context(ctx))
+func (e *chromeEngine) capture(ctx context.Context, req Request) (found []Candidate, err error) {
+	source := "default"
+	finish := streamlog.Start(ctx, source, "browser_source")
+	defer func() {
+		if ctx.Err() != nil {
+			found, err = nil, ctx.Err()
+		}
+		finish(Outcome(ctx, err))
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// A new navigation must not steal focus from another capture's trusted click.
+	target, err := (proto.TargetCreateTarget{URL: "about:blank", Background: true}).Call(e.browser.Context(ctx))
 	if err != nil {
 		return nil, engineFailure{fmt.Errorf("open browser page: %w", err)}
 	}
@@ -764,6 +837,9 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
+	tried := map[string]bool{}
+	playAttempted := false
+	foregrounded := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -781,11 +857,242 @@ func (e *chromeEngine) capture(ctx context.Context, req Request) ([]Candidate, e
 				}
 				return found, nil
 			}
+			if !foregrounded {
+				// Default autoplay may depend on visibility. Promote this new page
+				// once input is free, without blocking its navigation or network work.
+				select {
+				case e.interactions <- struct{}{}:
+					if ctx.Err() != nil {
+						<-e.interactions
+						return nil, ctx.Err()
+					}
+					err := (proto.PageBringToFront{}).Call(page)
+					<-e.interactions
+					if err != nil {
+						return nil, fmt.Errorf("activate browser page: %w", err)
+					}
+					foregrounded = true
+				default:
+				}
+			}
 			if col.exhausted() {
+				var button *rod.Element
+				var label string
+				var err error
+				if !playAttempted {
+					button, err = findPlayButton(page, req.PlayButtonPath)
+				}
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				if !col.exhausted() || col.challenged() {
+					continue
+				}
+				play := button != nil
+				if err == nil && button == nil {
+					button, label, err = nextSourceButton(page, req.FallbackSelector, tried)
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					if !col.exhausted() || col.challenged() {
+						continue
+					}
+				}
+				if err == nil && button != nil {
+					err = e.withInteraction(ctx, page, col, func() error {
+						foregrounded = true
+						// The selected frame/button or paused state may have changed
+						// while another page owned foreground input. Revalidate in full.
+						if play {
+							button, err = findPlayButton(page, req.PlayButtonPath)
+						} else {
+							button, label, err = nextSourceButton(page, req.FallbackSelector, tried)
+						}
+						if err != nil {
+							return err
+						}
+						if ctx.Err() != nil {
+							return ctx.Err()
+						}
+						if button == nil || !col.exhausted() || col.challenged() {
+							return nil
+						}
+						// Reset before Click: its handler may request media immediately.
+						nextSource := source
+						if !play {
+							nextSource = fmt.Sprintf("source-%d", len(tried)+1)
+						}
+						if !col.resetForSource(nextSource) {
+							return nil
+						}
+						if !play {
+							finish("unavailable", "no_matching_media")
+							source = nextSource
+							finish = streamlog.Start(ctx, source, "browser_source")
+						}
+						playAttempted = play
+						var finishPlay func(string, string)
+						if play {
+							finishPlay = streamlog.Start(ctx, source, "browser_play")
+							if e.logger != nil {
+								e.logger.Print("browser player start")
+							}
+						} else {
+							tried[label] = true
+							if e.logger != nil {
+								e.logger.Printf("browser source fallback attempt=%d", len(tried))
+							}
+						}
+						err = button.Click(proto.InputMouseButtonLeft, 1)
+						if finishPlay != nil {
+							if err == nil && ctx.Err() == nil {
+								finishPlay("resolved", "click_dispatched")
+							} else {
+								finishPlay(Outcome(ctx, errors.Join(ErrClickFailed, err)))
+							}
+						}
+						return err
+					})
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					if err == nil {
+						continue
+					}
+				}
+				// Rod errors can contain DOM text; keep failure diagnostics data-free.
+				if err != nil {
+					return nil, errors.Join(ErrNoMedia, ErrClickFailed)
+				}
 				return nil, fmt.Errorf("%w: %s", ErrNoMedia, col.observed())
 			}
 		}
 	}
+}
+
+// Foreground changes and input share a gate; navigation and network observation
+// remain parallel, even while a covered button holds that gate.
+func (e *chromeEngine) withInteraction(ctx context.Context, root *rod.Page, col *collector, click func() error) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			// Late media/challenges must not wait behind another page's click.
+			if !col.exhausted() || col.challenged() {
+				return nil
+			}
+		case e.interactions <- struct{}{}:
+			defer func() { <-e.interactions }()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !col.exhausted() || col.challenged() {
+				return nil
+			}
+			// Use the ROOT session and the capture context, not the button's iframe
+			// or rod.Page.Activate (which uses the shared browser's lifetime).
+			if err := (proto.PageBringToFront{}).Call(root.Context(ctx)); err != nil {
+				return err
+			}
+			return click()
+		}
+	}
+}
+
+func findPlayButton(page *rod.Page, path []string) (*rod.Element, error) {
+	if len(path) == 0 || len(path) > maxPlayFrames+1 {
+		return nil, nil
+	}
+	for _, selector := range path {
+		if strings.TrimSpace(selector) == "" {
+			return nil, nil
+		}
+	}
+	for _, selector := range path[:len(path)-1] {
+		frames, err := page.Elements(selector)
+		if err != nil || len(frames) != 1 {
+			return nil, err
+		}
+		iframe, err := frames[0].Matches("iframe")
+		if err != nil || !iframe {
+			return nil, err
+		}
+		visible, err := frames[0].Visible()
+		if err != nil || !visible {
+			return nil, err
+		}
+		page, err = frames[0].Frame()
+		if err != nil {
+			return nil, err
+		}
+	}
+	videos, err := page.Elements("video")
+	if err != nil || len(videos) != 1 {
+		return nil, err
+	}
+	buttons, err := page.Elements(path[len(path)-1])
+	if err != nil {
+		return nil, err
+	}
+	for _, button := range buttons {
+		if err := page.GetContext().Err(); err != nil {
+			return nil, err
+		}
+		enabled, err := button.Matches(`button:enabled:not([aria-disabled="true"])`)
+		if err != nil || !enabled {
+			continue
+		}
+		visible, err := button.Visible()
+		if err != nil || !visible {
+			continue
+		}
+		// Read only standard DOM state, never a site's player functions. Check
+		// last so a video that started during button lookup is not toggled.
+		paused, err := videos[0].Eval(`() => this instanceof HTMLVideoElement && this.paused`)
+		if err != nil {
+			return nil, err
+		}
+		if !paused.Value.Bool() {
+			return nil, nil
+		}
+		return button, nil
+	}
+	return nil, page.GetContext().Err()
+}
+
+// nextSourceButton considers only provider-selected top-level buttons, in DOM
+// order. The caller records the label before clicking, including failed clicks.
+func nextSourceButton(page *rod.Page, selector string, tried map[string]bool) (*rod.Element, string, error) {
+	if selector == "" || len(tried) >= maxSourceAttempts {
+		return nil, "", nil
+	}
+	buttons, err := page.Elements(selector)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, button := range buttons {
+		if err := page.GetContext().Err(); err != nil {
+			return nil, "", err
+		}
+		enabled, err := button.Matches(`button:enabled:not([aria-disabled="true"])`)
+		if err != nil || !enabled {
+			continue
+		}
+		visible, err := button.Visible()
+		if err != nil || !visible {
+			continue
+		}
+		text, err := button.Text()
+		label := strings.Join(strings.Fields(text), " ")
+		if err != nil || label == "" || tried[label] {
+			continue
+		}
+		return button, label, nil
+	}
+	return nil, "", page.GetContext().Err()
 }
 
 // collector turns the raw CDP event stream into accepted candidates. Every
@@ -795,6 +1102,7 @@ type collector struct {
 	start time.Time
 
 	mu         sync.Mutex
+	source     string
 	pending    map[string]*requestChain
 	accepted   []*Candidate
 	firstMatch time.Time
@@ -816,11 +1124,30 @@ type requestChain struct {
 }
 
 func newCollector(req Request) *collector {
-	return &collector{req: req, start: time.Now(), pending: map[string]*requestChain{}}
+	return &collector{req: req, source: "default", start: time.Now(), pending: map[string]*requestChain{}}
+}
+
+func (c *collector) resetForSource(source string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.firstMatch.IsZero() || c.docStatus == 403 {
+		return false
+	}
+	c.pending = map[string]*requestChain{}
+	c.source = SourceID(source)
+	c.accepted = nil
+	c.firstMatch = time.Time{}
+	c.start = time.Now()
+	// Switching an embed or starting a player need not fire a top-level load.
+	c.loadedAt = c.start
+	return true
 }
 
 func (c *collector) request(ev *proto.NetworkRequestWillBeSent) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	candidate := &Candidate{
+		Source:   c.source,
 		URL:      ev.Request.URL,
 		Kind:     string(ev.Type),
 		Headers:  headerMap(ev.Request.Headers),
@@ -828,8 +1155,6 @@ func (c *collector) request(ev *proto.NetworkRequestWillBeSent) {
 		Observed: time.Since(c.start),
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	id := string(ev.RequestID)
 	chain := c.pending[id]
 	if chain == nil {

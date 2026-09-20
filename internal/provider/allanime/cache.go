@@ -1,6 +1,7 @@
 package allanime
 
 import (
+	"context"
 	"strings"
 	"time"
 )
@@ -43,19 +44,23 @@ func (c *Client) cachedStreams(episode Episode, translation, quality string) ([]
 	return cloneStreams(entry.streams), true
 }
 
-func (c *Client) cacheStreams(episode Episode, translation, quality string, streams []Stream) {
+func (c *Client) cacheStreams(ctx context.Context, episode Episode, translation, quality string, streams []Stream) error {
 	if len(streams) == 0 {
-		return
+		return ctx.Err()
 	}
 	c.cacheMu.Lock()
 	defer c.cacheMu.Unlock()
+	entry := streamEntry{streams: cloneStreams(streams), expires: c.now().Add(streamTTL)}
+	// Check under the publication lock, after cloning. Never invalidate on
+	// cancellation: another request may have published a valid shared entry.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.streamCache == nil {
 		c.streamCache = make(map[string]streamEntry)
 	}
-	c.streamCache[streamKey(episode, translation, quality)] = streamEntry{
-		streams: cloneStreams(streams),
-		expires: c.now().Add(streamTTL),
-	}
+	c.streamCache[streamKey(episode, translation, quality)] = entry
+	return nil
 }
 
 // InvalidateStreams drops a cached resolution. Callers use it when a stream

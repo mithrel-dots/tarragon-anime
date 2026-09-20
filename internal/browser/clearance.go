@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"tarragon-anime/internal/streamlog"
 )
 
 var (
@@ -24,9 +26,16 @@ type clearance interface {
 }
 
 type clearanceSession struct {
-	done   chan struct{}
-	cancel context.CancelFunc
-	err    error // Published by closing done, after the profile is released.
+	done      chan struct{}
+	cancel    context.CancelFunc
+	err       error                    // Published by closing done, after the profile is released.
+	owners    map[*clearanceOwner]bool // Protected by Resolver.mu.
+	abandoned bool
+}
+
+type clearanceOwner struct {
+	pending bool
+	stop    func() bool
 }
 
 func hasDisplay() bool {
@@ -37,12 +46,17 @@ func hasDisplay() bool {
 // for it to exit. The user must complete the check and close that window;
 // Chromium's normal shutdown then persists the clearance cookie.
 func (r *Resolver) Clear(ctx context.Context, pageURL string) error {
+	return r.clear(ctx, pageURL, true)
+}
+
+func (r *Resolver) clear(ctx context.Context, pageURL string, waitForClearance bool) (err error) {
 	if pageURL == "" {
 		return errors.New("browser clearance: page URL is required")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+retry:
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -57,16 +71,62 @@ func (r *Resolver) Clear(ctx context.Context, pageURL string) error {
 		return fmt.Errorf("%w: %w", ErrNoDisplay, r.challengeError(pageURL))
 	}
 	session := r.clearing
+	if session == nil && !waitForClearance {
+		r.mu.Unlock()
+		return nil
+	}
+	if session != nil && session.abandoned {
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.done:
+			return ErrClosed
+		case <-session.done:
+			goto retry
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		r.mu.Unlock()
+		return err
+	}
 	if session == nil {
 		lifetime, cancel := context.WithTimeout(context.Background(), r.opts.ClearanceTimeout)
-		session = &clearanceSession{done: make(chan struct{}), cancel: cancel}
+		session = &clearanceSession{done: make(chan struct{}), cancel: cancel, owners: map[*clearanceOwner]bool{}}
 		r.clearing = session
 		if r.startCancel != nil {
 			r.startCancel()
 		}
 		go r.watchClearance(lifetime, session, pageURL)
 	}
+	owner := &clearanceOwner{}
+	session.owners[owner] = true
+	owner.stop = context.AfterFunc(ctx, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		// A normal request returning pending hands the window to the human.
+		// A race loser, even one that already returned pending, needs no window.
+		if !owner.pending || errors.Is(context.Cause(ctx), streamlog.ErrWinnerSelected) {
+			r.releaseClearance(session, owner)
+		}
+	})
 	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if errors.Is(err, ErrClearancePending) {
+			owner.pending = true
+		} else {
+			owner.stop()
+			r.releaseClearance(session, owner)
+		}
+	}()
+	if !waitForClearance {
+		return ErrClearancePending
+	}
 
 	wait, cancel := context.WithTimeout(ctx, r.opts.ClearanceWait)
 	defer cancel()
@@ -83,6 +143,15 @@ func (r *Resolver) Clear(ctx context.Context, pageURL string) error {
 	}
 }
 
+// Caller holds mu. Never cancel a session another request still owns.
+func (r *Resolver) releaseClearance(session *clearanceSession, owner *clearanceOwner) {
+	delete(session.owners, owner)
+	if r.clearing == session && len(session.owners) == 0 {
+		session.abandoned = true
+		session.cancel()
+	}
+}
+
 func (r *Resolver) watchClearance(ctx context.Context, session *clearanceSession, pageURL string) {
 	var window clearance
 	var result error
@@ -94,18 +163,23 @@ func (r *Resolver) watchClearance(ctx context.Context, session *clearanceSession
 		if locked {
 			<-r.process
 		}
-		session.cancel()
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if r.closed {
 			result = ErrClosed
 		}
 		if result != nil {
-			r.opts.Logger.Printf("browser bot check: %v", result)
+			status, reason := Outcome(ctx, result)
+			r.opts.Logger.Printf("browser bot check status=%s reason=%s", status, reason)
 		} else {
 			r.opts.Logger.Printf("browser bot check passed; profile released for capture")
 		}
+		session.cancel()
 		session.err = result
+		for owner := range session.owners {
+			owner.stop()
+		}
+		clear(session.owners)
 		r.clearing = nil
 		close(session.done)
 	}()
@@ -149,12 +223,20 @@ func (r *Resolver) watchClearance(ctx context.Context, session *clearanceSession
 		return
 	}
 	r.stopEngine()
+	if err := ctx.Err(); err != nil {
+		result = err
+		return
+	}
 	window, result = r.newClearance(ctx, r.opts, pageURL)
+	if ctx.Err() != nil {
+		result = ctx.Err()
+		return
+	}
 	if result != nil {
 		result = fmt.Errorf("open browser for the bot check: %w; %w", result, r.challengeError(pageURL))
 		return
 	}
-	r.opts.Logger.Printf("browser opened for the origin's bot check: %s", pageURL)
+	r.opts.Logger.Print("browser opened for the origin's bot check")
 
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()

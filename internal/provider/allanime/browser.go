@@ -2,6 +2,7 @@ package allanime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"tarragon-anime/internal/browser"
+	"tarragon-anime/internal/streamlog"
 )
 
 // Resolver captures the requests a real browser session makes while the
@@ -49,12 +51,45 @@ func (c *Client) browserStreams(ctx context.Context, episode Episode, translatio
 			class := classify(candidate, episode.ShowID, episode.Value, translation)
 			return class != mediaNone && class != mediaSubtitle
 		},
+		FallbackSelector: "button.episode-page__source-btn:not(.episode-page__source-btn--warn)",
+		PlayButtonPath: []string{
+			`iframe[title="Episode player"]`,
+			`iframe[src^="https://mp4upload.com/embed-"], iframe[src^="https://www.mp4upload.com/embed-"]`,
+			`button.vjs-big-play-button, button.vjs-play-control:not(.vjs-playing)`,
+		},
 	})
 	if err != nil {
 		return nil, err
 	}
-	return streamsFromCandidates(candidates, episode, translation, c.origin, quality)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	source := "default"
+	if len(candidates) > 0 {
+		source = browser.SourceID(candidates[0].Source)
+	}
+	finish := streamlog.Start(ctx, source, "validation")
+	streams, err := streamsFromCandidates(candidates, episode, translation, c.origin, quality)
+	switch {
+	case errors.Is(err, errCredentials):
+		finish("unavailable", "credentials_required")
+	case errors.Is(err, errSplitTracks):
+		finish("unavailable", "unsupported_tracks")
+	case err != nil:
+		finish("unavailable", "no_playable_media")
+	default:
+		finish("resolved", "validated_media")
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return streams, err
 }
+
+var (
+	errCredentials = errors.New("browser media requires Cookie or Authorization headers; use browser playback until an origin-scoped credential handoff is available")
+	errSplitTracks = errors.New("separate adaptive tracks with no manifest")
+)
 
 type mediaClass int
 
@@ -322,9 +357,9 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 	}
 	if len(playable) == 0 {
 		if credentialsRejected {
-			return nil, fmt.Errorf("browser media requires Cookie or Authorization headers; use browser playback until an origin-scoped credential handoff is available")
+			return nil, errors.Join(browser.ErrNoMedia, errCredentials)
 		}
-		return nil, fmt.Errorf("browser session captured no playable media")
+		return nil, fmt.Errorf("%w: browser session captured no playable media", browser.ErrNoMedia)
 	}
 
 	worst := strings.EqualFold(quality, "worst")
@@ -362,6 +397,7 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 			continue
 		}
 		streams = append(streams, Stream{
+			Source:   browser.SourceID(item.candidate.Source),
 			URL:      item.candidate.URL,
 			Headers:  playbackHeaders(item.candidate, origin),
 			Subtitle: subtitle,
@@ -378,8 +414,8 @@ func streamsFromCandidates(candidates []browser.Candidate, episode Episode, tran
 // silently or at whichever quality happened to be observed, and both look like
 // a broken player rather than an unsupported source.
 func splitTrackError(tracks int) error {
-	return fmt.Errorf("origin serves the episode as %d separate adaptive tracks with no manifest; "+
-		"picking one would play silently or at an arbitrary quality, so this source needs a provider that publishes a playlist", tracks)
+	return fmt.Errorf("%w: origin serves the episode as %d %w; "+
+		"picking one would play silently or at an arbitrary quality, so this source needs a provider that publishes a playlist", browser.ErrNoMedia, tracks, errSplitTracks)
 }
 
 func hasCredentials(candidate browser.Candidate) bool {

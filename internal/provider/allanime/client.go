@@ -14,7 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"tarragon-anime/internal/browser"
 	"tarragon-anime/internal/provider"
+	"tarragon-anime/internal/streamlog"
 )
 
 const (
@@ -139,18 +141,33 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, translation string) 
 // Streams resolves playable URLs by reading them off the site's own player in
 // a managed browser session. Results are cached per episode, translation and
 // quality; see cache.go.
-func (c *Client) Streams(ctx context.Context, episode Episode, translation, quality string) ([]Stream, error) {
+func (c *Client) Streams(ctx context.Context, episode Episode, translation, quality string) (streams []Stream, err error) {
+	ctx = streamlog.WithProvider(ctx, "allanime")
+	finish := streamlog.Start(ctx, "browser", "streams")
+	defer func() {
+		if ctx.Err() != nil {
+			streams, err = nil, ctx.Err()
+		}
+		finish(browser.Outcome(ctx, err))
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if streams, ok := c.cachedStreams(episode, translation, quality); ok {
+		finishCache := streamlog.Start(ctx, browser.SourceID(streams[0].Source), "cache")
+		finishCache("resolved", "validated_cache")
 		return streams, nil
 	}
 	if c.browser == nil {
 		return nil, ErrBrowserRequired
 	}
-	streams, err := c.browserStreams(ctx, episode, translation, quality)
+	streams, err = c.browserStreams(ctx, episode, translation, quality)
 	if err != nil {
 		return nil, fmt.Errorf("resolve AllAnime episode %d: %w", episode.Number, err)
 	}
-	c.cacheStreams(episode, translation, quality, streams)
+	if err := c.cacheStreams(ctx, episode, translation, quality, streams); err != nil {
+		return nil, err
+	}
 	return streams, nil
 }
 

@@ -315,6 +315,17 @@ func TestStreamsUsesBrowserResolution(t *testing.T) {
 	client := NewClientWithEndpoints(nil, "https://api.test", "https://mkissa.to")
 	client.UseBrowser(captureFunc(func(_ context.Context, req browser.Request) ([]browser.Candidate, error) {
 		pageURL.Store(req.PageURL)
+		if req.FallbackSelector != "button.episode-page__source-btn:not(.episode-page__source-btn--warn)" {
+			t.Fatalf("unexpected source fallback selector %q", req.FallbackSelector)
+		}
+		wantPlayPath := []string{
+			`iframe[title="Episode player"]`,
+			`iframe[src^="https://mp4upload.com/embed-"], iframe[src^="https://www.mp4upload.com/embed-"]`,
+			`button.vjs-big-play-button, button.vjs-play-control:not(.vjs-playing)`,
+		}
+		if !reflect.DeepEqual(req.PlayButtonPath, wantPlayPath) {
+			t.Fatalf("unexpected player path %#v", req.PlayButtonPath)
+		}
 		if req.Ready == nil {
 			t.Fatal("browser request has no readiness predicate")
 		}

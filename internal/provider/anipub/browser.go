@@ -2,6 +2,7 @@ package anipub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"tarragon-anime/internal/browser"
+	"tarragon-anime/internal/streamlog"
 )
 
 // Resolver captures the requests a real browser session makes while the site's
@@ -38,12 +40,34 @@ func (c *Client) browserStreams(ctx context.Context, episode Episode, translatio
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// quality is deliberately unused: the master playlist carries every
 	// rendition, so the player selects rather than this code choosing one and
 	// pinning playback to it.
 	_ = quality
-	return streamsFromCandidates(candidates)
+	source := "default"
+	if len(candidates) > 0 {
+		source = browser.SourceID(candidates[0].Source)
+	}
+	finish := streamlog.Start(ctx, source, "validation")
+	streams, err := streamsFromCandidates(candidates)
+	switch {
+	case errors.Is(err, errCredentials):
+		finish("unavailable", "credentials_required")
+	case err != nil:
+		finish("unavailable", "no_playable_media")
+	default:
+		finish("resolved", "validated_media")
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return streams, err
 }
+
+var errCredentials = errors.New("browser media requires Cookie or Authorization headers; use browser playback until an origin-scoped credential handoff is available")
 
 type mediaClass int
 
@@ -109,7 +133,18 @@ func streamsFromCandidates(candidates []browser.Candidate) ([]Stream, error) {
 	}
 	var playlists []ranked
 	subtitle := ""
+	credentialsRejected := false
 	for _, candidate := range candidates {
+		credentials := false
+		for key := range candidate.Headers {
+			if strings.EqualFold(key, "Cookie") || strings.EqualFold(key, "Authorization") {
+				credentials = true
+			}
+		}
+		if credentials {
+			credentialsRejected = credentialsRejected || classify(candidate) != mediaNone
+			continue
+		}
 		switch classify(candidate) {
 		case mediaSubtitle:
 			if subtitle == "" {
@@ -120,7 +155,10 @@ func streamsFromCandidates(candidates []browser.Candidate) ([]Stream, error) {
 		}
 	}
 	if len(playlists) == 0 {
-		return nil, fmt.Errorf("browser session captured no playlist")
+		if credentialsRejected {
+			return nil, errors.Join(browser.ErrNoMedia, errCredentials)
+		}
+		return nil, fmt.Errorf("%w: browser session captured no playlist", browser.ErrNoMedia)
 	}
 
 	sort.SliceStable(playlists, func(i, j int) bool {
@@ -133,6 +171,7 @@ func streamsFromCandidates(candidates []browser.Candidate) ([]Stream, error) {
 	streams := make([]Stream, 0, len(playlists))
 	for _, item := range playlists {
 		streams = append(streams, Stream{
+			Source:   browser.SourceID(item.candidate.Source),
 			URL:      item.candidate.URL,
 			Headers:  playbackHeaders(item.candidate),
 			Subtitle: subtitle,

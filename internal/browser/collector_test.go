@@ -3,6 +3,7 @@ package browser
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,6 +71,119 @@ func TestCollectorGivesUpAfterLoadWithoutMedia(t *testing.T) {
 			t.Fatalf("observed() = %q, want it to report %q", summary, want)
 		}
 	}
+}
+
+func TestCollectorResetForSource(t *testing.T) {
+	c := newCollector(Request{
+		PageURL: "https://example.test/watch",
+		Accept:  func(Candidate) bool { return true },
+		Ready:   func(c Candidate) bool { return c.MIME == "video/mp4" },
+		Settle:  time.Hour,
+	})
+	c.response(&proto.NetworkResponseReceived{Type: proto.NetworkResourceTypeDocument,
+		Response: &proto.NetworkResponse{URL: c.req.PageURL, Status: 200}})
+	c.request(&proto.NetworkRequestWillBeSent{RequestID: "subtitle", Request: &proto.NetworkRequest{URL: "https://cdn.test/old.vtt"}})
+	c.response(&proto.NetworkResponseReceived{RequestID: "subtitle", Response: &proto.NetworkResponse{Status: 200, MIMEType: "text/vtt"}})
+	c.request(&proto.NetworkRequestWillBeSent{RequestID: "old", Request: &proto.NetworkRequest{URL: "https://cdn.test/old.mp4"}})
+	c.response(&proto.NetworkResponseReceived{RequestID: "old", HasExtraInfo: true,
+		Response: &proto.NetworkResponse{Status: 206, MIMEType: "video/mp4"}})
+	c.start = time.Now().Add(-time.Hour)
+	c.loadedAt = c.start
+	if !c.exhausted() || len(c.matches()) != 1 {
+		t.Fatal("expected an exhausted source with only a subtitle accepted")
+	}
+	before := time.Now()
+	if !c.resetForSource("source-1") {
+		t.Fatal("exhausted source was not reset")
+	}
+	if len(c.pending) != 0 || len(c.accepted) != 0 || !c.firstMatch.IsZero() || c.docStatus != 200 {
+		t.Fatal("reset must clear observations and settlement, preserving document status")
+	}
+	if c.start.Before(before) || c.start != c.loadedAt || c.exhausted() {
+		t.Fatal("reset did not start a fresh observation/grace window")
+	}
+	start := c.start
+	c.loaded()
+	if c.loadedAt != start {
+		t.Fatal("later load event extended source grace")
+	}
+	// Old in-flight responses/headers cannot revive the discarded source.
+	c.extraInfo(&proto.NetworkRequestWillBeSentExtraInfo{RequestID: "old", Headers: proto.NetworkHeaders{"Cookie": gson.New("old-cookie")}})
+	c.response(&proto.NetworkResponseReceived{RequestID: "old", Response: &proto.NetworkResponse{Status: 206, MIMEType: "video/mp4"}})
+	c.data(&proto.NetworkDataReceived{RequestID: "old", DataLength: 1 << 20})
+	c.failed(&proto.NetworkLoadingFailed{RequestID: "subtitle"})
+	if len(c.matches()) != 0 || !c.firstMatch.IsZero() {
+		t.Fatal("old source leaked into the new observation window")
+	}
+	// Grace must expire even when switching an iframe fires no top-level load.
+	c.loadedAt = time.Now().Add(-noMediaGrace - time.Second)
+	if !c.exhausted() || !c.resetForSource("source-2") {
+		t.Fatal("source retry without a load event was not bounded")
+	}
+	// An immediate request after reset still requires successful response and
+	// wire headers; the new source cannot inherit the old source's credentials.
+	c.request(&proto.NetworkRequestWillBeSent{RequestID: "new", Request: &proto.NetworkRequest{
+		URL: "https://cdn.test/new.mp4", Headers: proto.NetworkHeaders{"Cookie": gson.New("provisional")},
+	}})
+	c.response(&proto.NetworkResponseReceived{RequestID: "new", HasExtraInfo: true,
+		Response: &proto.NetworkResponse{Status: 206, MIMEType: "video/mp4"}})
+	if len(c.matches()) != 0 {
+		t.Fatal("new media accepted before wire headers arrived")
+	}
+	c.extraInfo(&proto.NetworkRequestWillBeSentExtraInfo{RequestID: "new", Headers: proto.NetworkHeaders{"cookie": gson.New("new-cookie")}})
+	found := c.matches()
+	if len(found) != 1 || found[0].Source != "source-2" || found[0].URL != "https://cdn.test/new.mp4" || found[0].Status != 206 || found[0].Headers["cookie"] != "new-cookie" {
+		t.Fatalf("new source media missing or contaminated: %#v", found)
+	}
+	if found[0].Observed < 0 || found[0].Observed >= time.Since(before) || c.firstMatch.Before(before) {
+		t.Fatal("new source inherited old observation/settle timestamps")
+	}
+	if _, done := c.settled(); done {
+		t.Fatal("new source inherited an expired settle window")
+	}
+}
+
+func TestCollectorResetPreservesLateMediaAndChallenges(t *testing.T) {
+	for _, status := range []int{200, 403} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			c := newCollector(testRequest())
+			c.docStatus = status
+			if status == 200 {
+				c.request(&proto.NetworkRequestWillBeSent{RequestID: "media", Request: &proto.NetworkRequest{URL: "https://cdn.test/media.mp4"}})
+				c.response(&proto.NetworkResponseReceived{RequestID: "media", Response: &proto.NetworkResponse{Status: 206}})
+			}
+			start, first, count := c.start, c.firstMatch, len(c.matches())
+			if c.resetForSource("source-1") || c.start != start || c.firstMatch != first || len(c.matches()) != count || c.docStatus != status {
+				t.Fatal("source reset discarded late media or a challenge")
+			}
+			if status == 403 && !c.challenged() {
+				t.Fatal("source reset lost the main document challenge")
+			}
+		})
+	}
+}
+
+func TestCollectorResetConcurrentWithEvents(t *testing.T) {
+	c := newCollector(Request{Accept: func(Candidate) bool { return false }})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := range 500 {
+			id := proto.NetworkRequestID(fmt.Sprint(i))
+			c.request(&proto.NetworkRequestWillBeSent{RequestID: id, Request: &proto.NetworkRequest{URL: "https://cdn.test/video.mp4"}})
+			c.response(&proto.NetworkResponseReceived{RequestID: id, Response: &proto.NetworkResponse{Status: 206}})
+			c.extraInfo(&proto.NetworkRequestWillBeSentExtraInfo{RequestID: id})
+			c.data(&proto.NetworkDataReceived{RequestID: id, DataLength: 1024})
+			c.failed(&proto.NetworkLoadingFailed{RequestID: id})
+			c.loaded()
+		}
+	})
+	for range 500 {
+		c.resetForSource("source-1")
+		c.exhausted()
+		c.settled()
+		c.matches()
+	}
+	wg.Wait()
 }
 
 func TestCollectorObservedSummarizesRejectedMediaWithoutSecrets(t *testing.T) {

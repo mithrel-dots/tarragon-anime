@@ -348,8 +348,47 @@ func TestResolverKeepsBrowserAfterEmptyPage(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("browser starts = %d, want the browser to survive an empty page", got)
 	}
-	if _, closed := eng.counts(); closed != 0 {
-		t.Fatalf("browser closed = %d, want it kept alive", closed)
+	if captures, closed := eng.counts(); captures != 2 || closed != 0 {
+		t.Fatalf("captures=%d closed=%d, want fresh captures on the same engine after failure", captures, closed)
+	}
+}
+
+func TestSourceButtonSelectionBounds(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		selector string
+		tried    map[string]bool
+	}{
+		{name: "opt-out"},
+		{name: "three attempts", selector: "button.source", tried: map[string]bool{"Mp4": true, "Ok": true, "Other": true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// A nil page proves opt-out and the cap cause no DOM interaction.
+			button, label, err := nextSourceButton(nil, test.selector, test.tried)
+			if err != nil || button != nil || label != "" {
+				t.Fatalf("nextSourceButton() = %v, %q, %v", button, label, err)
+			}
+		})
+	}
+}
+
+func TestPlayButtonPathBounds(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path []string
+	}{
+		{name: "opt-out"},
+		{name: "empty button selector", path: []string{"iframe", " "}},
+		{name: "empty frame selector", path: []string{"", "button.play"}},
+		{name: "four frames", path: []string{"iframe", "iframe", "iframe", "iframe", "button.play"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Invalid/disabled paths must not inspect even the top-level DOM.
+			button, err := findPlayButton(nil, test.path)
+			if err != nil || button != nil {
+				t.Fatalf("findPlayButton() = %v, %v", button, err)
+			}
+		})
 	}
 }
 

@@ -22,6 +22,7 @@ type Stream struct {
 	URL      string
 	Headers  map[string]string
 	Subtitle string
+	Source   string // Non-secret source label or ordinal for resolution logs.
 }
 
 type Client interface {
