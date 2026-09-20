@@ -23,7 +23,7 @@ test-race:
 # clearance/restart regression test (requires a display).
 # ANIME_LIVE_MEDIA=1 also decodes one MyStream video frame with headless mpv.
 test-live:
-	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/browser ./internal/provider/allanime ./internal/provider/animeflix ./internal/provider/animepahe ./internal/provider/anineko ./internal/provider/anipub
+	go test -tags=live -timeout 20m -p 1 ./internal/anilist ./internal/anime ./internal/browser ./internal/provider/allanime ./internal/provider/animeflix ./internal/provider/animepahe ./internal/provider/anineko ./internal/provider/anipub
 
 check-deps:
 	@command -v go >/dev/null || { printf '%s\n' 'go is required' >&2; exit 1; }

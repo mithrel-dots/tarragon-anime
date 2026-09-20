@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	"tarragon-anime/internal/provider"
+	"tarragon-anime/internal/streamlog"
 )
 
 const (
@@ -218,6 +219,9 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, _ string) ([]Episode
 // Soft subtitles use the embed's external track when available; hard subtitles
 // remain burned into the selected video stream.
 func (c *Client) Streams(ctx context.Context, episode Episode, translation, quality string) ([]Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	slug := strings.TrimSpace(episode.ShowID)
 	if slug == "" {
 		return nil, errors.New("AniNeko streams: show id is required")
@@ -235,20 +239,45 @@ func (c *Client) Streams(ctx context.Context, episode Episode, translation, qual
 		return nil, fmt.Errorf("no AniNeko %s streams for episode %d", normalizeTranslation(translation), episode.Number)
 	}
 
-	var failures []string
+	var failures []error
+	seen := make(map[string]bool)
 	for _, embedURL := range embedURLs {
-		stream, resolveErr := c.resolveEmbed(ctx, embedURL, quality)
-		if resolveErr != nil {
-			c.logger.Printf("AniNeko embed %s failed: %v", embedURL, resolveErr)
-			failures = append(failures, resolveErr.Error())
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		embedURL = c.absoluteURL(embedURL)
+		if seen[embedURL] {
 			continue
 		}
+		seen[embedURL] = true
+		id := fmt.Sprintf("source-%d", len(seen))
+		finish := streamlog.Start(ctx, id, "resolve")
+		if resolveEmbedHost(embedURL) == "" {
+			finish("unavailable", "unsupported_source")
+			continue
+		}
+		stream, resolveErr := c.resolveEmbed(ctx, embedURL, quality)
+		if ctx.Err() != nil {
+			resolveErr = ctx.Err()
+		}
+		finish(streamlog.Outcome(ctx, resolveErr))
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if resolveErr != nil {
+			failures = append(failures, resolveErr)
+			continue
+		}
+		stream.Source = id
 		return []Stream{stream}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if len(failures) == 0 {
 		return nil, fmt.Errorf("no playable AniNeko streams for episode %d", episode.Number)
 	}
-	return nil, fmt.Errorf("no playable AniNeko streams for episode %d: %s", episode.Number, strings.Join(failures, "; "))
+	return nil, fmt.Errorf("no playable AniNeko streams for episode %d: %w", episode.Number, errors.Join(failures...))
 }
 
 func (c *Client) loadEmbedPage(ctx context.Context, slug string, number int) (embedPage, error) {
@@ -260,6 +289,9 @@ func (c *Client) loadEmbedPage(ctx context.Context, slug string, number int) (em
 }
 
 func (c *Client) resolveEmbed(ctx context.Context, embedURL, quality string) (Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return Stream{}, err
+	}
 	embedURL = c.absoluteURL(embedURL)
 	switch resolveEmbedHost(embedURL) {
 	case "bibiemb":
@@ -297,6 +329,9 @@ func (c *Client) fetchJSON(ctx context.Context, method, endpoint, referer string
 }
 
 func (c *Client) requestBody(ctx context.Context, method, endpoint, referer string, payload any) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var reader io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -320,6 +355,9 @@ func (c *Client) requestBody(ctx context.Context, method, endpoint, referer stri
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxBody))
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {

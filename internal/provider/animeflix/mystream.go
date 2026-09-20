@@ -17,6 +17,9 @@ import (
 )
 
 var (
+	errMissingSubtitles  = errors.New("MyStream has no verified full English subtitle track")
+	errUnsupportedSource = errors.New("unsupported MyStream player path")
+
 	videoPathRE = regexp.MustCompile(`^/video/([a-fA-F0-9]{32})/?$`)
 	subtitleRE  = regexp.MustCompile(`\bplayerjsSubtitle\s*=\s*("(?:\\.|[^"\\])*")`)
 	trackRE     = regexp.MustCompile(`\[([^\]]+)\]([^\[]+)`)
@@ -25,6 +28,9 @@ var (
 )
 
 func (c *Client) resolveMyStream(ctx context.Context, embedURL, translation, quality string) (provider.Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return provider.Stream{}, err
+	}
 	// A jar belongs to one resolution, never to the caller's shared HTTP client:
 	// active playback and next-episode prefetch can establish different sessions.
 	client := *c.http
@@ -39,7 +45,7 @@ func (c *Client) resolveMyStream(ctx context.Context, embedURL, translation, qua
 	}
 	path := videoPathRE.FindStringSubmatch(u.Path)
 	if path == nil {
-		return provider.Stream{}, errors.New("unsupported MyStream player path")
+		return provider.Stream{}, errUnsupportedSource
 	}
 	endpoint := u.ResolveReference(&url.URL{Path: "/player/index.php", RawQuery: url.Values{"data": {path[1]}, "do": {"getVideo"}}.Encode()})
 	body, _, err := fetch(ctx, &client, http.MethodPost, endpoint.String(), pageURL, url.Values{"hash": {path[1]}, "r": {c.origin + "/"}})
@@ -90,7 +96,7 @@ func (c *Client) resolveMyStream(ctx context.Context, embedURL, translation, qua
 	if err := ctx.Err(); err != nil {
 		return provider.Stream{}, err
 	}
-	localMaster, localSubtitle, err := c.publish(master, subtitle)
+	localMaster, localSubtitle, err := c.publish(ctx, master, subtitle)
 	if err != nil {
 		return provider.Stream{}, err
 	}
@@ -132,7 +138,7 @@ func englishSubtitle(base, page string) (string, error) {
 			}
 		}
 	}
-	return "", errors.New("MyStream has no verified full English subtitle track")
+	return "", errMissingSubtitles
 }
 
 func normalizeSubtitle(raw string) ([]byte, error) {

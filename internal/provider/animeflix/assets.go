@@ -1,6 +1,7 @@
 package animeflix
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -31,9 +32,13 @@ type assetServer struct {
 
 // publish makes the already-normalized playlists available locally. It never
 // fetches media: URLs in master are intentionally left as absolute origins.
-func (c *Client) publish(master, subtitle []byte) (masterURL string, subtitleURL string, err error) {
+// The context gates publication only; playback survives lookup cancellation.
+func (c *Client) publish(ctx context.Context, master, subtitle []byte) (masterURL string, subtitleURL string, err error) {
 	c.assetsMu.Lock()
 	defer c.assetsMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	if c.closed {
 		return "", "", errors.New("AnimeFlix client is closed")
 	}
@@ -63,6 +68,10 @@ func (c *Client) publish(master, subtitle []byte) (masterURL string, subtitleURL
 		return "", "", tokenErr
 	}
 	c.assets.mu.Lock()
+	defer c.assets.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	c.assets.entries[token] = assetEntry{master: append([]byte(nil), master...), subtitle: append([]byte(nil), subtitle...)}
 	c.assets.order = append(c.assets.order, token)
 	for len(c.assets.order) > maxAssetEntries {
@@ -70,7 +79,6 @@ func (c *Client) publish(master, subtitle []byte) (masterURL string, subtitleURL
 		c.assets.order = c.assets.order[1:]
 		delete(c.assets.entries, oldest)
 	}
-	c.assets.mu.Unlock()
 
 	masterURL = c.assets.baseURL + "/" + token + "/master.m3u8"
 	if len(subtitle) != 0 {

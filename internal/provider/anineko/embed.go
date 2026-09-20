@@ -62,11 +62,11 @@ func (c *Client) resolveVibeplayer(ctx context.Context, embedURL string) (Stream
 		return Stream{}, fmt.Errorf("vibeplayer master playlist not found")
 	}
 	masterURL := strings.TrimSpace(match[1])
-	proxy, err := c.vibeProxy()
+	proxy, err := c.vibeProxy(ctx)
 	if err != nil {
 		return Stream{}, err
 	}
-	proxyURL, err := proxy.register(masterURL, embedURL)
+	proxyURL, err := proxy.register(ctx, masterURL, embedURL)
 	if err != nil {
 		return Stream{}, err
 	}

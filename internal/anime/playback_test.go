@@ -224,7 +224,7 @@ func (p *fakePlayer) Play(_ context.Context, _ mpv.Stream, _ string, start float
 
 type memoryState struct {
 	mu       sync.Mutex
-	mapping  string
+	mappings map[int]map[string]string
 	progress map[[2]int]store.Progress
 	media    map[int]store.MediaInfo
 	queue    []store.SyncItem
@@ -235,6 +235,7 @@ type memoryState struct {
 
 func newMemoryState() *memoryState {
 	return &memoryState{
+		mappings: make(map[int]map[string]string),
 		progress: make(map[[2]int]store.Progress),
 		media:    make(map[int]store.MediaInfo),
 	}
@@ -342,15 +343,19 @@ func (s *memoryState) pendingCount() int {
 	return len(s.queue)
 }
 
-func (s *memoryState) ProviderMapping(context.Context, int, string) (string, bool, error) {
+func (s *memoryState) ProviderMapping(_ context.Context, mediaID int, name string) (string, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.mapping, s.mapping != "", nil
+	mapping, found := s.mappings[mediaID][name]
+	return mapping, found, nil
 }
 
-func (s *memoryState) SaveProviderMapping(_ context.Context, _ int, _, providerID string) error {
+func (s *memoryState) SaveProviderMapping(_ context.Context, mediaID int, name, providerID string) error {
 	s.mu.Lock()
-	s.mapping = providerID
+	if s.mappings[mediaID] == nil {
+		s.mappings[mediaID] = make(map[string]string)
+	}
+	s.mappings[mediaID][name] = providerID
 	s.mu.Unlock()
 	return nil
 }

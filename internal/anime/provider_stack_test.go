@@ -74,7 +74,11 @@ func (p stackTestProvider) Streams(_ context.Context, episode provider.Episode, 
 	if p.streamErr != nil {
 		return nil, p.streamErr
 	}
-	return []provider.Stream{{URL: p.streamURL}}, nil
+	streamURL := p.streamURL
+	if streamURL == "" {
+		streamURL = "https://video.test/episode.m3u8"
+	}
+	return []provider.Stream{{URL: streamURL}}, nil
 }
 
 type stackTestPlayer struct {
@@ -94,6 +98,7 @@ func TestPlaybackFallsBackWhenProviderCatalogueFails(t *testing.T) {
 		"allanime":  stackTestProvider{name: "allanime", episodeErr: errors.New("unavailable")},
 		"animepahe": stackTestProvider{name: "animepahe"},
 	}, unusedPlayer{}, nil, nil, nil, config, nil)
+	defer service.Close()
 
 	episodes, err := service.Episodes(t.Context(), 154587)
 	if err != nil {
@@ -233,6 +238,7 @@ func TestProviderEpisodeFallsBackToCatalogueIDWithoutShowID(t *testing.T) {
 	service := NewServiceWithProviders(&cachingAniList{}, map[string]provider.Client{
 		"fallback": stackTestProvider{name: "catalogue", emptyShowID: true},
 	}, unusedPlayer{}, nil, nil, nil, config, nil)
+	defer service.Close()
 
 	episodes, err := service.Episodes(t.Context(), 154587)
 	if err != nil {
@@ -265,6 +271,7 @@ func TestStreamFallbackLogsServingProvider(t *testing.T) {
 	if player.stream.URL != "https://video.test/animepahe.m3u8" {
 		t.Fatalf("mpv stream = %#v", player.stream)
 	}
+	service.Close()
 	if !strings.Contains(logs.String(), "stream served provider=animepahe") {
 		t.Fatalf("logs do not identify serving provider: %s", logs.String())
 	}
@@ -272,10 +279,11 @@ func TestStreamFallbackLogsServingProvider(t *testing.T) {
 
 func TestStreamDoesNotUseUnconfiguredProvider(t *testing.T) {
 	config := DefaultConfig()
+	var unconfiguredCalls atomic.Int32
 	player := &stackTestPlayer{session: newFakeSession()}
 	service := NewServiceWithProviders(&cachingAniList{}, map[string]provider.Client{
 		"allanime":  stackTestProvider{name: "allanime", streamErr: errors.New("stream unavailable")},
-		"animepahe": stackTestProvider{name: "animepahe", streamURL: "https://video.test/animepahe.m3u8"},
+		"animepahe": stackTestProvider{name: "animepahe", streamURL: "https://video.test/animepahe.m3u8", calls: &unconfiguredCalls},
 	}, player, nil, nil, nil, config, nil)
 	defer service.Close()
 
@@ -288,6 +296,10 @@ func TestStreamDoesNotUseUnconfiguredProvider(t *testing.T) {
 	}
 	if player.stream.URL != "" {
 		t.Fatalf("mpv stream = %#v", player.stream)
+	}
+	service.Close()
+	if unconfiguredCalls.Load() != 0 {
+		t.Fatalf("unconfigured provider made %d calls", unconfiguredCalls.Load())
 	}
 }
 

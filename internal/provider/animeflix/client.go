@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"tarragon-anime/internal/provider"
+	"tarragon-anime/internal/streamlog"
 )
 
 const (
@@ -74,6 +75,9 @@ func (c *Client) apiJSON(ctx context.Context, path string, out any) error {
 }
 
 func (c *Client) Streams(ctx context.Context, episode provider.Episode, translation, quality string) ([]provider.Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(episode.ShowID) == "" || strings.TrimSpace(episode.Value) == "" || episode.Number <= 0 {
 		return nil, errors.New("AnimeFlix streams require a show and episode id")
 	}
@@ -99,22 +103,43 @@ func (c *Client) Streams(ctx context.Context, episode provider.Episode, translat
 	seen := make(map[string]bool)
 	var failures []error
 	for _, source := range append(sources.Sub, sources.Dub...) {
-		u, err := url.Parse(source.URL)
-		if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" || !myStreamHost.MatchString(strings.ToLower(u.Hostname())) {
-			continue
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if seen[source.URL] {
 			continue
 		}
 		seen[source.URL] = true
-		stream, err := c.resolveMyStream(ctx, source.URL, translation, quality)
-		if err == nil {
-			return []provider.Stream{stream}, nil
+		u, err := url.Parse(source.URL)
+		if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" || !myStreamHost.MatchString(strings.ToLower(u.Hostname())) {
+			finish := streamlog.Start(ctx, fmt.Sprintf("source-%d", len(seen)), "resolve")
+			finish("unavailable", "unsupported_source")
+			continue
 		}
+		id := fmt.Sprintf("mystream-%d", len(seen))
+		finish := streamlog.Start(ctx, id, "resolve")
+		stream, err := c.resolveMyStream(ctx, source.URL, translation, quality)
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		status, reason := streamlog.Outcome(ctx, err)
+		if errors.Is(err, errMissingSubtitles) {
+			status, reason = "unavailable", "missing_subtitles"
+		} else if errors.Is(err, errUnsupportedSource) {
+			status, reason = "unavailable", "unsupported_source"
+		}
+		finish(status, reason)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		if err == nil {
+			stream.Source = id
+			return []provider.Stream{stream}, nil
+		}
 		failures = append(failures, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if len(failures) > 0 {
 		return nil, fmt.Errorf("resolve AnimeFlix MyStream: %w", errors.Join(failures...))
@@ -123,6 +148,9 @@ func (c *Client) Streams(ctx context.Context, episode provider.Episode, translat
 }
 
 func fetch(ctx context.Context, client *http.Client, method, endpoint, referer string, form url.Values) ([]byte, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	var body io.Reader
 	if form != nil {
 		body = strings.NewReader(form.Encode())
@@ -148,6 +176,9 @@ func fetch(ctx context.Context, client *http.Client, method, endpoint, referer s
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
+		return nil, "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
 	if len(data) > maxBody {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/provider"
 	"tarragon-anime/internal/store"
+	"tarragon-anime/internal/streamlog"
 )
 
 type aniListClient interface {
@@ -103,12 +105,13 @@ type Service struct {
 	accountToken string
 	accountName  string
 
-	rootCtx      context.Context
-	rootCancel   context.CancelFunc
-	lifecycleMu  sync.Mutex
-	closed       bool
-	workers      sync.WaitGroup
-	serviceClose sync.Once
+	rootCtx       context.Context
+	rootCancel    context.CancelFunc
+	lifecycleMu   sync.Mutex
+	closed        bool
+	workers       sync.WaitGroup
+	serviceClose  sync.Once
+	providerSlots chan struct{}
 }
 
 type activePlayback struct {
@@ -164,6 +167,7 @@ func NewServiceWithProviders(anilistClient aniListClient, providers map[string]p
 		anilist: anilistClient, providers: cloneProviders(providers), player: player, state: state, preview: previews,
 		sync: syncer, config: config, logger: logger, media: make(map[int]anilist.Media),
 		episodes: make(map[int][]Episode), rootCtx: rootCtx, rootCancel: rootCancel,
+		providerSlots: make(chan struct{}, 4),
 	}
 }
 
@@ -1104,56 +1108,148 @@ func (s *Service) invalidateStreams(episode Episode) {
 }
 
 func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Stream, Episode, error) {
-	var failures []string
-	for _, name := range s.providerNames() {
-		if err := ctx.Err(); err != nil {
-			return mpv.Stream{}, episode, err
-		}
-		if s.providers[name] == nil {
-			continue
-		}
-		candidate := episode
-		if name != episode.Provider {
-			media, err := s.mediaFor(ctx, episode.MediaID)
-			if err != nil {
-				failures = append(failures, name+": load media: "+err.Error())
-				continue
-			}
-			episodes, err := s.providerEpisodes(ctx, media, name)
-			if err != nil {
-				failures = append(failures, name+": "+err.Error())
-				s.logger.Printf("provider stream fallback episodes failed provider=%s media_id=%d: %v", name, episode.MediaID, err)
-				continue
-			}
-			found := false
-			for _, item := range episodes {
-				if item.Number == episode.Number {
-					candidate, found = item, true
-					break
-				}
-			}
-			if !found {
-				failures = append(failures, name+": episode is unavailable")
-				continue
-			}
-		}
-		client := s.providers[candidate.Provider]
-		streams, err := client.Streams(ctx, provider.Episode{
-			ShowID: candidate.ProviderID, Number: candidate.Number, Value: candidate.Value,
-		}, s.config.Translation, s.config.PreferredQuality)
-		if err != nil {
-			failures = append(failures, candidate.Provider+": "+err.Error())
-			continue
-		}
-		if len(streams) == 0 {
-			failures = append(failures, candidate.Provider+": no playable streams")
-			continue
-		}
-		stream := streams[0]
-		return mpv.Stream{URL: stream.URL, Headers: stream.Headers, Subtitle: stream.Subtitle}, candidate, nil
+	ctx = streamlog.WithResolution(ctx, s.logger, episode.MediaID, episode.Number, s.config.Translation)
+	ctx, cancel := context.WithCancelCause(ctx)
+	stopRootCancel := context.AfterFunc(s.rootCtx, func() { cancel(context.Cause(s.rootCtx)) })
+	defer func() {
+		// Serving resources belong to provider clients, not lookup contexts.
+		stopRootCancel()
+		cancel(nil)
+	}()
+	if s.rootCtx.Err() != nil {
+		cancel(context.Cause(s.rootCtx))
 	}
-	if len(failures) == 0 {
+	if err := ctx.Err(); err != nil {
+		return mpv.Stream{}, episode, err
+	}
+	names := s.providerNames()
+	if len(names) == 0 {
 		return mpv.Stream{}, episode, fmt.Errorf("no configured provider can serve episode %d", episode.Number)
+	}
+	// Populate media once, before provider workers can race on an AniList miss.
+	var media anilist.Media
+	var mediaErr error
+	for _, name := range names {
+		if name != episode.Provider && s.providers[name] != nil {
+			media, mediaErr = s.mediaFor(ctx, episode.MediaID)
+			break
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return mpv.Stream{}, episode, err
+	}
+	type result struct {
+		index   int
+		stream  provider.Stream
+		episode Episode
+		reason  string
+	}
+	// Each worker sends once; abandoned results never hold up cancellation or Close.
+	results := make(chan result, len(names))
+	cancels := make([]context.CancelCauseFunc, len(names))
+	for index, name := range names {
+		attemptCtx, attemptCancel := context.WithCancelCause(streamlog.WithProvider(ctx, name))
+		cancels[index] = attemptCancel
+		if !s.launch(func() {
+			out := result{index: index, episode: episode}
+			var err error
+			finish := streamlog.Start(attemptCtx, "provider", "resolve")
+			defer func() {
+				status, reason := streamlog.Outcome(attemptCtx, err)
+				if status == "failed" {
+					reason = out.reason
+					switch reason {
+					case "provider_unavailable", "episode_unavailable", "no_stream":
+						status = "unavailable"
+					}
+				}
+				finish(status, reason)
+				results <- out
+			}()
+			select {
+			case s.providerSlots <- struct{}{}:
+				defer func() { <-s.providerSlots }()
+			case <-attemptCtx.Done():
+				return
+			}
+			if attemptCtx.Err() != nil {
+				return
+			}
+			client := s.providers[name]
+			if client == nil {
+				out.reason = "provider_unavailable"
+				err = fmt.Errorf("provider is unavailable")
+				return
+			}
+			if name != episode.Provider {
+				if mediaErr != nil {
+					out.reason, err = "media_failed", mediaErr
+					return
+				}
+				var episodes []Episode
+				episodes, out.reason, err = s.providerEpisodes(attemptCtx, media, name)
+				if err != nil || attemptCtx.Err() != nil {
+					return
+				}
+				found := episodeIndex(episodes, episode.Number)
+				if found < 0 {
+					out.reason = "episode_unavailable"
+					err = fmt.Errorf("episode is unavailable")
+					return
+				}
+				out.episode = episodes[found]
+			}
+			var streams []provider.Stream
+			streams, err = client.Streams(attemptCtx, provider.Episode{
+				ShowID: out.episode.ProviderID, Number: out.episode.Number, Value: out.episode.Value,
+			}, s.config.Translation, s.config.PreferredQuality)
+			if err != nil {
+				out.reason = "streams_failed"
+				return
+			}
+			if attemptCtx.Err() != nil {
+				return
+			}
+			for _, stream := range streams {
+				parsed, parseErr := url.Parse(stream.URL)
+				if parseErr != nil || parsed.Hostname() == "" || strings.ContainsAny(stream.URL, " \t\r\n") {
+					continue
+				}
+				if parsed.Scheme != "http" && parsed.Scheme != "https" {
+					continue
+				}
+				out.stream = stream
+				return
+			}
+			out.reason = "no_stream"
+			if len(streams) > 0 {
+				out.reason = "invalid_stream"
+			}
+			err = fmt.Errorf("no playable streams")
+		}) {
+			return mpv.Stream{}, episode, context.Canceled
+		}
+	}
+	failures := make([]string, len(names))
+	for range names {
+		select {
+		case <-ctx.Done():
+			return mpv.Stream{}, episode, ctx.Err()
+		case out := <-results:
+			if err := ctx.Err(); err != nil {
+				return mpv.Stream{}, episode, err
+			}
+			if out.stream.URL != "" {
+				for index, stop := range cancels {
+					if index != out.index {
+						stop(streamlog.ErrWinnerSelected)
+					}
+				}
+				streamlog.Selected(streamlog.WithProvider(ctx, names[out.index]), out.stream.Source)
+				return mpv.Stream{URL: out.stream.URL, Headers: out.stream.Headers, Subtitle: out.stream.Subtitle}, out.episode, nil
+			}
+			failures[out.index] = names[out.index] + ": " + out.reason
+		}
 	}
 	return mpv.Stream{}, episode, fmt.Errorf("resolve episode %d stream: %s", episode.Number, strings.Join(failures, "; "))
 }
@@ -1225,11 +1321,8 @@ func (s *Service) providerNames() []string {
 	return result
 }
 
-func (s *Service) resolveProvider(ctx context.Context, mediaID int, name string) (provider.Anime, error) {
-	media, err := s.mediaFor(ctx, mediaID)
-	if err != nil {
-		return provider.Anime{}, err
-	}
+func (s *Service) resolveProvider(ctx context.Context, media anilist.Media, name string) (provider.Anime, error) {
+	mediaID := media.ID
 	client := s.providers[name]
 	if client == nil {
 		return provider.Anime{}, fmt.Errorf("provider %q is unavailable", name)
@@ -1237,10 +1330,13 @@ func (s *Service) resolveProvider(ctx context.Context, mediaID int, name string)
 	if s.state != nil {
 		providerID, found, err := s.state.ProviderMapping(ctx, mediaID, name)
 		if err != nil {
-			s.logger.Printf("load provider mapping media_id=%d: %v", mediaID, err)
+			s.logger.Printf("provider mapping media_id=%d reason=mapping_load_failed", mediaID)
 		} else if found {
 			return provider.Anime{ID: providerID, AniListID: mediaID}, nil
 		}
+	}
+	if ctx.Err() != nil {
+		return provider.Anime{}, ctx.Err()
 	}
 	aliases := []string{media.English, media.Romaji, media.Native, media.Title}
 	aliases = append(aliases, media.Synonyms...)
@@ -1248,26 +1344,31 @@ func (s *Service) resolveProvider(ctx context.Context, mediaID int, name string)
 	if err != nil {
 		return provider.Anime{}, fmt.Errorf("match %s title for AniList %d: %w", name, mediaID, err)
 	}
-	s.logger.Printf("provider match provider=%s media_id=%d provider_id=%s", name, mediaID, match.ID)
+	if ctx.Err() != nil {
+		return provider.Anime{}, ctx.Err()
+	}
 	if s.state != nil {
 		if err := s.state.SaveProviderMapping(ctx, mediaID, name, match.ID); err != nil {
-			s.logger.Printf("save provider mapping media_id=%d: %v", mediaID, err)
+			s.logger.Printf("provider mapping media_id=%d reason=mapping_save_failed", mediaID)
 		}
 	}
 	return match, nil
 }
 
-func (s *Service) providerEpisodes(ctx context.Context, media anilist.Media, name string) ([]Episode, error) {
-	providerAnime, err := s.resolveProvider(ctx, media.ID, name)
+func (s *Service) providerEpisodes(ctx context.Context, media anilist.Media, name string) ([]Episode, string, error) {
+	providerAnime, err := s.resolveProvider(ctx, media, name)
 	if err != nil {
-		return nil, err
+		return nil, "match_failed", err
+	}
+	if ctx.Err() != nil {
+		return nil, "match_failed", ctx.Err()
 	}
 	items, err := s.providers[name].Episodes(ctx, providerAnime, s.config.Translation)
 	if err != nil {
-		return nil, err
+		return nil, "episodes_failed", err
 	}
 	if len(items) == 0 {
-		return nil, fmt.Errorf("provider returned no episodes")
+		return nil, "episodes_failed", fmt.Errorf("provider returned no episodes")
 	}
 	result := make([]Episode, 0, len(items))
 	for _, item := range items {
@@ -1285,9 +1386,9 @@ func (s *Service) providerEpisodes(ctx context.Context, media anilist.Media, nam
 		})
 	}
 	if len(result) == 0 {
-		return nil, fmt.Errorf("provider returned no valid episodes")
+		return nil, "episodes_failed", fmt.Errorf("provider returned no valid episodes")
 	}
-	return result, nil
+	return result, "", nil
 }
 
 func (s *Service) resumePosition(ctx context.Context, episode Episode) float64 {

@@ -177,11 +177,11 @@ func TestVibeProxyRewritesPlaylistAndStripsSegmentWrapper(t *testing.T) {
 
 	client := NewClientWithBaseURL(server.Client(), server.URL)
 	defer client.Close()
-	proxy, err := client.vibeProxy()
+	proxy, err := client.vibeProxy(t.Context())
 	if err != nil {
 		t.Fatalf("vibeProxy() error = %v", err)
 	}
-	masterURL, err := proxy.register(server.URL+"/media/master.m3u8", server.URL+"/embed/vibe")
+	masterURL, err := proxy.register(t.Context(), server.URL+"/media/master.m3u8", server.URL+"/embed/vibe")
 	if err != nil {
 		t.Fatalf("register() error = %v", err)
 	}

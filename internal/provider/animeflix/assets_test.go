@@ -13,7 +13,7 @@ func TestPublishServesImmutableAssets(t *testing.T) {
 	t.Cleanup(c.Close)
 	master := []byte("#EXTM3U\nhttps://origin.example/video.m3u8\n")
 	subtitle := []byte("WEBVTT\n\n00:00.000 --> 00:01.000\nHello\n")
-	masterURL, subtitleURL, err := c.publish(master, subtitle)
+	masterURL, subtitleURL, err := c.publish(t.Context(), master, subtitle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestPublishServesImmutableAssets(t *testing.T) {
 func TestAssetsRejectInvalidRequestsAndMissingSubtitle(t *testing.T) {
 	c := NewClient(nil)
 	t.Cleanup(c.Close)
-	masterURL, subtitleURL, err := c.publish([]byte("master"), nil)
+	masterURL, subtitleURL, err := c.publish(t.Context(), []byte("master"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestAssetsConcurrentUseAndBound(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 8; j++ {
-				masterURL, _, err := c.publish([]byte("master"), []byte("sub"))
+				masterURL, _, err := c.publish(t.Context(), []byte("master"), []byte("sub"))
 				if err != nil {
 					t.Errorf("publish: %v", err)
 					return
@@ -112,12 +112,12 @@ func TestAssetsConcurrentUseAndBound(t *testing.T) {
 	if count > maxAssetEntries {
 		t.Fatalf("asset count = %d, want <= %d", count, maxAssetEntries)
 	}
-	firstURL, _, err := c.publish([]byte("first"), nil)
+	firstURL, _, err := c.publish(t.Context(), []byte("first"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < maxAssetEntries; i++ {
-		if _, _, err := c.publish([]byte("next"), nil); err != nil {
+		if _, _, err := c.publish(t.Context(), []byte("next"), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -135,12 +135,12 @@ func TestAssetsConcurrentUseAndBound(t *testing.T) {
 func TestCloseIsIdempotentAndPreventsReopen(t *testing.T) {
 	c := NewClient(nil)
 	t.Cleanup(c.Close)
-	if _, _, err := c.publish([]byte("master"), nil); err != nil {
+	if _, _, err := c.publish(t.Context(), []byte("master"), nil); err != nil {
 		t.Fatal(err)
 	}
 	c.Close()
 	c.Close()
-	if _, _, err := c.publish([]byte("master"), nil); err == nil {
+	if _, _, err := c.publish(t.Context(), []byte("master"), nil); err == nil {
 		t.Fatal("publish after Close succeeded")
 	}
 }

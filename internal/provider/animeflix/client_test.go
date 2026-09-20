@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"tarragon-anime/internal/provider"
+	"tarragon-anime/internal/streamlog"
 )
 
 type rerouteTransport struct {
@@ -56,8 +58,8 @@ func (t *rerouteTransport) records() []requestRecord {
 
 func TestStreamsResolvesRealMyStreamURLsWithScopedCookiesAndFallback(t *testing.T) {
 	const (
-		first  = "https://as-cdn1.top/video/0123456789abcdef0123456789abcdef"
-		second = "https://as-cdn2.top/video/fedcba9876543210fedcba9876543210"
+		first  = "https://as-cdn1.top/video/0123456789abcdef0123456789abcdef?token=first-secret"
+		second = "https://as-cdn2.top/video/fedcba9876543210fedcba9876543210?token=second-secret"
 	)
 	var gotMu sync.Mutex
 	var requests []requestRecord
@@ -70,18 +72,18 @@ func TestStreamsResolvesRealMyStreamURLsWithScopedCookiesAndFallback(t *testing.
 		gotMu.Unlock()
 		switch {
 		case r.URL.Path == "/api/v1/server/episode" && r.Method == http.MethodGet:
-			io.WriteString(w, `{"success":true,"data":{"sub":[{"url":"`+first+`"},{"url":"https://abyss.example/video/x"},{"url":"https://as-cdn3.top.evil/video/0123456789abcdef0123456789abcdef"},{"url":"https://user@as-cdn4.top/video/0123456789abcdef0123456789abcdef"},{"url":"http://as-cdn5.top/video/0123456789abcdef0123456789abcdef"}],"dub":[{"url":"`+second+`"}]}}`)
+			io.WriteString(w, `{"success":true,"data":{"sub":[{"url":"`+first+`"},{"url":"`+first+`"},{"url":"https://abyss.example/video/x"},{"url":"https://abyss.example/video/x"},{"url":"https://as-cdn3.top.evil/video/0123456789abcdef0123456789abcdef"},{"url":"https://user@as-cdn4.top/video/0123456789abcdef0123456789abcdef"},{"url":"http://as-cdn5.top/video/0123456789abcdef0123456789abcdef"}],"dub":[{"url":"`+second+`"},{"url":"https://as-cdn6.top/video/never-attempted"},{"url":"https://abyss.example/never-attempted"}]}}`)
 		case r.URL.Path == "/video/0123456789abcdef0123456789abcdef":
-			http.SetCookie(w, &http.Cookie{Name: "session", Value: "first", Path: "/"})
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: "cookie-secret", Path: "/"})
 			io.WriteString(w, `<html>playerjsSubtitle="[English]subs.jpg"</html>`)
 		case r.URL.Path == "/video/fedcba9876543210fedcba9876543210":
 			io.WriteString(w, `<html>playerjsSubtitle="[English]subs.jpg"</html>`)
 		case r.URL.Path == "/player/index.php":
 			if r.FormValue("hash") == "0123456789abcdef0123456789abcdef" {
-				if r.Header.Get("Cookie") != "session=first" {
+				if r.Header.Get("Cookie") != "session=cookie-secret" {
 					t.Errorf("first POST did not receive player cookie: %q", r.Header.Get("Cookie"))
 				}
-				http.Error(w, "first source failed", http.StatusBadGateway)
+				http.Error(w, "upstream-secret Authorization: Bearer header-secret "+first, http.StatusBadGateway)
 			} else {
 				if r.Header.Get("Cookie") != "" {
 					t.Errorf("fallback POST leaked cookie: %q", r.Header.Get("Cookie"))
@@ -113,12 +115,45 @@ func TestStreamsResolvesRealMyStreamURLsWithScopedCookiesAndFallback(t *testing.
 	httpClient.Jar = jar
 	c := NewClientWithEndpoints(httpClient, "https://animesalt.backendapia.workers.dev/api/v1", "https://animesalt.cx")
 	t.Cleanup(c.Close)
-	streams, err := c.Streams(context.Background(), provider.Episode{ShowID: "show", Number: 1, Value: "episode"}, "sub", "best")
+	var logs bytes.Buffer
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ctx = streamlog.WithProvider(streamlog.WithResolution(ctx, log.New(&logs, "", 0), 123, 1, "sub"), "animeflix")
+	streams, err := c.Streams(ctx, provider.Episode{ShowID: "show", Number: 1, Value: "episode"}, "sub", "best")
 	if err != nil || len(streams) != 1 {
 		t.Fatalf("Streams() = %#v, %v", streams, err)
 	}
 	if streams[0].Subtitle == "" || streams[0].Headers["Referer"] != second {
 		t.Fatalf("stream = %#v, want local subtitles and second player referer", streams[0])
+	}
+	cancel()
+	if streams[0].Source != "mystream-6" {
+		t.Fatalf("Source = %q", streams[0].Source)
+	}
+	for source, outcome := range map[string]string{
+		"mystream-1": "failed reason=resolution_failed",
+		"source-2":   "unavailable reason=unsupported_source",
+		"source-3":   "unavailable reason=unsupported_source",
+		"source-4":   "unavailable reason=unsupported_source",
+		"source-5":   "unavailable reason=unsupported_source",
+		"mystream-6": "resolved reason=-",
+	} {
+		prefix := "provider=animeflix source=" + source + " stage=resolve status="
+		if strings.Count(logs.String(), prefix+"started ") != 1 || strings.Count(logs.String(), prefix+outcome+" ") != 1 {
+			t.Fatalf("missing or duplicate outcome for %s: %s", source, logs.String())
+		}
+	}
+	if strings.Count(logs.String(), "stream_attempt ") != 12 {
+		t.Fatalf("unexpected attempts: %s", logs.String())
+	}
+	for _, secret := range []string{first, second, "https://", "http://", "first-secret", "second-secret", "cookie-secret", "upstream-secret", "header-secret", "sig=", "token=", userAgent} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("logs contain secret %q: %s", secret, logs.String())
+		}
+	}
+	repeated, err := c.Streams(t.Context(), provider.Episode{ShowID: "show", Number: 1, Value: "episode"}, "sub", "best")
+	if err != nil || len(repeated) != 1 || repeated[0].Source != streams[0].Source {
+		t.Fatalf("unstable winning Source: %#v, %v", repeated, err)
 	}
 	for _, assetURL := range []string{streams[0].URL, streams[0].Subtitle} {
 		response, getErr := http.Get(assetURL)
@@ -158,7 +193,7 @@ func TestStreamsResolvesRealMyStreamURLsWithScopedCookiesAndFallback(t *testing.
 	if !sawAPI || !sawPost || !sawMaster || !sawSubtitle {
 		t.Fatalf("request properties API=%v POST=%v master=%v subtitle=%v; requests=%#v", sawAPI, sawPost, sawMaster, sawSubtitle, requests)
 	}
-	for _, rejected := range []string{"abyss.example", "as-cdn3.top.evil", "as-cdn4.top", "as-cdn5.top"} {
+	for _, rejected := range []string{"abyss.example", "as-cdn3.top.evil", "as-cdn4.top", "as-cdn5.top", "never-attempted"} {
 		for _, request := range requests {
 			if strings.Contains(request.url, rejected) {
 				t.Fatalf("unsupported source %q was requested: %s", rejected, request.url)
@@ -298,8 +333,17 @@ func TestStreamsRejectsUnverifiedPlayerResults(t *testing.T) {
 			base, _ := url.Parse(server.URL)
 			c := NewClientWithEndpoints(&http.Client{Transport: &rerouteTransport{base: base}}, server.URL+"/api/v1", "https://animeflix.com.ru")
 			t.Cleanup(c.Close)
-			if _, err := c.Streams(context.Background(), provider.Episode{ShowID: "s", Number: 1, Value: "e"}, "sub", ""); err == nil {
+			var logs bytes.Buffer
+			ctx := streamlog.WithProvider(streamlog.WithResolution(t.Context(), log.New(&logs, "", 0), 123, 1, "sub"), "animeflix")
+			if _, err := c.Streams(ctx, provider.Episode{ShowID: "s", Number: 1, Value: "e"}, "sub", ""); err == nil {
 				t.Fatal("Streams accepted an unverified result")
+			}
+			outcome := "failed reason=resolution_failed"
+			if name == "missing English subtitle" {
+				outcome = "unavailable reason=missing_subtitles"
+			}
+			if strings.Count(logs.String(), "stream_attempt ") != 2 || !strings.Contains(logs.String(), "status="+outcome+" ") {
+				t.Fatalf("unexpected rejection outcome: %s", logs.String())
 			}
 		})
 	}

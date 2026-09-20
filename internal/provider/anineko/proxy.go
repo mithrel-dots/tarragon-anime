@@ -38,9 +38,12 @@ type vibeProxy struct {
 	sessions map[string]*vibeSession
 }
 
-func (c *Client) vibeProxy() (*vibeProxy, error) {
+func (c *Client) vibeProxy(ctx context.Context) (*vibeProxy, error) {
 	c.proxyMu.Lock()
 	defer c.proxyMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.proxy != nil {
 		return c.proxy, nil
 	}
@@ -69,20 +72,25 @@ func (p *vibeProxy) close() {
 	}
 }
 
-func (p *vibeProxy) register(masterURL, referer string) (string, error) {
+// The lookup context gates registration; playback uses each HTTP request's
+// context instead, so selecting a winner can safely cancel the lookup.
+func (p *vibeProxy) register(ctx context.Context, masterURL, referer string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	var rawID [8]byte
 	if _, err := rand.Read(rawID[:]); err != nil {
 		return "", err
 	}
 	id := hex.EncodeToString(rawID[:])
-	p.mu.Lock()
 	p.sessions[id] = &vibeSession{
 		masterURL: masterURL,
 		referer:   referer,
 		variants:  map[string]string{},
 		segments:  map[string][]vibeSegment{},
 	}
-	p.mu.Unlock()
 	return p.baseURL + "/stream/" + id + "/master.m3u8", nil
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/go-rod/rod/lib/launcher"
 
 	"tarragon-anime/internal/provider"
+	"tarragon-anime/internal/streamlog"
 )
 
 const (
@@ -217,6 +218,9 @@ func (c *Client) Episodes(ctx context.Context, anime provider.Anime, _ string) (
 }
 
 func (c *Client) Streams(ctx context.Context, episode provider.Episode, translation, quality string) ([]provider.Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	ref := parseAnimeID(episode.ShowID)
 	if ref.session == "" {
 		return nil, fmt.Errorf("AnimePahe provider id %q is missing a session id", episode.ShowID)
@@ -232,18 +236,38 @@ func (c *Client) Streams(ctx context.Context, episode provider.Episode, translat
 	if len(links) == 0 {
 		return nil, fmt.Errorf("AnimePahe returned no %s streams for episode %d", translation, episode.Number)
 	}
-	var result []provider.Stream
+	seen := make(map[string]bool)
 	for _, link := range links {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if seen[link] {
+			continue
+		}
+		seen[link] = true
+		if !isKwikURL(link) {
+			finish := streamlog.Start(ctx, fmt.Sprintf("source-%d", len(seen)), "resolve")
+			finish("unavailable", "unsupported_source")
+			continue
+		}
+		id := fmt.Sprintf("kwik-%d", len(seen))
+		finish := streamlog.Start(ctx, id, "resolve")
 		streamURL, err := c.extractKwik(ctx, link)
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		finish(streamlog.Outcome(ctx, err))
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if err == nil {
-			result = append(result, provider.Stream{URL: streamURL, Headers: map[string]string{"Referer": kwikOrigin(link)}})
-			break
+			return []provider.Stream{{URL: streamURL, Headers: map[string]string{"Referer": kwikOrigin(link)}, Source: id}}, nil
 		}
 	}
-	if len(result) == 0 {
-		return nil, fmt.Errorf("extract AnimePahe streams from Kwik")
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return result, nil
+	return nil, fmt.Errorf("extract AnimePahe streams from Kwik")
 }
 
 type playerLink struct {
@@ -258,7 +282,9 @@ func parsePlayerLinks(html, translation, quality string) []string {
 		for _, match := range attrRE.FindAllStringSubmatch(button, -1) {
 			attributes[strings.ToLower(match[1])] = match[2]
 		}
-		if !isKwikURL(attributes["data-src"]) {
+		// Keep unsupported URLs in preference order so Streams can log their
+		// rejection without fetching them or reporting alternatives after a win.
+		if strings.TrimSpace(attributes["data-src"]) == "" {
 			continue
 		}
 		item := playerLink{url: attributes["data-src"]}
@@ -317,6 +343,9 @@ func (c *Client) extractKwik(ctx context.Context, link string) (string, error) {
 		return "", err
 	}
 	for _, match := range packerRE.FindAllStringSubmatch(string(body), -1) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		base, _ := strconv.Atoi(match[2])
 		count, _ := strconv.Atoi(match[3])
 		words := strings.Split(match[4], "|")
@@ -368,6 +397,9 @@ func unpackPacker(value string, base, count int, words []string) string {
 
 func (c *Client) get(ctx context.Context, endpoint string, page bool) ([]byte, error) {
 	for attempt := 0; attempt < 2; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
@@ -388,6 +420,9 @@ func (c *Client) get(ctx context.Context, endpoint string, page bool) ([]byte, e
 		resp.Body.Close()
 		if readErr != nil {
 			return nil, readErr
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if isChallenge(resp, body) {
 			if attempt == 1 {
@@ -413,6 +448,9 @@ func (c *Client) bypass(ctx context.Context, endpoint string) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.solver == nil {
 		return fmt.Errorf("AnimePahe Cloudflare/DDoS challenge requires browser clearance")
 	}
@@ -425,6 +463,9 @@ func (c *Client) bypass(ctx context.Context, endpoint string) error {
 	if err != nil {
 		return fmt.Errorf("solve AnimePahe browser challenge: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(cookies) == 0 {
 		return fmt.Errorf("solve AnimePahe browser challenge: no clearance cookies returned")
 	}
@@ -433,6 +474,9 @@ func (c *Client) bypass(ctx context.Context, endpoint string) error {
 }
 
 func solveChallenge(ctx context.Context, baseURL string) ([]*http.Cookie, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var result []*http.Cookie
 	ctx, cancel := context.WithTimeout(ctx, challengeTimeout)
 	defer cancel()

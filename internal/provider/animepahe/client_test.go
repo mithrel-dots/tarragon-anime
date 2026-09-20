@@ -54,7 +54,7 @@ func TestParsePlayerLinks(t *testing.T) {
 <button data-src="https://kwik.si/e/dub-720" data-resolution="720" data-audio="eng">
 <button data-src="https://example.test/e/not-a-stream" data-resolution="2160" data-audio="jpn">`
 	if got := parsePlayerLinks(html, "sub", "best"); !reflect.DeepEqual(got, []string{
-		"https://kwik.cx/e/sub-1080", "https://kwik.cx/e/sub-480",
+		"https://example.test/e/not-a-stream", "https://kwik.cx/e/sub-1080", "https://kwik.cx/e/sub-480",
 	}) {
 		t.Fatalf("sub links = %#v", got)
 	}
@@ -62,7 +62,7 @@ func TestParsePlayerLinks(t *testing.T) {
 		t.Fatalf("dub links = %#v", got)
 	}
 	if got := parsePlayerLinks(html, "sub", "worst"); !reflect.DeepEqual(got, []string{
-		"https://kwik.cx/e/sub-480", "https://kwik.cx/e/sub-1080",
+		"https://kwik.cx/e/sub-480", "https://kwik.cx/e/sub-1080", "https://example.test/e/not-a-stream",
 	}) {
 		t.Fatalf("worst sub links = %#v", got)
 	}

@@ -13,6 +13,11 @@ build_dependencies = ["go", "mpv", "chromium"]
 
 # Runtime browser configuration belongs in $XDG_CONFIG_HOME/tarragon/anime.toml
 # (default: ~/.config/tarragon/anime.toml), NOT in this plugin manifest.
+# Configured providers race for streams, with at most four lookups active across
+# playback and prefetch. The first valid result wins, not the first listed provider.
+# Losing attempts are cancelled; browser captures still respect max_sessions.
+# Provider and source outcomes are logged with a shared resolution ID, elapsed
+# time and reason codes. Source IDs are safe ordinals, not signed playback URLs.
 # The commented example below shows the defaults; missing files and omitted
 # settings use these values. Empty binary/profile_dir select Chromium from PATH
 # and $XDG_STATE_HOME/tarragon/anime/browser (default:
