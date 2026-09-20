@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"tarragon-anime/internal/anilist"
 	"tarragon-anime/internal/aniskip"
 	"tarragon-anime/internal/mpv"
 	"tarragon-anime/internal/provider"
@@ -642,7 +643,7 @@ func TestPlaybackAutoNextFailureLeavesMPVOpen(t *testing.T) {
 }
 
 func TestPlaybackAutoNextLastEpisodeLeavesMPVOpen(t *testing.T) {
-	client := &cachingAniList{}
+	client := &cachingAniList{media: &anilist.Media{ID: 154587, Title: "Frieren", Episodes: 28, AiredEpisodes: 1}}
 	session := newFakeSession()
 	provider := &autoNextProvider{episodes: []int{1}}
 	config := DefaultConfig()

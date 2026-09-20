@@ -354,6 +354,7 @@ func (s *Service) cacheMedia(ctx context.Context, item anilist.Media) Media {
 	if s.state != nil {
 		if err := s.state.SaveMedia(ctx, store.MediaInfo{
 			ID: media.ID, Title: media.Title, PreviewPath: media.CoverURL, Episodes: media.Episodes,
+			AiredEpisodes: item.AiredEpisodes,
 		}); err != nil {
 			s.logger.Printf("save media media_id=%d: %v", media.ID, err)
 		}
@@ -387,7 +388,7 @@ func (s *Service) ContinueWatching(ctx context.Context, limit int) ([]Resume, er
 
 // ResumeMedia continues an anime from the last watched episode.
 func (s *Service) ResumeMedia(ctx context.Context, mediaID int) error {
-	episodes, err := s.availableEpisodes(ctx, mediaID)
+	episodes, err := s.Episodes(ctx, mediaID)
 	if err != nil {
 		return err
 	}
@@ -415,36 +416,61 @@ func (s *Service) ResumeMedia(ctx context.Context, mediaID int) error {
 }
 
 func (s *Service) Episodes(ctx context.Context, mediaID int) ([]Episode, error) {
-	media, err := s.mediaFor(ctx, mediaID)
+	// Refresh airing metadata on each listing so a long-running plugin sees new releases.
+	var media anilist.Media
+	var err error
+	if s.anilist != nil {
+		media, err = s.anilist.Get(ctx, mediaID)
+	} else {
+		err = fmt.Errorf("AniList client is unavailable")
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
 	if err != nil {
-		return nil, err
-	}
-	var failures []string
-	for _, name := range s.providerNames() {
-		if s.providers[name] == nil {
-			failures = append(failures, name+": unavailable")
-			continue
+		s.cacheMu.RLock()
+		cached, found := s.media[mediaID]
+		s.cacheMu.RUnlock()
+		if !found {
+			cached, found, _ = s.cachedMedia(ctx, mediaID)
 		}
-		result, err := s.providerEpisodes(ctx, media, name)
-		if err != nil {
-			failures = append(failures, name+": "+err.Error())
-			s.logger.Printf("provider episodes failed provider=%s media_id=%d: %v", name, mediaID, err)
-			continue
+		if !found {
+			return nil, err
 		}
-		s.logger.Printf("provider episodes provider=%s media_id=%d count=%d", name, mediaID, len(result))
-		s.cacheMu.Lock()
-		s.episodes[mediaID] = append([]Episode(nil), result...)
-		s.cacheMu.Unlock()
-		return result, nil
+		s.logger.Printf("AniList episodes unavailable, using cached media media_id=%d: %v", mediaID, err)
+		media = cached
+	} else if s.state != nil {
+		// Keep an existing local preview; listing episodes must not download artwork.
+		cached, _, _ := s.state.CachedMedia(ctx, mediaID)
+		cached.ID, cached.Title = mediaID, media.Title
+		cached.Episodes, cached.AiredEpisodes = media.Episodes, media.AiredEpisodes
+		if err := s.state.SaveMedia(ctx, cached); err != nil {
+			s.logger.Printf("save episode metadata media_id=%d: %v", mediaID, err)
+		}
 	}
-	if len(failures) == 0 {
-		return nil, fmt.Errorf("no providers configured for AniList %d", mediaID)
+	s.cacheMu.Lock()
+	s.media[mediaID] = media
+	delete(s.episodes, mediaID)
+	s.cacheMu.Unlock()
+	if media.AiredEpisodes < 0 {
+		return nil, fmt.Errorf("AniList has no aired episode count for %s; try again when its metadata is available", media.Title)
 	}
-	return nil, fmt.Errorf("resolve episodes for AniList %d: %s", mediaID, strings.Join(failures, "; "))
+	result := make([]Episode, 0, media.AiredEpisodes)
+	for number := 1; number <= media.AiredEpisodes; number++ {
+		result = append(result, Episode{
+			MediaID: mediaID, Number: number,
+			Title: fmt.Sprintf("%s - Episode %d", media.Title, number),
+		})
+	}
+	s.cacheMu.Lock()
+	s.episodes[mediaID] = append([]Episode(nil), result...)
+	s.cacheMu.Unlock()
+	s.logger.Printf("AniList episodes media_id=%d count=%d", mediaID, len(result))
+	return result, nil
 }
 
 func (s *Service) Play(ctx context.Context, mediaID, episodeNumber int) error {
-	episodes, err := s.availableEpisodes(ctx, mediaID)
+	episodes, err := s.Episodes(ctx, mediaID)
 	if err != nil {
 		return err
 	}
@@ -457,8 +483,8 @@ func (s *Service) Play(ctx context.Context, mediaID, episodeNumber int) error {
 }
 
 func (s *Service) PlayEpisode(ctx context.Context, episode Episode) error {
-	if episode.Provider == "" || episode.ProviderID == "" {
-		return fmt.Errorf("invalid provider context for %s", episode.ResultID())
+	if episode.MediaID <= 0 || episode.Number <= 0 {
+		return fmt.Errorf("invalid episode %s", episode.ResultID())
 	}
 	episodes, err := s.availableEpisodes(ctx, episode.MediaID)
 	if err != nil {
@@ -1080,6 +1106,9 @@ func (s *Service) invalidateStreams(episode Episode) {
 func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Stream, Episode, error) {
 	var failures []string
 	for _, name := range s.providerNames() {
+		if err := ctx.Err(); err != nil {
+			return mpv.Stream{}, episode, err
+		}
 		if s.providers[name] == nil {
 			continue
 		}
@@ -1315,5 +1344,6 @@ func mediaFromAniList(item anilist.Media) Media {
 func mediaFromStore(item store.MediaInfo) anilist.Media {
 	return anilist.Media{
 		ID: item.ID, Title: item.Title, Episodes: item.Episodes, CoverURL: item.PreviewPath,
+		AiredEpisodes: item.AiredEpisodes,
 	}
 }

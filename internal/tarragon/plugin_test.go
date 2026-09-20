@@ -69,7 +69,7 @@ func (f *fakeAnimeService) Search(context.Context, string) ([]anime.Media, error
 }
 
 func (f *fakeAnimeService) Episodes(context.Context, int) ([]anime.Episode, error) {
-	return []anime.Episode{{MediaID: 154587, Number: 4, Title: "Frieren - Episode 4", Provider: "allanime", ProviderID: "show-1"}}, nil
+	return []anime.Episode{{MediaID: 154587, Number: 4, Title: "Frieren - Episode 4"}}, nil
 }
 
 func (f *fakeAnimeService) Play(context.Context, int, int) error { return nil }

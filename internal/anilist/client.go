@@ -21,16 +21,17 @@ type Client struct {
 }
 
 type Media struct {
-	ID       int
-	IDMal    int
-	Title    string
-	English  string
-	Romaji   string
-	Native   string
-	Synonyms []string
-	Format   string
-	Episodes int
-	CoverURL string
+	ID            int
+	IDMal         int
+	Title         string
+	English       string
+	Romaji        string
+	Native        string
+	Synonyms      []string
+	Format        string
+	Episodes      int // Total planned episodes; zero means unknown.
+	AiredEpisodes int // -1 means unknown; zero means confirmed no aired episodes.
+	CoverURL      string
 }
 
 func NewClient(httpClient *http.Client) *Client {
@@ -90,7 +91,7 @@ type Viewer struct {
 	Name string
 }
 
-const mediaFields = `_id: id idMal title { romaji english native } synonyms format episodes coverImage { large }`
+const mediaFields = `_id: id idMal title { romaji english native } synonyms format episodes status nextAiringEpisode { episode } coverImage { large }`
 
 func (c *Client) Search(ctx context.Context, query string) ([]Media, error) {
 	const gql = `query ($search: String!) { Page(page: 1, perPage: 20) { media(search: $search, type: ANIME, isAdult: false, sort: SEARCH_MATCH) { ` + mediaFields + ` } } }`
@@ -104,15 +105,20 @@ func (c *Client) Search(ctx context.Context, query string) ([]Media, error) {
 	}
 	media := make([]Media, 0, len(response.Page.Media))
 	for _, item := range response.Page.Media {
-		media = append(media, item.toMedia())
+		media = append(media, item.toMedia(0))
 	}
 	return media, nil
 }
 
 func (c *Client) Get(ctx context.Context, id int) (Media, error) {
-	const gql = `query ($id: Int!) { Media(id: $id, type: ANIME) { ` + mediaFields + ` } }`
+	const gql = `query ($id: Int!) { Media(id: $id, type: ANIME) { ` + mediaFields + ` } Page(page: 1, perPage: 1) { airingSchedules(mediaId: $id, notYetAired: false, sort: EPISODE_DESC) { episode } } }`
 	var response struct {
 		Media *mediaResponse `json:"Media"`
+		Page  struct {
+			AiringSchedules []struct {
+				Episode int `json:"episode"`
+			} `json:"airingSchedules"`
+		} `json:"Page"`
 	}
 	if err := c.do(ctx, gql, map[string]any{"id": id}, &response); err != nil {
 		return Media{}, fmt.Errorf("get AniList media %d: %w", id, err)
@@ -120,7 +126,13 @@ func (c *Client) Get(ctx context.Context, id int) (Media, error) {
 	if response.Media == nil {
 		return Media{}, fmt.Errorf("get AniList media %d: not found", id)
 	}
-	return response.Media.toMedia(), nil
+	latestAiredEpisode := 0
+	for _, schedule := range response.Page.AiringSchedules {
+		if schedule.Episode > latestAiredEpisode {
+			latestAiredEpisode = schedule.Episode
+		}
+	}
+	return response.Media.toMedia(latestAiredEpisode), nil
 }
 
 func (c *Client) Viewer(ctx context.Context) (Viewer, error) {
@@ -186,7 +198,7 @@ func (c *Client) List(ctx context.Context, userID int, status string) ([]ListIte
 	var items []ListItem
 	for _, list := range response.Collection.Lists {
 		for _, entry := range list.Entries {
-			items = append(items, ListItem{Media: entry.Media.toMedia(), Status: entry.Status, Progress: entry.Progress})
+			items = append(items, ListItem{Media: entry.Media.toMedia(0), Status: entry.Status, Progress: entry.Progress})
 		}
 	}
 	return items, nil
@@ -212,15 +224,19 @@ type mediaResponse struct {
 		English string `json:"english"`
 		Native  string `json:"native"`
 	} `json:"title"`
-	Synonyms []string `json:"synonyms"`
-	Format   string   `json:"format"`
-	Episodes int      `json:"episodes"`
-	Cover    struct {
+	Synonyms          []string `json:"synonyms"`
+	Format            string   `json:"format"`
+	Episodes          int      `json:"episodes"`
+	Status            string   `json:"status"`
+	NextAiringEpisode struct {
+		Episode int `json:"episode"`
+	} `json:"nextAiringEpisode"`
+	Cover struct {
 		Large string `json:"large"`
 	} `json:"coverImage"`
 }
 
-func (m mediaResponse) toMedia() Media {
+func (m mediaResponse) toMedia(latestAiredEpisode int) Media {
 	title := m.Title.English
 	if title == "" {
 		title = m.Title.Romaji
@@ -228,10 +244,28 @@ func (m mediaResponse) toMedia() Media {
 	if title == "" {
 		title = m.Title.Native
 	}
+	airedEpisodes := -1
+	switch {
+	case m.Status == "NOT_YET_RELEASED":
+		airedEpisodes = 0
+	case m.Status == "FINISHED" && m.Episodes > 0:
+		airedEpisodes = m.Episodes
+	default:
+		if latestAiredEpisode > 0 {
+			airedEpisodes = latestAiredEpisode
+		}
+		// Past schedules take precedence over the estimate from the next episode.
+		if airedEpisodes < 0 && m.Status != "FINISHED" && m.NextAiringEpisode.Episode > 0 {
+			airedEpisodes = m.NextAiringEpisode.Episode - 1
+		}
+	}
+	if m.Episodes > 0 && airedEpisodes > m.Episodes {
+		airedEpisodes = m.Episodes
+	}
 	return Media{
 		ID: m.ID, IDMal: m.IDMal, Title: title, English: m.Title.English, Romaji: m.Title.Romaji,
 		Native: m.Title.Native, Synonyms: m.Synonyms, Format: m.Format,
-		Episodes: m.Episodes, CoverURL: m.Cover.Large,
+		Episodes: m.Episodes, AiredEpisodes: airedEpisodes, CoverURL: m.Cover.Large,
 	}
 }
 

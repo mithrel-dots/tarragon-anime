@@ -18,7 +18,7 @@ type Store struct {
 	db *sql.DB
 }
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 type columnShape struct {
 	name         string
@@ -69,10 +69,11 @@ type Progress struct {
 }
 
 type MediaInfo struct {
-	ID          int
-	Title       string
-	PreviewPath string
-	Episodes    int
+	ID            int
+	Title         string
+	PreviewPath   string
+	Episodes      int
+	AiredEpisodes int // -1 means unknown; 0 means no episodes have aired.
 }
 
 type ResumeEntry struct {
@@ -216,14 +217,15 @@ func (s *Store) SaveProgress(ctx context.Context, progress Progress) error {
 
 func (s *Store) SaveMedia(ctx context.Context, media MediaInfo) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO media (anilist_id, title, preview_path, episodes, updated_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO media (anilist_id, title, preview_path, episodes, aired_episodes, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(anilist_id) DO UPDATE SET
 			title = excluded.title,
 			preview_path = excluded.preview_path,
 			episodes = excluded.episodes,
+			aired_episodes = excluded.aired_episodes,
 			updated_at = excluded.updated_at`,
-		media.ID, media.Title, media.PreviewPath, media.Episodes, time.Now().Unix(),
+		media.ID, media.Title, media.PreviewPath, media.Episodes, media.AiredEpisodes, time.Now().Unix(),
 	)
 	if err != nil {
 		return fmt.Errorf("save media %d: %w", media.ID, err)
@@ -234,9 +236,9 @@ func (s *Store) SaveMedia(ctx context.Context, media MediaInfo) error {
 func (s *Store) CachedMedia(ctx context.Context, mediaID int) (MediaInfo, bool, error) {
 	var media MediaInfo
 	err := s.db.QueryRowContext(ctx, `
-		SELECT anilist_id, title, preview_path, episodes
+		SELECT anilist_id, title, preview_path, episodes, aired_episodes
 		FROM media WHERE anilist_id = ?`, mediaID).Scan(
-		&media.ID, &media.Title, &media.PreviewPath, &media.Episodes,
+		&media.ID, &media.Title, &media.PreviewPath, &media.Episodes, &media.AiredEpisodes,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return MediaInfo{}, false, nil
@@ -249,7 +251,7 @@ func (s *Store) CachedMedia(ctx context.Context, mediaID int) (MediaInfo, bool, 
 
 func (s *Store) SearchMedia(ctx context.Context, query string) ([]MediaInfo, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT anilist_id, title, preview_path, episodes
+		SELECT anilist_id, title, preview_path, episodes, aired_episodes
 		FROM media WHERE lower(title) LIKE '%' || lower(?) || '%'
 		ORDER BY updated_at DESC`, query)
 	if err != nil {
@@ -259,7 +261,7 @@ func (s *Store) SearchMedia(ctx context.Context, query string) ([]MediaInfo, err
 	var result []MediaInfo
 	for rows.Next() {
 		var media MediaInfo
-		if err := rows.Scan(&media.ID, &media.Title, &media.PreviewPath, &media.Episodes); err != nil {
+		if err := rows.Scan(&media.ID, &media.Title, &media.PreviewPath, &media.Episodes, &media.AiredEpisodes); err != nil {
 			return nil, fmt.Errorf("scan cached media: %w", err)
 		}
 		result = append(result, media)
@@ -476,6 +478,10 @@ func (s *Store) migrate(ctx context.Context) error {
 				)`,
 				`INSERT INTO progress_write_sequence (id, value)
 				 SELECT 1, COALESCE(MAX(write_seq), 0) FROM watch_progress`,
+			}
+		case 4:
+			statements = []string{
+				`ALTER TABLE media ADD COLUMN aired_episodes INTEGER NOT NULL DEFAULT -1`,
 			}
 		default:
 			return fmt.Errorf("no migration for SQLite schema version %d", target)

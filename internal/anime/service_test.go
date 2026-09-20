@@ -3,6 +3,7 @@ package anime
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"tarragon-anime/internal/anilist"
@@ -14,6 +15,7 @@ import (
 
 type cachingAniList struct {
 	getCalls int
+	media    *anilist.Media
 }
 
 type invalidationCall struct {
@@ -88,12 +90,15 @@ func (offlineAniList) Get(context.Context, int) (anilist.Media, error) {
 }
 
 func (c *cachingAniList) Search(context.Context, string) ([]anilist.Media, error) {
-	return []anilist.Media{{ID: 154587, IDMal: 52991, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}}, nil
+	return []anilist.Media{{ID: 154587, IDMal: 52991, Title: "Frieren", English: "Frieren", Episodes: 28, AiredEpisodes: 28, CoverURL: "https://image.test/cover.jpg"}}, nil
 }
 
 func (c *cachingAniList) Get(context.Context, int) (anilist.Media, error) {
 	c.getCalls++
-	return anilist.Media{ID: 154587, IDMal: 52991, Title: "Frieren", English: "Frieren", Episodes: 28, CoverURL: "https://image.test/cover.jpg"}, nil
+	if c.media != nil {
+		return *c.media, nil
+	}
+	return anilist.Media{ID: 154587, IDMal: 52991, Title: "Frieren", English: "Frieren", Episodes: 28, AiredEpisodes: 28, CoverURL: "https://image.test/cover.jpg"}, nil
 }
 
 type cachingProvider struct{}
@@ -122,7 +127,7 @@ func (fakePreviewCache) Get(context.Context, int, string) (string, error) {
 	return "/tmp/tarragon-anime-cover.jpg", nil
 }
 
-func TestEpisodesUsesMediaCachedBySearch(t *testing.T) {
+func TestEpisodesRefreshesMediaCachedBySearch(t *testing.T) {
 	client := &cachingAniList{}
 	service := NewService(client, cachingProvider{}, unusedPlayer{}, nil, nil, nil, DefaultConfig(), nil)
 	if _, err := service.Search(t.Context(), "frieren"); err != nil {
@@ -131,8 +136,47 @@ func TestEpisodesUsesMediaCachedBySearch(t *testing.T) {
 	if _, err := service.Episodes(t.Context(), 154587); err != nil {
 		t.Fatal(err)
 	}
-	if client.getCalls != 0 {
-		t.Fatalf("AniList Get() calls = %d, want 0", client.getCalls)
+	if client.getCalls != 1 {
+		t.Fatalf("AniList Get() calls = %d, want 1", client.getCalls)
+	}
+}
+
+func TestEpisodesCachesAiredCountForOfflineListing(t *testing.T) {
+	state := newMemoryState()
+	if err := state.SaveMedia(t.Context(), store.MediaInfo{
+		ID: 182205, Title: "Slime Season 4", PreviewPath: "/tmp/slime.jpg", Episodes: 24, AiredEpisodes: -1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	metadata := &cachingAniList{media: &anilist.Media{ID: 182205, Title: "Slime Season 4", Episodes: 24, AiredEpisodes: 23}}
+	service := NewServiceWithProviders(metadata, nil, unusedPlayer{}, state, nil, nil, DefaultConfig(), nil)
+	defer service.Close()
+	if _, err := service.Episodes(t.Context(), 182205); err != nil {
+		t.Fatal(err)
+	}
+	cached, found, err := state.CachedMedia(t.Context(), 182205)
+	if err != nil || !found || cached.AiredEpisodes != 23 || cached.Episodes != 24 || cached.PreviewPath != "/tmp/slime.jpg" {
+		t.Fatalf("cached metadata = %#v, %v, %v", cached, found, err)
+	}
+	offline := NewServiceWithProviders(offlineAniList{}, nil, unusedPlayer{}, state, nil, nil, DefaultConfig(), nil)
+	defer offline.Close()
+	episodes, err := offline.Episodes(t.Context(), 182205)
+	if err != nil || len(episodes) != 23 {
+		t.Fatalf("offline episodes = %d, %v; want 23", len(episodes), err)
+	}
+}
+
+func TestEpisodesUnknownAiringCountDoesNotUsePlannedTotal(t *testing.T) {
+	metadata := &cachingAniList{media: &anilist.Media{ID: 182205, Title: "Slime Season 4", Episodes: 24, AiredEpisodes: -1}}
+	service := NewServiceWithProviders(metadata, nil, unusedPlayer{}, nil, nil, nil, DefaultConfig(), nil)
+	defer service.Close()
+	service.episodes[182205] = []Episode{{MediaID: 182205, Number: 1}}
+	_, err := service.Episodes(t.Context(), 182205)
+	if err == nil || !strings.Contains(err.Error(), "AniList has no aired episode count") {
+		t.Fatalf("Episodes() error = %v", err)
+	}
+	if len(service.episodes[182205]) != 0 {
+		t.Fatal("unknown metadata left stale episodes in the cache")
 	}
 }
 
@@ -151,7 +195,7 @@ func TestSearchUsesLocalPreviewPath(t *testing.T) {
 func TestOfflineAniListUsesCachedMedia(t *testing.T) {
 	state := newMemoryState()
 	if err := state.SaveMedia(t.Context(), store.MediaInfo{
-		ID: 154587, Title: "Frieren", PreviewPath: "/tmp/frieren.jpg", Episodes: 28,
+		ID: 154587, Title: "Frieren", PreviewPath: "/tmp/frieren.jpg", Episodes: 28, AiredEpisodes: 28,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +246,7 @@ func TestPlaybackPreservesProviderEpisodeValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(episodes) != 1 || episodes[0].Value != "provider-episode-key" {
+	if len(episodes) != 28 || episodes[0].Value != "" {
 		t.Fatalf("Episodes() = %#v", episodes)
 	}
 	if err := service.PlayEpisode(t.Context(), episodes[0]); err != nil {

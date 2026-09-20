@@ -112,22 +112,48 @@ func TestStoreResumeEntriesAndSyncQueue(t *testing.T) {
 }
 
 func TestStoreCachedMediaLookup(t *testing.T) {
-	state, err := Open(filepath.Join(t.TempDir(), "anime.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer state.Close()
-	if err := state.SaveMedia(t.Context(), MediaInfo{ID: 154587, Title: "Frieren", PreviewPath: "/tmp/frieren.jpg", Episodes: 28}); err != nil {
-		t.Fatal(err)
-	}
+	for _, tt := range []struct {
+		name          string
+		airedEpisodes [2]int
+	}{
+		{name: "unknown_to_airing", airedEpisodes: [2]int{-1, 7}},
+		{name: "zero_to_unknown", airedEpisodes: [2]int{0, -1}},
+		{name: "airing_to_zero", airedEpisodes: [2]int{7, 0}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "anime.db")
+			state, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { state.Close() }()
+			for _, airedEpisodes := range tt.airedEpisodes {
+				want := MediaInfo{
+					ID: 154587, Title: "Frieren", PreviewPath: "/tmp/frieren.jpg",
+					Episodes: 28, AiredEpisodes: airedEpisodes,
+				}
+				if err := state.SaveMedia(t.Context(), want); err != nil {
+					t.Fatal(err)
+				}
+				if err := state.Close(); err != nil {
+					t.Fatal(err)
+				}
+				reopened, err := Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				state = reopened
 
-	media, found, err := state.CachedMedia(t.Context(), 154587)
-	if err != nil || !found || media.Title != "Frieren" || media.Episodes != 28 {
-		t.Fatalf("CachedMedia() = %#v, %v, %v", media, found, err)
-	}
-	items, err := state.SearchMedia(t.Context(), "rieren")
-	if err != nil || len(items) != 1 || items[0].ID != 154587 {
-		t.Fatalf("SearchMedia() = %#v, %v", items, err)
+				media, found, err := state.CachedMedia(t.Context(), want.ID)
+				if err != nil || !found || media != want {
+					t.Fatalf("CachedMedia() = %#v, %v, %v, want %#v", media, found, err, want)
+				}
+				items, err := state.SearchMedia(t.Context(), "rieren")
+				if err != nil || len(items) != 1 || items[0] != want {
+					t.Fatalf("SearchMedia() = %#v, %v, want [%#v]", items, err, want)
+				}
+			}
+		})
 	}
 }
 
@@ -311,6 +337,57 @@ func TestMigrateDeployedV2PreservesData(t *testing.T) {
 	}
 }
 
+func TestMigrateV3PreservesMediaWithUnknownAiredEpisodes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anime.db")
+	db := createLegacyDatabase(t, path, 3)
+	mustExec(t, db, `INSERT INTO media VALUES
+		(30, 'Planned', '/planned.jpg', 12, 100),
+		(31, 'Unannounced', '/unannounced.jpg', 0, 100)`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if got := databaseVersion(t, state.db); got != 4 {
+		t.Fatalf("user_version = %d, want 4", got)
+	}
+	var kind, defaultValue string
+	var notNull int
+	if err := state.db.QueryRowContext(t.Context(), `
+		SELECT type, "notnull", dflt_value FROM pragma_table_info('media')
+		WHERE name = 'aired_episodes'`).Scan(&kind, &notNull, &defaultValue); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "INTEGER" || notNull != 1 || defaultValue != "-1" {
+		t.Fatalf("aired_episodes column = (%q, %d, %q), want (INTEGER, 1, -1)", kind, notNull, defaultValue)
+	}
+	for _, want := range []MediaInfo{
+		{ID: 30, Title: "Planned", PreviewPath: "/planned.jpg", Episodes: 12, AiredEpisodes: -1},
+		{ID: 31, Title: "Unannounced", PreviewPath: "/unannounced.jpg", Episodes: 0, AiredEpisodes: -1},
+	} {
+		media, found, err := state.CachedMedia(t.Context(), want.ID)
+		if err != nil || !found || media != want {
+			t.Fatalf("CachedMedia() = %#v, %v, %v, want %#v", media, found, err, want)
+		}
+		items, err := state.SearchMedia(t.Context(), want.Title)
+		if err != nil || len(items) != 1 || items[0] != want {
+			t.Fatalf("SearchMedia() = %#v, %v, want [%#v]", items, err, want)
+		}
+		var updatedAt int64
+		if err := state.db.QueryRowContext(t.Context(), `
+			SELECT updated_at FROM media WHERE anilist_id = ?`, want.ID).Scan(&updatedAt); err != nil {
+			t.Fatal(err)
+		}
+		if updatedAt != 100 {
+			t.Fatalf("media %d updated_at = %d, want 100", want.ID, updatedAt)
+		}
+	}
+}
+
 func TestMigratePopulatedUnversionedDatabase(t *testing.T) {
 	for _, version := range []int{1, 2} {
 		t.Run("v"+strconv.Itoa(version), func(t *testing.T) {
@@ -479,11 +556,12 @@ func TestOpenRejectsNewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, `PRAGMA user_version = 4`)
+	newerVersion := schemaVersion + 1
+	mustExec(t, db, `PRAGMA user_version = `+strconv.Itoa(newerVersion))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "unsupported SQLite schema version 4") {
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "unsupported SQLite schema version "+strconv.Itoa(newerVersion)) {
 		t.Fatalf("Open() error = %v, want unsupported newer schema", err)
 	}
 
@@ -492,8 +570,8 @@ func TestOpenRejectsNewerSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if got := databaseVersion(t, db); got != 4 {
-		t.Fatalf("user_version = %d after rejected open, want 4", got)
+	if got := databaseVersion(t, db); got != newerVersion {
+		t.Fatalf("user_version = %d after rejected open, want %d", got, newerVersion)
 	}
 	var position float64
 	if err := db.QueryRowContext(t.Context(), `SELECT position FROM watch_progress WHERE anilist_id = 30`).Scan(&position); err != nil {
@@ -546,6 +624,17 @@ func createLegacyDatabase(t *testing.T, path string, version int) *sql.DB {
 				updated_at INTEGER NOT NULL,
 				UNIQUE (anilist_id, episode)
 			)`,
+		)
+	}
+	if version >= 3 {
+		statements = append(statements,
+			`ALTER TABLE watch_progress ADD COLUMN write_seq INTEGER NOT NULL DEFAULT 0`,
+			`CREATE UNIQUE INDEX watch_progress_write_seq ON watch_progress(write_seq)`,
+			`CREATE TABLE progress_write_sequence (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				value INTEGER NOT NULL
+			)`,
+			`INSERT INTO progress_write_sequence (id, value) VALUES (1, 0)`,
 		)
 	}
 	for _, statement := range statements {
