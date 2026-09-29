@@ -43,9 +43,7 @@ func (c *Client) browserStreams(ctx context.Context, episode Episode, translatio
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// quality is deliberately unused: the master playlist carries every
-	// rendition, so the player selects rather than this code choosing one and
-	// pinning playback to it.
+	// Selection happens in prepareStream after the captured master is fetched.
 	_ = quality
 	source := "default"
 	if len(candidates) > 0 {

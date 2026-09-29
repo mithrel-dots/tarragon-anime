@@ -30,7 +30,7 @@ type Config struct {
 }
 
 // BrowserConfig controls the managed Chromium instance used to resolve streams
-// from a provider's own player.
+// from a provider's own player. Enabled also gates AnimePahe's challenge solver.
 type BrowserConfig struct {
 	Enabled     bool
 	Binary      string

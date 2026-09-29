@@ -3,6 +3,7 @@ package animepahe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,8 +41,9 @@ type Client struct {
 	http *http.Client
 	base string
 
-	accessMu chan struct{}
-	solver   func(context.Context, string) ([]*http.Cookie, error)
+	accessMu       chan struct{}
+	solver         func(context.Context, string) ([]*http.Cookie, error)
+	browserEnabled bool
 }
 
 var _ provider.Client = (*Client)(nil)
@@ -62,11 +64,19 @@ func NewClientWithBaseURL(httpClient *http.Client, baseURL string) *Client {
 		client.Jar, _ = cookiejar.New(nil)
 	}
 	return &Client{
-		http:     &client,
-		base:     strings.TrimRight(baseURL, "/"),
-		accessMu: make(chan struct{}, 1),
-		solver:   func(ctx context.Context, origin string) ([]*http.Cookie, error) { return solveChallenge(ctx, origin) },
+		http:           &client,
+		base:           strings.TrimRight(baseURL, "/"),
+		accessMu:       make(chan struct{}, 1),
+		solver:         func(ctx context.Context, origin string) ([]*http.Cookie, error) { return solveChallenge(ctx, origin) },
+		browserEnabled: true,
 	}
+}
+
+// WithBrowser controls the optional challenge solver. Configure it before use;
+// HTTP-only operation reports challenges without launching a separate Chromium.
+func (c *Client) WithBrowser(enabled bool) *Client {
+	c.browserEnabled = enabled
+	return c
 }
 
 type searchResponse struct {
@@ -237,6 +247,7 @@ func (c *Client) Streams(ctx context.Context, episode provider.Episode, translat
 		return nil, fmt.Errorf("AnimePahe returned no %s streams for episode %d", translation, episode.Number)
 	}
 	seen := make(map[string]bool)
+	var failures []error
 	for _, link := range links {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -263,11 +274,15 @@ func (c *Client) Streams(ctx context.Context, episode provider.Episode, translat
 		if err == nil {
 			return []provider.Stream{{URL: streamURL, Headers: map[string]string{"Referer": kwikOrigin(link)}, Source: id}}, nil
 		}
+		failures = append(failures, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return nil, fmt.Errorf("extract AnimePahe streams from Kwik")
+	if len(failures) > 0 {
+		return nil, fmt.Errorf("extract AnimePahe streams from Kwik: %w", errors.Join(failures...))
+	}
+	return nil, fmt.Errorf("AnimePahe returned no supported Kwik sources")
 }
 
 type playerLink struct {
@@ -304,6 +319,16 @@ func parsePlayerLinks(html, translation, quality string) []string {
 	selected := sub
 	if strings.EqualFold(translation, "dub") {
 		selected = dub
+	}
+	if wanted, err := strconv.Atoi(strings.TrimSuffix(strings.ToLower(strings.TrimSpace(quality)), "p")); err == nil && wanted > 0 && len(selected) > 0 {
+		preferred := len(selected) - 1
+		for i, link := range selected {
+			if link.res <= wanted {
+				preferred = i
+				break
+			}
+		}
+		selected = append(append([]playerLink(nil), selected[preferred:]...), selected[:preferred]...)
 	}
 	result := make([]string, 0, len(selected))
 	for _, link := range selected {
@@ -451,7 +476,7 @@ func (c *Client) bypass(ctx context.Context, endpoint string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if c.solver == nil {
+	if !c.browserEnabled || c.solver == nil {
 		return fmt.Errorf("AnimePahe Cloudflare/DDoS challenge requires browser clearance")
 	}
 	parsedEndpoint, err := url.Parse(endpoint)

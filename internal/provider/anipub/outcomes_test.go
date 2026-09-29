@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,23 @@ import (
 	"tarragon-anime/internal/browser"
 	"tarragon-anime/internal/streamlog"
 )
+
+type fixtureTransport func(*http.Request) (*http.Response, error)
+
+func (f fixtureTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func browserFixtureClient(t *testing.T) *Client {
+	t.Helper()
+	c := NewClient(&http.Client{Transport: fixtureTransport(func(r *http.Request) (*http.Response, error) {
+		status, body := 404, "missing native player"
+		if strings.HasSuffix(r.URL.Path, ".m3u8") {
+			status, body = 200, "#EXTM3U\n#EXTINF:10,\nsegment.jpg\n#EXT-X-ENDLIST\n"
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: r}, nil
+	})})
+	t.Cleanup(c.Close)
+	return c
+}
 
 func TestStreamsValidationOutcomesAndSafeSources(t *testing.T) {
 	for _, test := range []struct {
@@ -28,7 +47,7 @@ func TestStreamsValidationOutcomesAndSafeSources(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var logs bytes.Buffer
 			ctx := streamlog.WithResolution(t.Context(), log.New(&logs, "", 0), 42, 1, "sub")
-			c := NewClient(nil)
+			c := browserFixtureClient(t)
 			episode := Episode{ShowID: "123", Number: 1, Value: "1"}
 			candidate := browser.Candidate{URL: "https://cdn.test/master.m3u8?token=private-token", Status: 200, Source: test.source, Headers: map[string]string{"Referer": "https://player.test/?token=private-token"}}
 			if test.mutate != nil {
@@ -74,7 +93,7 @@ func TestStreamsValidationOutcomesAndSafeSources(t *testing.T) {
 func TestCancelledStreamsNeverPublishOrInvalidateSharedCache(t *testing.T) {
 	for _, withWinner := range []bool{false, true} {
 		t.Run(map[bool]string{false: "empty-cache", true: "shared-winner"}[withWinner], func(t *testing.T) {
-			c := NewClient(nil)
+			c := browserFixtureClient(t)
 			episode := Episode{ShowID: "123", Number: 1, Value: "1"}
 			entered, release := make(chan struct{}), make(chan struct{})
 			var calls atomic.Int32

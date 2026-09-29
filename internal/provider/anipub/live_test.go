@@ -4,17 +4,20 @@ package anipub
 
 import (
 	"context"
+	"log"
 	"net/http"
+	"os"
 	"testing"
 	"time"
+
+	"tarragon-anime/internal/browser"
+	"tarragon-anime/internal/provider/providertest"
 )
 
-// Metadata resolution is pure HTTP against the site's own endpoints, so it can
-// be exercised for real without a browser. Stream resolution cannot: the
-// player encrypts its source response, so it needs a capture and lives in the
-// browser live tests instead.
+// Metadata resolution uses the site's own HTTP endpoints.
 func TestLiveMatchAndEpisodes(t *testing.T) {
 	client := NewClient(&http.Client{Timeout: 20 * time.Second})
+	defer client.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 
@@ -45,5 +48,78 @@ func TestLiveMatchAndEpisodes(t *testing.T) {
 
 	if got := watchURL(client.base, episodes[0].ShowID, episodes[0].Value, "sub"); got == "" {
 		t.Fatal("watchURL() produced nothing for the first episode")
+	}
+}
+
+func TestLiveBrowserStreams(t *testing.T) {
+	binary, err := browser.FindBinary()
+	if err != nil {
+		t.Skip(err)
+	}
+	resolver := browser.New(browser.Options{
+		Binary: binary, ProfileDir: t.TempDir(), Headless: true,
+		Timeout: 60 * time.Second, Logger: log.New(os.Stderr, "browser: ", 0),
+	})
+	defer resolver.Close()
+	client := NewClient(&http.Client{Timeout: 20 * time.Second})
+	defer client.Close()
+	client.UseBrowser(resolver)
+	for _, mode := range []string{"sub", "dub"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+			defer cancel()
+			show, err := client.Match(ctx, 182205, []string{"That Time I Got Reincarnated as a Slime Season 4"}, mode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			episodes, err := client.Episodes(ctx, show, mode)
+			if err != nil || len(episodes) == 0 {
+				t.Fatalf("episodes=%d error=%v", len(episodes), err)
+			}
+			streams, err := client.browserStreams(ctx, episodes[0], mode, "worst")
+			if err != nil || len(streams) == 0 {
+				t.Fatalf("streams=%d error=%v", len(streams), err)
+			}
+			stream, err := client.prepareStream(ctx, streams[0], "worst", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			providertest.CheckMedia(t, ctx, stream)
+		})
+	}
+}
+
+func TestLiveNativeStreams(t *testing.T) {
+	client := NewClient(&http.Client{Timeout: 20 * time.Second})
+	defer client.Close()
+	for _, title := range []struct {
+		id   int
+		name string
+	}{
+		{182205, "That Time I Got Reincarnated as a Slime Season 4"},
+		{154587, "Frieren: Beyond Journey's End"},
+		{1, "Cowboy Bebop"},
+	} {
+		for _, mode := range []string{"sub", "dub"} {
+			t.Run(title.name+"/"+mode, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+				defer cancel()
+				show, err := client.Match(ctx, title.id, []string{title.name}, mode)
+				if err != nil {
+					t.Fatal(err)
+				}
+				episodes, err := client.Episodes(ctx, show, mode)
+				if err != nil || len(episodes) == 0 {
+					t.Fatalf("episodes=%d error=%v", len(episodes), err)
+				}
+				start := time.Now()
+				streams, err := client.Streams(ctx, episodes[0], mode, "worst")
+				if err != nil || len(streams) == 0 {
+					t.Fatalf("streams=%d error=%v", len(streams), err)
+				}
+				t.Logf("resolved via %s in %s", streams[0].Source, time.Since(start).Round(time.Millisecond))
+				providertest.CheckMedia(t, ctx, streams[0])
+			})
+		}
 	}
 }

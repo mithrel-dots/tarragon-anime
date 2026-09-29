@@ -66,6 +66,11 @@ func TestParsePlayerLinks(t *testing.T) {
 	}) {
 		t.Fatalf("worst sub links = %#v", got)
 	}
+	for _, quality := range []string{"720p", "240"} {
+		if got := parsePlayerLinks(html, "sub", quality); got[0] != "https://kwik.cx/e/sub-480" {
+			t.Fatalf("%s links = %#v, want 480p first", quality, got)
+		}
+	}
 }
 
 func TestGetChallengeUsesSolverCookiesAndContext(t *testing.T) {
@@ -116,6 +121,29 @@ func TestGetChallengeRejectsEmptySolverCookies(t *testing.T) {
 	_, err := client.get(context.Background(), server.URL, true)
 	if err == nil || !strings.Contains(err.Error(), "no clearance cookies") {
 		t.Fatalf("get() error = %v", err)
+	}
+}
+
+func TestDisabledBrowserNeverSolvesChallenge(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ok" {
+			_, _ = io.WriteString(w, "ok")
+			return
+		}
+		w.Header().Set("Server", "cloudflare")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	client := NewClientWithBaseURL(server.Client(), server.URL).WithBrowser(false)
+	client.solver = func(context.Context, string) ([]*http.Cookie, error) {
+		t.Fatal("disabled browser launched the challenge solver")
+		return nil, nil
+	}
+	if _, err := client.get(t.Context(), server.URL, true); err == nil || !strings.Contains(err.Error(), "requires browser clearance") {
+		t.Fatalf("expected challenge error, got %v", err)
+	}
+	if body, err := client.get(t.Context(), server.URL+"/ok", true); err != nil || string(body) != "ok" {
+		t.Fatalf("HTTP-only request failed: %q, %v", body, err)
 	}
 }
 

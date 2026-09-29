@@ -130,8 +130,7 @@ func (openBrowser) Open(url string) error {
 }
 
 // newBrowserResolver builds the managed Chromium resolver, or returns nil when
-// the machine has no browser. A missing browser is not fatal: providers fall
-// back to their native resolution path.
+// the machine has no browser. HTTP-capable providers can still resolve streams.
 func newBrowserResolver(config anime.BrowserConfig, logger *log.Logger) *browser.Resolver {
 	if !config.Enabled {
 		return nil
@@ -215,6 +214,7 @@ func run() error {
 	aniPubClient := anipub.NewClient(httpClient).WithLogger(logger)
 	defer aniNekoClient.Close()
 	defer animeFlixClient.Close()
+	defer aniPubClient.Close()
 	if resolver := newBrowserResolver(config.Browser, logger); resolver != nil {
 		// One resolver is shared: it owns a single Chromium and serialises
 		// captures itself, so a second would only contend for the profile.
@@ -225,7 +225,7 @@ func run() error {
 	providers := map[string]provider.Client{
 		"allanime":  allAnimeClient,
 		"animeflix": animeFlixClient,
-		"animepahe": animepahe.NewClient(httpClient),
+		"animepahe": animepahe.NewClient(httpClient).WithBrowser(config.Browser.Enabled),
 		"anineko":   aniNekoClient,
 		"anipub":    aniPubClient,
 	}

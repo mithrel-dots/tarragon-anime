@@ -2,11 +2,12 @@ package anipub
 
 import (
 	"context"
-	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,7 +40,9 @@ func catalogueServer(t *testing.T) *httptest.Server {
 				"link":"src=https://anipub.test/play/59970/1/sub","ep":[
 					{"link":"src=https://anipub.test/play/59970/2/sub"},
 					{"link":"src=https://anipub.test/play/59970/3/sub"}
-				]}}`))
+			]}}`))
+		case strings.HasSuffix(r.URL.Path, ".m3u8"):
+			_, _ = io.WriteString(w, "#EXTM3U\n#EXTINF:10,\nsegment.jpg\n#EXT-X-ENDLIST\n")
 		default:
 			http.NotFound(w, r)
 		}
@@ -100,6 +103,35 @@ func TestEpisodesIncludeTheOneOutsideTheList(t *testing.T) {
 	}
 	if !reflect.DeepEqual(episodes, want) {
 		t.Fatalf("Episodes() = %#v, want %#v", episodes, want)
+	}
+}
+
+func TestEpisodeCacheAndRateLimitErrors(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			io.WriteString(w, `{"error":"Streaming rate limit exceeded. Wait 60s."}`)
+			return
+		}
+		io.WriteString(w, `{"local":{"link":"src=/play/123/1/sub"}}`)
+	}))
+	defer server.Close()
+	c := NewClientWithBaseURL(server.Client(), server.URL)
+	show := Anime{ID: "123"}
+	if _, err := c.Episodes(t.Context(), show, "sub"); err == nil || !strings.Contains(err.Error(), "rate limit") {
+		t.Fatalf("lost upstream error: %v", err)
+	}
+	episodes, err := c.Episodes(t.Context(), show, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	episodes[0].Number = 999
+	episodes, err = c.Episodes(t.Context(), show, "dub")
+	if err != nil || len(episodes) != 1 || episodes[0].Number != 1 || calls.Load() != 2 {
+		t.Fatalf("episode cache: %+v, %v, calls=%d", episodes, err, calls.Load())
+	}
+	if _, err := decodeSearchResults([]byte(`{"error":"Search rate limit exceeded"}`)); err == nil || !strings.Contains(err.Error(), "rate limit") {
+		t.Fatalf("lost search API error: %v", err)
 	}
 }
 
@@ -166,17 +198,31 @@ func TestWatchURL(t *testing.T) {
 	if got != want {
 		t.Fatalf("watchURL() = %q, want %q", got, want)
 	}
+	if got := watchURL("https://anipub.test", "2454", "video:107257", "dub"); got != "https://anipub.test/video/107257/dub" {
+		t.Fatalf("legacy watch URL = %s", got)
+	}
 }
 
-// The player encrypts its source response, so without a browser there is no
-// HTTP-only path to a playable URL and the caller must be told plainly.
-func TestStreamsWithoutABrowserIsReported(t *testing.T) {
+func TestLegacyVideoEpisodesPreserveOpaqueIDs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"local":{"name":"Episode 1","link":"src=https://anipub.test/video/107257/sub","ep":[{"link":"src=https://anipub.test/video/107259/sub"},{"link":"src=https://anipub.test/video/107260/sub"}]}}`)
+	}))
+	defer server.Close()
+	c := NewClientWithBaseURL(server.Client(), server.URL)
+	episodes, err := c.Episodes(t.Context(), Anime{ID: "2454"}, "sub")
+	want := []Episode{{ShowID: "2454", Number: 1, Value: "video:107257"}, {ShowID: "2454", Number: 2, Value: "video:107259"}, {ShowID: "2454", Number: 3, Value: "video:107260"}}
+	if err != nil || !reflect.DeepEqual(episodes, want) {
+		t.Fatalf("legacy episodes=%+v error=%v", episodes, err)
+	}
+}
+
+func TestNativeFailureWithoutBrowserIsReported(t *testing.T) {
 	server := catalogueServer(t)
 	client := NewClientWithBaseURL(server.Client(), server.URL)
 
 	_, err := client.Streams(context.Background(), Episode{ShowID: "59970", Number: 1, Value: "1"}, "sub", "best")
-	if !errors.Is(err, ErrBrowserRequired) {
-		t.Fatalf("Streams() error = %v, want ErrBrowserRequired", err)
+	if err == nil || !strings.Contains(err.Error(), "load AniPub player") {
+		t.Fatalf("Streams() error = %v, want the native resolution failure", err)
 	}
 }
 
@@ -199,7 +245,7 @@ func TestStreamsPreferTheMasterPlaylist(t *testing.T) {
 		}, nil
 	}))
 
-	streams, err := client.Streams(context.Background(), Episode{ShowID: "59970", Number: 1, Value: "1"}, "sub", "best")
+	streams, err := client.browserStreams(context.Background(), Episode{ShowID: "59970", Number: 1, Value: "1"}, "sub", "best")
 	if err != nil {
 		t.Fatalf("Streams() error = %v", err)
 	}
@@ -219,11 +265,12 @@ func TestStreamsPreferTheMasterPlaylist(t *testing.T) {
 func TestStreamsAreCachedUntilInvalidated(t *testing.T) {
 	server := catalogueServer(t)
 	client := NewClientWithBaseURL(server.Client(), server.URL)
+	t.Cleanup(client.Close)
 
 	captures := 0
 	client.UseBrowser(captureFunc(func(context.Context, browser.Request) ([]browser.Candidate, error) {
 		captures++
-		return []browser.Candidate{{URL: "https://cdn.test/a/master.m3u8", Status: 200}}, nil
+		return []browser.Candidate{{URL: server.URL + "/a/master.m3u8", Status: 200}}, nil
 	}))
 
 	episode := Episode{ShowID: "59970", Number: 1, Value: "1"}

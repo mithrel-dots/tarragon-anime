@@ -186,6 +186,8 @@ func TestProviderEpisodeUsesPlaybackShowID(t *testing.T) {
 			_, _ = w.Write([]byte(`[{"Name":"Frieren","Id":8347}]`))
 		case r.URL.Path == "/v1/api/details/8347":
 			_, _ = w.Write([]byte(`{"local":{"link":"src=/play/59970/5/sub"}}`))
+		case r.URL.Path == "/episode.m3u8":
+			_, _ = w.Write([]byte("#EXTM3U\n#EXTINF:10,\nsegment.jpg\n#EXT-X-ENDLIST\n"))
 		default:
 			http.NotFound(w, r)
 		}
@@ -193,12 +195,13 @@ func TestProviderEpisodeUsesPlaybackShowID(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	client := anipub.NewClientWithBaseURL(server.Client(), server.URL)
+	t.Cleanup(client.Close)
 	var capturedURL string
 	captures := 0
 	client.UseBrowser(stackCaptureFunc(func(_ context.Context, request browserpkg.Request) ([]browserpkg.Candidate, error) {
 		captures++
 		capturedURL = request.PageURL
-		return []browserpkg.Candidate{{URL: "https://video.test/episode.m3u8", Status: http.StatusOK}}, nil
+		return []browserpkg.Candidate{{URL: server.URL + "/episode.m3u8", Status: http.StatusOK}}, nil
 	}))
 	state := newMemoryState()
 	player := &fakePlayer{session: newFakeSession(), err: errors.New("player unavailable")}

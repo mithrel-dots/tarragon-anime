@@ -1,9 +1,5 @@
-// Package anipub resolves anime from AniPub. Metadata comes from the site's
-// own JSON endpoints; playable URLs come from a browser session, because the
-// player's source response carries the media URL encrypted and only the site's
-// JavaScript can unwrap it. What the player then requests over the network is
-// an ordinary HLS master playlist with a separate subtitle track, so the
-// browser only has to watch rather than decrypt.
+// Package anipub resolves AniPub metadata and MegaPlay streams over HTTP, with
+// an optional browser fallback when the native player adapter becomes outdated.
 package anipub
 
 import (
@@ -21,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"tarragon-anime/internal/browser"
 	"tarragon-anime/internal/provider"
@@ -45,15 +42,11 @@ const (
 	maxBody = 4 << 20
 )
 
-// ErrBrowserRequired reports that stream resolution was attempted without a
-// browser. The player encrypts its source response, so there is no HTTP-only
-// path to a playable URL.
-var ErrBrowserRequired = errors.New("AniPub stream resolution requires a browser session")
-
 // playLinkRE pulls the play route out of a details entry. The site stores the
 // value as an iframe attribute fragment rather than a bare URL, and the
 // episode number is a path segment inside it.
 var playLinkRE = regexp.MustCompile(`/play/(\d+)/(\d+)(?:/([a-zA-Z]+))?`)
+var videoLinkRE = regexp.MustCompile(`/video/(\d+)(?:/([a-zA-Z]+))?`)
 
 type Client struct {
 	http   *http.Client
@@ -62,8 +55,13 @@ type Client struct {
 
 	browser Resolver
 
-	cacheMu     sync.Mutex
-	streamCache map[string]streamEntry
+	cacheMu      sync.Mutex
+	streamCache  map[string]streamEntry
+	episodeCache map[string]episodeEntry
+
+	proxyMu sync.Mutex
+	proxy   *mediaProxy
+	closed  bool
 }
 
 var _ provider.Client = (*Client)(nil)
@@ -83,10 +81,11 @@ func NewClientWithBaseURL(httpClient *http.Client, baseURL string) *Client {
 		baseURL = defaultBaseURL
 	}
 	return &Client{
-		http:        httpClient,
-		base:        strings.TrimRight(baseURL, "/"),
-		logger:      log.New(io.Discard, "", 0),
-		streamCache: map[string]streamEntry{},
+		http:         httpClient,
+		base:         strings.TrimRight(baseURL, "/"),
+		logger:       log.New(io.Discard, "", 0),
+		streamCache:  map[string]streamEntry{},
+		episodeCache: map[string]episodeEntry{},
 	}
 }
 
@@ -102,9 +101,11 @@ type searchResult struct {
 	Name   string `json:"Name"`
 	ID     int    `json:"Id"`
 	Finder string `json:"finder"`
+	Error  string `json:"error"`
 }
 
 type detailsResponse struct {
+	Error string `json:"error"`
 	Local struct {
 		Name   string `json:"name"`
 		Finder string `json:"finder"`
@@ -116,6 +117,11 @@ type detailsResponse struct {
 			Link string `json:"link"`
 		} `json:"ep"`
 	} `json:"local"`
+}
+
+type episodeEntry struct {
+	episodes []Episode
+	expires  time.Time
 }
 
 // Match finds the show on AniPub. Only an exact title match is accepted: the
@@ -190,6 +196,9 @@ func decodeSearchResults(body []byte) ([]searchResult, error) {
 		if err := json.Unmarshal(trimmed, &single); err != nil {
 			return nil, fmt.Errorf("decode result: %w", err)
 		}
+		if single.Error != "" {
+			return nil, fmt.Errorf("AniPub API: %s", single.Error)
+		}
 		// The no-match marker carries no id, and an entry without one cannot
 		// be resolved anyway.
 		if single.ID == 0 {
@@ -200,17 +209,30 @@ func decodeSearchResults(body []byte) ([]searchResult, error) {
 	return nil, fmt.Errorf("unexpected search payload")
 }
 
-// Episodes lists the show's episodes. Numbers come from the play route rather
-// than from the list position, because the list omits the first episode and
-// carries no numbering of its own.
+// Episodes reads explicit numbers from /play routes, or the ordered /video
+// catalogue whose separately stored first entry is labelled Episode 1.
 func (c *Client) Episodes(ctx context.Context, anime Anime, _ string) ([]Episode, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(anime.ID) == "" {
 		return nil, errors.New("AniPub episodes: show id is required")
+	}
+	// The details API has a low per-minute limit. Playback and next-episode
+	// prefetch ask for the same list, including across sub/dub lookups.
+	c.cacheMu.Lock()
+	entry, ok := c.episodeCache[anime.ID]
+	c.cacheMu.Unlock()
+	if ok && time.Now().Before(entry.expires) {
+		return append([]Episode(nil), entry.episodes...), nil
 	}
 	var details detailsResponse
 	endpoint := c.base + "/v1/api/details/" + url.PathEscape(strings.TrimSpace(anime.ID))
 	if err := c.fetchJSON(ctx, endpoint, &details); err != nil {
 		return nil, fmt.Errorf("list AniPub episodes: %w", err)
+	}
+	if details.Error != "" {
+		return nil, fmt.Errorf("list AniPub episodes: %s", details.Error)
 	}
 
 	links := make([]string, 0, len(details.Local.Episodes)+1)
@@ -219,9 +241,26 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, _ string) ([]Episode
 		links = append(links, item.Link)
 	}
 
+	legacy := videoLinkRE.MatchString(details.Local.Link)
+	if legacy && !strings.EqualFold(strings.TrimSpace(details.Local.Name), "Episode 1") {
+		return nil, errors.New("AniPub legacy episode list does not start at episode one")
+	}
 	seen := map[int]bool{}
+	seenVideos := map[string]bool{}
 	episodes := make([]Episode, 0, len(links))
-	for _, link := range links {
+	for index, link := range links {
+		// Older catalogue entries use opaque video IDs, with episode one
+		// stored separately and the remaining episodes in playback order.
+		// Preserve those IDs rather than treating them as MAL/episode numbers.
+		if legacy {
+			match := videoLinkRE.FindStringSubmatch(link)
+			if match == nil || seenVideos[match[1]] {
+				return nil, errors.New("AniPub legacy episode list has missing or duplicate video IDs")
+			}
+			seenVideos[match[1]] = true
+			episodes = append(episodes, Episode{ShowID: anime.ID, Number: index + 1, Value: "video:" + match[1]})
+			continue
+		}
 		show, number, ok := parsePlayLink(link)
 		if !ok || seen[number] {
 			continue
@@ -237,6 +276,17 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, _ string) ([]Episode
 		return nil, fmt.Errorf("no AniPub episodes for %s", anime.ID)
 	}
 	sort.SliceStable(episodes, func(i, j int) bool { return episodes[i].Number < episodes[j].Number })
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for id, entry := range c.episodeCache {
+		if time.Now().After(entry.expires) {
+			delete(c.episodeCache, id)
+		}
+	}
+	c.episodeCache[anime.ID] = episodeEntry{append([]Episode(nil), episodes...), time.Now().Add(time.Minute)}
 	return episodes, nil
 }
 
@@ -262,6 +312,9 @@ func watchURL(base, showID, episodeValue, translation string) string {
 	if translation == "" {
 		translation = "sub"
 	}
+	if videoID, ok := strings.CutPrefix(episodeValue, "video:"); ok {
+		return fmt.Sprintf("%s/video/%s/%s", strings.TrimRight(base, "/"), url.PathEscape(videoID), url.PathEscape(translation))
+	}
 	return fmt.Sprintf("%s/play/%s/%s/%s",
 		strings.TrimRight(base, "/"),
 		url.PathEscape(showID),
@@ -270,11 +323,11 @@ func watchURL(base, showID, episodeValue, translation string) string {
 	)
 }
 
-// Streams resolves playable URLs for an episode. Results are cached briefly
-// because the captured URLs are signed and a capture costs a page load.
+// Streams tries native HTTP resolution first, then an optional browser capture.
+// Both paths normalize the selected playlist before caching its local URL.
 func (c *Client) Streams(ctx context.Context, episode Episode, translation, quality string) (streams []Stream, err error) {
 	ctx = streamlog.WithProvider(ctx, "anipub")
-	finish := streamlog.Start(ctx, "browser", "streams")
+	finish := streamlog.Start(ctx, "provider", "streams")
 	defer func() {
 		if ctx.Err() != nil {
 			streams, err = nil, ctx.Err()
@@ -284,18 +337,60 @@ func (c *Client) Streams(ctx context.Context, episode Episode, translation, qual
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(episode.ShowID) == "" {
-		return nil, errors.New("AniPub streams: show id is required")
+	if strings.TrimSpace(episode.ShowID) == "" || episode.Number <= 0 {
+		return nil, errors.New("AniPub streams: show id and positive episode number are required")
+	}
+	if episode.Value == "" {
+		episode.Value = strconv.Itoa(episode.Number)
+	}
+	translation = strings.ToLower(strings.TrimSpace(translation))
+	if translation == "" {
+		translation = "sub"
+	}
+	if translation != "sub" && translation != "dub" {
+		return nil, fmt.Errorf("unsupported AniPub translation %q", translation)
+	}
+	c.proxyMu.Lock()
+	closed := c.closed
+	c.proxyMu.Unlock()
+	if closed {
+		return nil, errors.New("AniPub client is closed")
 	}
 	if cached, ok := c.cachedStreams(episode, translation, quality); ok {
-		finishCache := streamlog.Start(ctx, browser.SourceID(cached[0].Source), "cache")
+		source := cached[0].Source
+		if source != "native" {
+			source = browser.SourceID(source)
+		}
+		finishCache := streamlog.Start(ctx, source, "cache")
 		finishCache("resolved", "validated_cache")
 		return cached, nil
 	}
-	if c.browser == nil {
-		return nil, ErrBrowserRequired
+	finishNative := streamlog.Start(ctx, "native", "resolve")
+	streams, err = c.nativeStreams(ctx, episode, translation, quality)
+	finishNative(streamlog.Outcome(ctx, err))
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	streams, err = c.browserStreams(ctx, episode, translation, quality)
+	if err != nil && c.browser != nil {
+		nativeErr := err
+		streams, err = c.browserStreams(ctx, episode, translation, quality)
+		if err == nil {
+			var prepared Stream
+			for _, stream := range streams {
+				prepared, err = c.prepareStream(ctx, stream, quality, nil)
+				if err == nil {
+					streams = []Stream{prepared}
+					break
+				}
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+			}
+		}
+		if err != nil {
+			err = errors.Join(nativeErr, err)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("resolve AniPub episode %d: %w", episode.Number, err)
 	}

@@ -121,7 +121,16 @@ func chooseVariant(variants []variant, quality string) variant {
 		}
 		return ordered[i].order < ordered[j].order
 	})
-	if strings.EqualFold(strings.TrimSpace(quality), "worst") {
+	quality = strings.ToLower(strings.TrimSpace(quality))
+	if quality == "worst" {
+		return ordered[len(ordered)-1]
+	}
+	if wanted, err := strconv.Atoi(strings.TrimSuffix(quality, "p")); err == nil && wanted > 0 {
+		for _, item := range ordered {
+			if item.height <= wanted {
+				return item
+			}
+		}
 		return ordered[len(ordered)-1]
 	}
 	return ordered[0]

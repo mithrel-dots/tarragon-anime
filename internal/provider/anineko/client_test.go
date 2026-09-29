@@ -144,6 +144,37 @@ func TestChooseVariantUsesResolutionAndQuality(t *testing.T) {
 	if got := chooseVariant(variants, "worst").URL; !strings.HasSuffix(got, "/720.m3u8") {
 		t.Fatalf("worst variant = %q", got)
 	}
+	for _, quality := range []string{"720p", "900", "480p"} {
+		if got := chooseVariant(variants, quality).URL; !strings.HasSuffix(got, "/720.m3u8") {
+			t.Fatalf("%s variant = %q, want 720p", quality, got)
+		}
+	}
+}
+
+func TestStreamsTryHardSubsAfterSoftSubsFail(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/watch/show/ep-1":
+			io.WriteString(w, `<div data-id="sub"><div data-video="https://bibiemb.test/soft"></div></div><div data-id="hsub"><div data-video="https://bibiemb.test/hard"></div></div><div data-id="dub"><div data-video="https://bibiemb.test/wrong-language"></div></div>`)
+		case "/soft":
+			http.Error(w, "source unavailable", http.StatusServiceUnavailable)
+		case "/hard":
+			io.WriteString(w, `const src = "`+server.URL+`/master.m3u8";`)
+		case "/master.m3u8":
+			io.WriteString(w, "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1280x720\n720.m3u8\n")
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c := NewClientWithBaseURL(&http.Client{Transport: rewriteHostTransport{target: server.URL}}, server.URL)
+	defer c.Close()
+	streams, err := c.Streams(t.Context(), Episode{ShowID: "show", Number: 1}, "sub", "best")
+	if err != nil || len(streams) != 1 || streams[0].Headers["Referer"] != "https://bibiemb.test/hard" {
+		t.Fatalf("hard sub fallback: %v, %v", streams, err)
+	}
 }
 
 func TestStripPNGWrapper(t *testing.T) {

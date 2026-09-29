@@ -51,10 +51,7 @@ func embedURLsForMode(groups map[string][]string, translation string) []string {
 	}
 	// Prefer soft subs because they can be turned off or styled in mpv. If a
 	// site only exposes hard subs, falling back keeps the provider useful.
-	if len(groups["sub"]) > 0 {
-		return append([]string(nil), groups["sub"]...)
-	}
-	return append([]string(nil), groups["hsub"]...)
+	return append(append([]string(nil), groups["sub"]...), groups["hsub"]...)
 }
 
 func normalizeTranslation(value string) string {

@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// streamTTL is how long a capture is reused. The captured URLs are signed and
-// expire, and a capture costs a full page load, so the window is short enough
-// to stay valid and long enough to keep next-episode prefetch off the critical
-// path.
+// streamTTL bounds reuse of native and browser resolutions. Upstream URLs may
+// expire; the short cache also keeps repeated resolution off the playback path.
 const streamTTL = 5 * time.Minute
 
 type streamEntry struct {
@@ -19,6 +19,13 @@ type streamEntry struct {
 }
 
 func streamKey(episode Episode, translation, quality string) string {
+	if episode.Value == "" {
+		episode.Value = strconv.Itoa(episode.Number)
+	}
+	translation = strings.ToLower(strings.TrimSpace(translation))
+	if translation == "" {
+		translation = "sub"
+	}
 	return fmt.Sprintf("%s|%s|%s|%s", episode.ShowID, episode.Value, translation, quality)
 }
 

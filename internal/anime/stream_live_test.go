@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -23,6 +24,14 @@ import (
 
 // This exercises the configured provider race without writing watch progress.
 func TestLiveProviderRace(t *testing.T) {
+	number := 18
+	if value := os.Getenv("ANIME_LIVE_EPISODE"); value != "" {
+		var err error
+		number, err = strconv.Atoi(value)
+		if err != nil || number <= 0 {
+			t.Fatal("ANIME_LIVE_EPISODE must be a positive integer")
+		}
+	}
 	path, err := ConfigPath()
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +65,7 @@ func TestLiveProviderRace(t *testing.T) {
 	httpClient := &http.Client{Timeout: 20 * time.Second}
 	all := allanime.NewClient(httpClient)
 	pub := anipub.NewClient(httpClient)
+	defer pub.Close()
 	if config.Browser.Enabled {
 		all.UseBrowser(resolver)
 		pub.UseBrowser(resolver)
@@ -64,14 +74,14 @@ func TestLiveProviderRace(t *testing.T) {
 	defer flix.Close()
 	defer neko.Close()
 	service := NewServiceWithProviders(anilist.NewClient(httpClient), map[string]provider.Client{
-		"animeflix": flix, "anineko": neko, "animepahe": animepahe.NewClient(httpClient),
+		"animeflix": flix, "anineko": neko, "animepahe": animepahe.NewClient(httpClient).WithBrowser(config.Browser.Enabled),
 		"allanime": all, "anipub": pub,
 	}, nil, nil, nil, nil, config, logger)
 	defer service.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 	start := time.Now()
-	stream, episode, err := service.resolveStream(ctx, Episode{MediaID: 182205, Number: 18})
+	stream, episode, err := service.resolveStream(ctx, Episode{MediaID: 182205, Number: number})
 	if err != nil {
 		t.Fatal(err)
 	}

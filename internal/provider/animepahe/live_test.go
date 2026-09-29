@@ -6,12 +6,14 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"tarragon-anime/internal/provider/providertest"
 )
 
 // TestLiveAnimePahe exercises the real metadata and player flow. It is opt-in
 // because the public origin may be unavailable or protected by Cloudflare.
 func TestLiveAnimePahe(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 	client := NewClient(nil)
 	anime, err := client.Match(ctx, 0, []string{"Frieren: Beyond Journey's End"}, "sub")
@@ -25,7 +27,9 @@ func TestLiveAnimePahe(t *testing.T) {
 	if len(episodes) == 0 {
 		t.Fatal("live AnimePahe returned no episodes")
 	}
-	if _, err := client.Streams(ctx, episodes[0], "sub", "best"); err != nil {
+	streams, err := client.Streams(ctx, episodes[0], "sub", "worst")
+	if err != nil || len(streams) == 0 {
 		t.Fatalf("live AnimePahe stream blocked or failed: %v", err)
 	}
+	providertest.CheckMedia(t, ctx, streams[0])
 }
