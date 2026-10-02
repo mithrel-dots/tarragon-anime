@@ -54,11 +54,17 @@ Live checks on **2026-09-29**, from the test machine's network:
 These are point-in-time checks. Live tests intentionally fail when an upstream
 is down, challenged, rate-limited, or returns unplayable media.
 
-AniPub's Slime season 4 catalogue currently repeats links to episodes 7–12 in
-place of 13–18. Those missing episodes are unavailable through its episode list;
-the explicit episode numbers take precedence over list position. In particular,
-the default episode-18 provider-race test still needs a working alternate such
-as AllAnime.
+**2026-10-02 update:** Re:ZERO season 4 episode 19 was verified through AniPub
+without Chromium: 2,470 seconds of audio/video, a full English subtitle track,
+and a decoded frame through the production mpv handoff. The native adapter now
+also handles MegaPlay's current named AES defaults and `getSourcesNew` endpoint.
+
+AniPub's catalogues can lag behind the player: Re:ZERO season 4 lists only
+episodes 1–9, and Slime season 4 repeats links to 7–12 in place of 13–18. Explicit
+episode numbers still take precedence over list position. For a requested
+episode missing from a consistent `/play` catalogue, the plugin tries that
+show's explicit episode route and validates the actual player and media before
+selecting it. It never renumbers repeated links or guesses opaque `/video` IDs.
 
 ## Checks
 
@@ -85,8 +91,17 @@ That check requires `mpv` and `ffprobe`; it opens no player window or audio
 device and writes no watch progress. Avoid repeatedly running the catalogue
 checks back-to-back: AniPub enforces a low per-minute request limit.
 
+To verify Re:ZERO season 4 episode 19, including the stale-catalogue lookup:
+
+```sh
+ANIME_LIVE_MEDIA=1 go test -tags=live -count=1 -v \
+  -run '^TestLiveReZeroSeason4Finale$' ./internal/provider/anipub
+```
+
 `ANIME_LIVE_FRESH=1` gives AllAnime tests temporary browser profiles.
 `ANIME_LIVE_MEDIA=1` also enables playback checks for the other providers.
 `ANIME_LIVE_EPISODE=1` changes the provider-race check from Slime season 4
 episode 18 to episode 1, which AniPub advertises for browser-free testing.
+`ANIME_LIVE_MEDIA_ID=189046 ANIME_LIVE_EPISODE=19` checks the Re:ZERO finale
+through the configured provider race instead.
 See `internal/provider/animeflix/README.md` for MyStream-specific constraints.

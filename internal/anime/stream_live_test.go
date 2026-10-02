@@ -24,6 +24,14 @@ import (
 
 // This exercises the configured provider race without writing watch progress.
 func TestLiveProviderRace(t *testing.T) {
+	mediaID := 182205
+	if value := os.Getenv("ANIME_LIVE_MEDIA_ID"); value != "" {
+		var err error
+		mediaID, err = strconv.Atoi(value)
+		if err != nil || mediaID <= 0 {
+			t.Fatal("ANIME_LIVE_MEDIA_ID must be a positive integer")
+		}
+	}
 	number := 18
 	if value := os.Getenv("ANIME_LIVE_EPISODE"); value != "" {
 		var err error
@@ -81,7 +89,7 @@ func TestLiveProviderRace(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 	start := time.Now()
-	stream, episode, err := service.resolveStream(ctx, Episode{MediaID: 182205, Number: number})
+	stream, episode, err := service.resolveStream(ctx, Episode{MediaID: mediaID, Number: number})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,16 +17,19 @@ import (
 )
 
 var (
-	embedRE  = regexp.MustCompile(`(?i)<iframe\b[^>]*\bsrc\s*=\s*["']?([^\s"'<>]+)`)
-	playerRE = regexp.MustCompile(`(?i)<div\b[^>]*\bid=["']megaplay-player["'][^>]*>`)
-	fileIDRE = regexp.MustCompile(`(?i)\bdata-id=["'](\d+)["']`)
-	clientRE = regexp.MustCompile(`(?i)<script\b[^>]*\bsrc=["']([^"']*/newclient\.min\.js[^"']*)["']`)
-	encodeRE = regexp.MustCompile(`\.encode\(("(?:\\.|[^"\\])*")\)`)
+	embedRE    = regexp.MustCompile(`(?i)<iframe\b[^>]*\bsrc\s*=\s*["']?([^\s"'<>]+)`)
+	playerRE   = regexp.MustCompile(`(?i)<div\b[^>]*\bid=["']megaplay-player["'][^>]*>`)
+	fileIDRE   = regexp.MustCompile(`(?i)\bdata-id=["'](\d+)["']`)
+	clientRE   = regexp.MustCompile(`(?i)<script\b[^>]*\bsrc=["']([^"']*/newclient\.min\.js[^"']*)["']`)
+	encodeRE   = regexp.MustCompile(`\.encode\(("(?:\\.|[^"\\])*")\)`)
+	trustKeyRE = regexp.MustCompile(`\.pick\(\s*\[\s*"trustAesKey"\s*,\s*"TRUST_AES_KEY"\s*\]\s*,\s*("(?:\\.|[^"\\])*")\s*\)`)
+	trustIVRE  = regexp.MustCompile(`\.pick\(\s*\[\s*"trustAesIv"\s*,\s*"TRUST_AES_IV"\s*\]\s*,\s*("(?:\\.|[^"\\])*")\s*\)`)
 )
 
 type sourceCipher struct {
-	key [32]byte
-	iv  [aes.BlockSize]byte
+	key         [32]byte
+	iv          [aes.BlockSize]byte
+	sourcesPath string
 }
 
 // MegaPlay publishes its source/segment URL cipher in newclient.min.js. Read
@@ -34,16 +37,32 @@ type sourceCipher struct {
 // plugin build. This parser deliberately refuses an unfamiliar script shape;
 // the optional browser fallback can still resolve the site's own player.
 func parseSourceCipher(script string) (*sourceCipher, error) {
-	values := encodeRE.FindAllStringSubmatch(script, -1)
-	if len(values) != 2 || !strings.Contains(script, `"AES-CBC"`) {
+	if !strings.Contains(script, `"AES-CBC"`) {
 		return nil, errors.New("unsupported MegaPlay cipher script")
 	}
+	var keyJSON, ivJSON string
+	path := "/stream/getSources"
+	if strings.Contains(script, `"stream/getSourcesNew"`) {
+		// The current player shares its source cipher with the trust adapter.
+		// Read the named defaults, not unrelated TextEncoder calls in the bundle.
+		keys, ivs := trustKeyRE.FindAllStringSubmatch(script, -1), trustIVRE.FindAllStringSubmatch(script, -1)
+		if len(keys) != 1 || len(ivs) != 1 {
+			return nil, errors.New("unsupported MegaPlay cipher script")
+		}
+		keyJSON, ivJSON, path = keys[0][1], ivs[0][1], "/stream/getSourcesNew"
+	} else {
+		values := encodeRE.FindAllStringSubmatch(script, -1)
+		if len(values) != 2 {
+			return nil, errors.New("unsupported MegaPlay cipher script")
+		}
+		keyJSON, ivJSON = values[0][1], values[1][1]
+	}
 	var key, iv string
-	if json.Unmarshal([]byte(values[0][1]), &key) != nil || json.Unmarshal([]byte(values[1][1]), &iv) != nil ||
+	if json.Unmarshal([]byte(keyJSON), &key) != nil || json.Unmarshal([]byte(ivJSON), &iv) != nil ||
 		len(key) == 0 || len(key) > 32 || len(iv) != aes.BlockSize {
 		return nil, errors.New("invalid MegaPlay cipher parameters")
 	}
-	c := &sourceCipher{}
+	c := &sourceCipher{sourcesPath: path}
 	copy(c.key[:], key)
 	copy(c.iv[:], iv)
 	return c, nil
@@ -97,6 +116,9 @@ func (c *Client) nativeStreams(ctx context.Context, episode Episode, translation
 	if id == nil || script == nil {
 		return nil, errors.New("unsupported MegaPlay player page")
 	}
+	if strings.Contains(string(page), "MegaPlayClientConfig") || strings.Contains(string(page), "MEGAPLAY_CLIENT_CONFIG") {
+		return nil, errors.New("unsupported MegaPlay cipher configuration override")
+	}
 	scriptURL, err := resourceURL(embed, html.UnescapeString(script[1]))
 	if err != nil {
 		return nil, err
@@ -109,7 +131,7 @@ func (c *Client) nativeStreams(ctx context.Context, episode Episode, translation
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := resourceURL(embed, "/stream/getSources?id="+id[1])
+	endpoint, err := resourceURL(embed, codec.sourcesPath+"?id="+id[1])
 	if err != nil {
 		return nil, err
 	}

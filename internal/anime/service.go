@@ -1186,18 +1186,10 @@ func (s *Service) resolveStream(ctx context.Context, episode Episode) (mpv.Strea
 					out.reason, err = "media_failed", mediaErr
 					return
 				}
-				var episodes []Episode
-				episodes, out.reason, err = s.providerEpisodes(attemptCtx, media, name)
+				out.episode, out.reason, err = s.providerEpisode(attemptCtx, media, name, episode.Number)
 				if err != nil || attemptCtx.Err() != nil {
 					return
 				}
-				found := episodeIndex(episodes, episode.Number)
-				if found < 0 {
-					out.reason = "episode_unavailable"
-					err = fmt.Errorf("episode is unavailable")
-					return
-				}
-				out.episode = episodes[found]
 			}
 			var streams []provider.Stream
 			streams, err = client.Streams(attemptCtx, provider.Episode{
@@ -1355,40 +1347,61 @@ func (s *Service) resolveProvider(ctx context.Context, media anilist.Media, name
 	return match, nil
 }
 
-func (s *Service) providerEpisodes(ctx context.Context, media anilist.Media, name string) ([]Episode, string, error) {
+func (s *Service) providerEpisode(ctx context.Context, media anilist.Media, name string, number int) (Episode, string, error) {
 	providerAnime, err := s.resolveProvider(ctx, media, name)
 	if err != nil {
-		return nil, "match_failed", err
+		return Episode{}, "match_failed", err
 	}
 	if ctx.Err() != nil {
-		return nil, "match_failed", ctx.Err()
+		return Episode{}, "match_failed", ctx.Err()
 	}
 	items, err := s.providers[name].Episodes(ctx, providerAnime, s.config.Translation)
 	if err != nil {
-		return nil, "episodes_failed", err
+		return Episode{}, "episodes_failed", err
 	}
 	if len(items) == 0 {
-		return nil, "episodes_failed", fmt.Errorf("provider returned no episodes")
+		return Episode{}, "episodes_failed", fmt.Errorf("provider returned no episodes")
 	}
-	result := make([]Episode, 0, len(items))
+	var selected provider.Episode
+	valid := false
 	for _, item := range items {
 		if item.Number <= 0 {
 			continue
 		}
-		providerID := providerAnime.ID
-		if item.ShowID != "" {
-			providerID = item.ShowID
+		valid = true
+		if item.Number == number {
+			selected = item
+			break
 		}
-		result = append(result, Episode{
-			MediaID: media.ID, Number: item.Number,
-			Title:    fmt.Sprintf("%s - Episode %d", media.Title, item.Number),
-			Provider: name, ProviderID: providerID, Value: item.Value,
-		})
 	}
-	if len(result) == 0 {
-		return nil, "episodes_failed", fmt.Errorf("provider returned no valid episodes")
+	if !valid {
+		return Episode{}, "episodes_failed", fmt.Errorf("provider returned no valid episodes")
 	}
-	return result, "", nil
+	if selected.Number == 0 {
+		lookup, ok := s.providers[name].(provider.EpisodeLookup)
+		if !ok {
+			return Episode{}, "episode_unavailable", fmt.Errorf("episode is unavailable")
+		}
+		selected, err = lookup.LookupEpisode(ctx, providerAnime, number, s.config.Translation)
+		if err != nil {
+			return Episode{}, "episode_unavailable", err
+		}
+		if selected.Number != number || selected.ShowID == "" || selected.Value == "" {
+			return Episode{}, "episodes_failed", fmt.Errorf("provider lookup returned an invalid episode")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return Episode{}, "episodes_failed", err
+	}
+	providerID := providerAnime.ID
+	if selected.ShowID != "" {
+		providerID = selected.ShowID
+	}
+	return Episode{
+		MediaID: media.ID, Number: selected.Number,
+		Title:    fmt.Sprintf("%s - Episode %d", media.Title, selected.Number),
+		Provider: name, ProviderID: providerID, Value: selected.Value,
+	}, "", nil
 }
 
 func (s *Service) resumePosition(ctx context.Context, episode Episode) float64 {

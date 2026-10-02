@@ -35,6 +35,15 @@ func encryptFixture(t *testing.T, codec *sourceCipher, value string) string {
 }
 
 func TestNativeStreamsQualityTranslationAndPlaybackLifetime(t *testing.T) {
+	for _, current := range []bool{false, true} {
+		t.Run(fmt.Sprintf("current=%t", current), func(t *testing.T) {
+			testNativeStreamsQualityTranslationAndPlaybackLifetime(t, current)
+		})
+	}
+}
+
+func testNativeStreamsQualityTranslationAndPlaybackLifetime(t *testing.T, current bool) {
+	t.Helper()
 	var codec sourceCipher
 	copy(codec.key[:], "fixture-key")
 	copy(codec.iv[:], "0123456789abcdef")
@@ -53,8 +62,18 @@ func TestNativeStreamsQualityTranslationAndPlaybackLifetime(t *testing.T) {
 			}
 			fmt.Fprintf(w, `<script src="/lib/newclient.min.js?v=rotating"></script><div class="player" id="megaplay-player" data-id="%s"></div>`, id)
 		case "/lib/newclient.min.js":
-			fmt.Fprint(w, `key=(new TextEncoder).encode("fixture-key"); mode="AES-CBC"; iv=(new TextEncoder).encode("0123456789abcdef")`)
-		case "/stream/getSources":
+			if current {
+				fmt.Fprint(w, `old="stream/getSources"; next="stream/getSourcesNew"; mode="AES-CBC";
+					key=String(e.pick(["trustAesKey","TRUST_AES_KEY"],"fixture-key"));
+					iv=String(e.pick(["trustAesIv","TRUST_AES_IV"],"0123456789abcdef"));
+					noise=new TextEncoder().encode(String(t));`)
+			} else {
+				fmt.Fprint(w, `key=(new TextEncoder).encode("fixture-key"); mode="AES-CBC"; iv=(new TextEncoder).encode("0123456789abcdef")`)
+			}
+		case "/stream/getSources", "/stream/getSourcesNew":
+			if (r.URL.Path == "/stream/getSourcesNew") != current {
+				t.Errorf("wrong source endpoint for current=%t: %s", current, r.URL.Path)
+			}
 			sources.Add(1)
 			id := r.URL.Query().Get("id")
 			if id != "101" && id != "102" || r.Header.Get("X-Requested-With") != "XMLHttpRequest" {
@@ -176,6 +195,65 @@ func TestSourceCipherRejectsDriftAndMalformedTokens(t *testing.T) {
 	plain, err := codec.decrypt(encryptFixture(t, codec, "https://cdn.test/rotated.m3u8"))
 	if err != nil || string(plain) != "https://cdn.test/rotated.m3u8" {
 		t.Fatalf("rotated cipher: %q, %v", plain, err)
+	}
+}
+
+func TestCurrentSourceCipherRotatesAndRejectsAmbiguousDefaults(t *testing.T) {
+	script := `rewrite="stream/getSourcesNew"; mode="AES-CBC";
+		key=e.pick(["trustAesKey", "TRUST_AES_KEY"], "rotated\\key");
+		iv=e.pick(["trustAesIv", "TRUST_AES_IV"], "0123456789abcdef");
+		new TextEncoder().encode("unrelated");`
+	codec, err := parseSourceCipher(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codec.sourcesPath != "/stream/getSourcesNew" {
+		t.Fatalf("source endpoint = %s", codec.sourcesPath)
+	}
+	var expected sourceCipher
+	copy(expected.key[:], `rotated\key`)
+	copy(expected.iv[:], "0123456789abcdef")
+	plain, err := codec.decrypt(encryptFixture(t, &expected, `{"file":"https://cdn.test/rotated.m3u8"}`))
+	if err != nil || string(plain) != `{"file":"https://cdn.test/rotated.m3u8"}` {
+		t.Fatalf("rotated named cipher: %q, %v", plain, err)
+	}
+	for _, invalid := range []string{
+		strings.ReplaceAll(script, "AES-CBC", "AES-GCM"),
+		strings.ReplaceAll(script, "trustAesKey", "unrecognizedKey"),
+		strings.ReplaceAll(script, "trustAesIv", "unrecognizedIV"),
+		strings.ReplaceAll(script, "0123456789abcdef", "short"),
+		strings.ReplaceAll(script, `rotated\\key`, strings.Repeat("a", 33)),
+		script + `other=e.pick(["trustAesKey","TRUST_AES_KEY"],"ambiguous");`,
+		script + `other=e.pick(["trustAesIv","TRUST_AES_IV"],"fedcba9876543210");`,
+	} {
+		if _, err := parseSourceCipher(invalid); err == nil {
+			t.Fatalf("accepted unsupported named cipher: %s", invalid)
+		}
+	}
+}
+
+func TestNativeSourceCipherRefusesPageOverrides(t *testing.T) {
+	for _, name := range []string{"MegaPlayClientConfig", "MEGAPLAY_CLIENT_CONFIG"} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/play/61316/19/sub":
+					io.WriteString(w, `<iframe src="/embed"></iframe>`)
+				case "/embed":
+					fmt.Fprintf(w, `<script>window.%s={trustAesKey:"override"};</script><script src="/lib/newclient.min.js"></script><div id="megaplay-player" data-id="179970"></div>`, name)
+				default:
+					t.Errorf("unexpected request after cipher override: %s", r.URL)
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			c := NewClientWithBaseURL(server.Client(), server.URL)
+			defer c.Close()
+			_, err := c.Streams(t.Context(), Episode{ShowID: "61316", Number: 19}, "sub", "best")
+			if err == nil || !strings.Contains(err.Error(), "configuration override") {
+				t.Fatalf("ignored page cipher override: %v", err)
+			}
+		})
 	}
 }
 

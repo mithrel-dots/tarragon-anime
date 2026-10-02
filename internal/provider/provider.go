@@ -30,3 +30,11 @@ type Client interface {
 	Episodes(context.Context, Anime, string) ([]Episode, error)
 	Streams(context.Context, Episode, string, string) ([]Stream, error)
 }
+
+// EpisodeLookup is an optional capability for providers with explicit episode
+// routes that can outlive a stale catalogue. LookupEpisode must preserve the
+// matched show's identity and requested number; Streams still validates that
+// the addressed episode has playable media. Opaque IDs must not be guessed.
+type EpisodeLookup interface {
+	LookupEpisode(context.Context, Anime, int, string) (Episode, error)
+}

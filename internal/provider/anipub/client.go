@@ -65,6 +65,7 @@ type Client struct {
 }
 
 var _ provider.Client = (*Client)(nil)
+var _ provider.EpisodeLookup = (*Client)(nil)
 
 // NewClient returns a client using the public AniPub endpoints.
 func NewClient(httpClient *http.Client) *Client {
@@ -120,8 +121,9 @@ type detailsResponse struct {
 }
 
 type episodeEntry struct {
-	episodes []Episode
-	expires  time.Time
+	episodes     []Episode
+	expires      time.Time
+	directShowID string // Only set when every raw link confirms the same /play show.
 }
 
 // Match finds the show on AniPub. Only an exact title match is accepted: the
@@ -248,6 +250,7 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, _ string) ([]Episode
 	seen := map[int]bool{}
 	seenVideos := map[string]bool{}
 	episodes := make([]Episode, 0, len(links))
+	directShowID, _, direct := parsePlayLink(details.Local.Link)
 	for index, link := range links {
 		// Older catalogue entries use opaque video IDs, with episode one
 		// stored separately and the remaining episodes in playback order.
@@ -262,6 +265,9 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, _ string) ([]Episode
 			continue
 		}
 		show, number, ok := parsePlayLink(link)
+		if !ok || show != directShowID {
+			direct = false
+		}
 		if !ok || seen[number] {
 			continue
 		}
@@ -286,8 +292,46 @@ func (c *Client) Episodes(ctx context.Context, anime Anime, _ string) ([]Episode
 			delete(c.episodeCache, id)
 		}
 	}
-	c.episodeCache[anime.ID] = episodeEntry{append([]Episode(nil), episodes...), time.Now().Add(time.Minute)}
+	if !direct {
+		directShowID = ""
+	}
+	c.episodeCache[anime.ID] = episodeEntry{
+		episodes: append([]Episode(nil), episodes...), expires: time.Now().Add(time.Minute),
+		directShowID: directShowID,
+	}
 	return episodes, nil
+}
+
+// LookupEpisode recovers an explicit /play route when AniPub's catalogue lags
+// behind its player. Use only a consistent show ID from the matched catalogue;
+// legacy /video IDs and conflicting show IDs cannot be extrapolated. The
+// requested route is not added to the catalogue, and Streams must validate it.
+func (c *Client) LookupEpisode(ctx context.Context, anime Anime, number int, translation string) (Episode, error) {
+	if err := ctx.Err(); err != nil {
+		return Episode{}, err
+	}
+	if number <= 0 {
+		return Episode{}, errors.New("AniPub episode lookup requires a positive episode number")
+	}
+	episodes, err := c.Episodes(ctx, anime, translation)
+	if err != nil {
+		return Episode{}, err
+	}
+	for _, episode := range episodes {
+		if episode.Number == number {
+			return episode, nil
+		}
+	}
+	c.cacheMu.Lock()
+	showID := c.episodeCache[anime.ID].directShowID
+	c.cacheMu.Unlock()
+	if id, err := strconv.Atoi(showID); err != nil || id <= 0 {
+		return Episode{}, errors.New("AniPub catalogue has no explicit episode route")
+	}
+	if err := ctx.Err(); err != nil {
+		return Episode{}, err
+	}
+	return Episode{ShowID: showID, Number: number, Value: strconv.Itoa(number)}, nil
 }
 
 // parsePlayLink reads the play route's show id and episode number. The stored

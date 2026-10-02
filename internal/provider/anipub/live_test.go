@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,4 +123,36 @@ func TestLiveNativeStreams(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestLiveReZeroSeason4Finale(t *testing.T) {
+	client := NewClient(&http.Client{Timeout: 20 * time.Second})
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	show, err := client.Match(ctx, 189046, []string{"Re:ZERO -Starting Life in Another World- Season 4"}, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	episode, err := client.LookupEpisode(ctx, show, 19, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if episode.ShowID != "61316" || episode.Number != 19 || episode.Value != "19" {
+		t.Fatalf("incorrect finale route: %+v", episode)
+	}
+	start := time.Now()
+	streams, err := client.Streams(ctx, episode, "sub", "best")
+	if err != nil || len(streams) == 0 {
+		t.Fatalf("streams=%d error=%v", len(streams), err)
+	}
+	if streams[0].Source != "native" || streams[0].Subtitle == "" {
+		t.Fatal("expected native resolution with full English subtitles")
+	}
+	subtitle, _, err := client.resource(ctx, streams[0].Subtitle, streams[0].Headers)
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(subtitle)), "WEBVTT") || !strings.Contains(string(subtitle), "-->") {
+		t.Fatalf("English subtitle track is not readable WebVTT: %v", err)
+	}
+	t.Logf("resolved via %s in %s", streams[0].Source, time.Since(start).Round(time.Millisecond))
+	providertest.CheckMedia(t, ctx, streams[0])
 }

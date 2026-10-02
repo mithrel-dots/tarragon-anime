@@ -2,10 +2,12 @@ package anipub
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -213,6 +215,88 @@ func TestLegacyVideoEpisodesPreserveOpaqueIDs(t *testing.T) {
 	want := []Episode{{ShowID: "2454", Number: 1, Value: "video:107257"}, {ShowID: "2454", Number: 2, Value: "video:107259"}, {ShowID: "2454", Number: 3, Value: "video:107260"}}
 	if err != nil || !reflect.DeepEqual(episodes, want) {
 		t.Fatalf("legacy episodes=%+v error=%v", episodes, err)
+	}
+}
+
+func TestLookupEpisodeRecoversStaleCatalogueWithoutRenumbering(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/api/details/8327" {
+			t.Errorf("unexpected request: %s", r.URL)
+			http.NotFound(w, r)
+			return
+		}
+		calls.Add(1)
+		io.WriteString(w, `{"local":{"link":"src=/play/61316/1/sub","ep":[
+			{"link":"src=/play/61316/2/sub"},
+			{"link":"src=/play/61316/2/sub"},
+			{"link":"src=/play/61316/9/sub"}
+		]}}`)
+	}))
+	defer server.Close()
+	c := NewClientWithBaseURL(server.Client(), server.URL)
+	defer c.Close()
+	show := Anime{ID: "8327", AniListID: 189046}
+	for _, number := range []int{2, 3, 19} {
+		for _, mode := range []string{"sub", "dub"} {
+			episode, err := c.LookupEpisode(t.Context(), show, number, mode)
+			if err != nil || episode.ShowID != "61316" || episode.Number != number || episode.Value != strconv.Itoa(number) {
+				t.Fatalf("lookup %d/%s = %+v, %v", number, mode, episode, err)
+			}
+		}
+	}
+	episodes, err := c.Episodes(t.Context(), show, "sub")
+	want := []Episode{{ShowID: "61316", Number: 1, Value: "1"}, {ShowID: "61316", Number: 2, Value: "2"}, {ShowID: "61316", Number: 9, Value: "9"}}
+	if err != nil || !reflect.DeepEqual(episodes, want) || calls.Load() != 1 {
+		t.Fatalf("lookup mutated or refetched catalogue: %+v, %v, calls=%d", episodes, err, calls.Load())
+	}
+}
+
+func TestLookupEpisodeDoesNotGuessOpaqueOrConflictingRoutes(t *testing.T) {
+	for _, test := range []struct{ name, body string }{
+		{"opaque video IDs", `{"local":{"name":"Episode 1","link":"src=/video/107257/sub","ep":[{"link":"src=/video/107259/sub"}]}}`},
+		{"conflicting shows", `{"local":{"link":"src=/play/61316/1/sub","ep":[{"link":"src=/play/123/2/sub"}]}}`},
+		{"conflict hidden by duplicate number", `{"local":{"link":"src=/play/61316/1/sub","ep":[{"link":"src=/play/123/1/sub"}]}}`},
+		{"missing first link", `{"local":{"ep":[{"link":"src=/play/61316/2/sub"}]}}`},
+		{"malformed link", `{"local":{"link":"src=/play/61316/1/sub","ep":[{"link":"unrecognized"}]}}`},
+		{"mixed route types", `{"local":{"link":"src=/play/61316/1/sub","ep":[{"link":"src=/video/107259/sub"}]}}`},
+		{"zero show ID", `{"local":{"link":"src=/play/0/1/sub"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			c := NewClientWithBaseURL(server.Client(), server.URL)
+			defer c.Close()
+			if episode, err := c.LookupEpisode(t.Context(), Anime{ID: "8327"}, 19, "sub"); err == nil {
+				t.Fatalf("guessed missing route: %+v", episode)
+			}
+		})
+	}
+}
+
+func TestLookupEpisodeValidationAndUnavailableMedia(t *testing.T) {
+	server := catalogueServer(t)
+	c := NewClientWithBaseURL(server.Client(), server.URL)
+	defer c.Close()
+	show := Anime{ID: "8347"}
+	for _, number := range []int{0, -1} {
+		if _, err := c.LookupEpisode(t.Context(), show, number, "sub"); err == nil {
+			t.Fatalf("accepted invalid episode %d", number)
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := c.LookupEpisode(ctx, show, 19, "sub"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled lookup: %v", err)
+	}
+	episode, err := c.LookupEpisode(t.Context(), show, 19, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streams, err := c.Streams(t.Context(), episode, "sub", "best"); err == nil || len(streams) != 0 {
+		t.Fatalf("missing episode bypassed media validation: %v, %v", streams, err)
 	}
 }
 
