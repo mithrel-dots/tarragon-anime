@@ -66,6 +66,13 @@ episode missing from a consistent `/play` catalogue, the plugin tries that
 show's explicit episode route and validates the actual player and media before
 selecting it. It never renumbers repeated links or guesses opaque `/video` IDs.
 
+**2026-10-05 update:** Black Clover season 2 episode 1 (AniList `195604`) was
+verified through AniPub without Chromium: 1,430 seconds of audio/video, English
+subtitles, and a decoded frame through mpv. When title matching fails, AniPub
+can now use AniList's MyAnimeList ID for a confirmed aired episode. The player
+must retain that exact ID, episode and translation, and its media is validated
+before playback. This fallback does not save a MAL ID as a catalogue mapping.
+
 ## Checks
 
 ```sh
@@ -104,4 +111,7 @@ ANIME_LIVE_MEDIA=1 go test -tags=live -count=1 -v \
 episode 18 to episode 1, which AniPub advertises for browser-free testing.
 `ANIME_LIVE_MEDIA_ID=189046 ANIME_LIVE_EPISODE=19` checks the Re:ZERO finale
 through the configured provider race instead.
+`ANIME_LIVE_MEDIA_ID=195604 ANIME_LIVE_EPISODE=1` checks the Black Clover premiere;
+the browser-free provider check is `TestLiveBlackCloverSeason2Premiere` in
+`./internal/provider/anipub` (with `-tags=live` and `ANIME_LIVE_MEDIA=1`).
 See `internal/provider/animeflix/README.md` for MyStream-specific constraints.

@@ -93,21 +93,26 @@ func (c *sourceCipher) decrypt(token string) ([]byte, error) {
 	return body[:len(body)-padding], nil
 }
 
-func (c *Client) nativeStreams(ctx context.Context, episode Episode, translation, quality string) ([]Stream, error) {
+func (c *Client) playerEmbed(ctx context.Context, episode Episode, translation string) (embed, referer string, err error) {
 	watch := watchURL(c.base, episode.ShowID, episode.Value, translation)
 	page, pageURL, err := c.resource(ctx, watch, map[string]string{"Referer": c.base + "/"})
 	if err != nil {
-		return nil, fmt.Errorf("load AniPub player: %w", err)
+		return "", "", fmt.Errorf("load AniPub player: %w", err)
 	}
 	match := embedRE.FindStringSubmatch(string(page))
 	if match == nil {
-		return nil, errors.New("AniPub player iframe not found")
+		return "", "", errors.New("AniPub player iframe not found")
 	}
-	embed, err := resourceURL(pageURL, html.UnescapeString(match[1]))
+	embed, err = resourceURL(pageURL, html.UnescapeString(match[1]))
+	return embed, pageURL, err
+}
+
+func (c *Client) nativeStreams(ctx context.Context, episode Episode, translation, quality string) ([]Stream, error) {
+	embed, referer, err := c.playerEmbed(ctx, episode, translation)
 	if err != nil {
 		return nil, err
 	}
-	page, embed, err = c.resource(ctx, embed, map[string]string{"Referer": pageURL})
+	page, embed, err := c.resource(ctx, embed, map[string]string{"Referer": referer})
 	if err != nil {
 		return nil, fmt.Errorf("load MegaPlay embed: %w", err)
 	}

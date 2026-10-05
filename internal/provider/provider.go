@@ -38,3 +38,11 @@ type Client interface {
 type EpisodeLookup interface {
 	LookupEpisode(context.Context, Anime, int, string) (Episode, error)
 }
+
+// MALEpisodeLookup is an optional fallback when a title is absent from a
+// provider's catalogue but its player accepts MyAnimeList IDs. The ID must come
+// from AniList metadata, and the provider must confirm that the player route
+// retains that ID, episode and translation. Streams still validates the media.
+type MALEpisodeLookup interface {
+	LookupMALEpisode(context.Context, int, int, string) (Episode, error)
+}

@@ -66,6 +66,7 @@ type Client struct {
 
 var _ provider.Client = (*Client)(nil)
 var _ provider.EpisodeLookup = (*Client)(nil)
+var _ provider.MALEpisodeLookup = (*Client)(nil)
 
 // NewClient returns a client using the public AniPub endpoints.
 func NewClient(httpClient *http.Client) *Client {
@@ -332,6 +333,28 @@ func (c *Client) LookupEpisode(ctx context.Context, anime Anime, number int, tra
 		return Episode{}, err
 	}
 	return Episode{ShowID: showID, Number: number, Value: strconv.Itoa(number)}, nil
+}
+
+// LookupMALEpisode addresses the player's explicit MAL route independently of
+// the title catalogue, which can lag behind newly released seasons. A catalogue
+// ID is not a MAL ID; this route must never be saved as a title mapping.
+func (c *Client) LookupMALEpisode(ctx context.Context, malID, number int, translation string) (Episode, error) {
+	if err := ctx.Err(); err != nil {
+		return Episode{}, err
+	}
+	if malID <= 0 || number <= 0 || (translation != "sub" && translation != "dub") {
+		return Episode{}, errors.New("AniPub MAL lookup requires positive IDs and a supported translation")
+	}
+	episode := Episode{ShowID: strconv.Itoa(malID), Number: number, Value: strconv.Itoa(number)}
+	embed, _, err := c.playerEmbed(ctx, episode, translation)
+	if err != nil {
+		return Episode{}, err
+	}
+	u, err := url.Parse(embed)
+	if err != nil || u.Path != fmt.Sprintf("/stream/mal/%d/%d/%s", malID, number, translation) {
+		return Episode{}, errors.New("AniPub player does not confirm the requested MAL episode")
+	}
+	return episode, nil
 }
 
 // parsePlayLink reads the play route's show id and episode number. The stored

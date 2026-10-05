@@ -156,3 +156,28 @@ func TestLiveReZeroSeason4Finale(t *testing.T) {
 	t.Logf("resolved via %s in %s", streams[0].Source, time.Since(start).Round(time.Millisecond))
 	providertest.CheckMedia(t, ctx, streams[0])
 }
+
+func TestLiveBlackCloverSeason2Premiere(t *testing.T) {
+	client := NewClient(&http.Client{Timeout: 20 * time.Second})
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+	defer cancel()
+	// AniList 195604 identifies this release as MAL 61967. AniPub's search
+	// catalogue currently only lists the original series and its specials.
+	episode, err := client.LookupMALEpisode(ctx, 61967, 1, "sub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, err := client.Streams(ctx, episode, "sub", "best")
+	if err != nil || len(streams) == 0 {
+		t.Fatalf("streams=%d error=%v", len(streams), err)
+	}
+	if streams[0].Source != "native" || streams[0].Subtitle == "" {
+		t.Fatal("expected native resolution with full English subtitles")
+	}
+	subtitle, _, err := client.resource(ctx, streams[0].Subtitle, streams[0].Headers)
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(subtitle)), "WEBVTT") || !strings.Contains(string(subtitle), "-->") {
+		t.Fatalf("English subtitle track is not readable WebVTT: %v", err)
+	}
+	providertest.CheckMedia(t, ctx, streams[0])
+}

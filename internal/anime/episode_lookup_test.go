@@ -138,3 +138,101 @@ func TestProviderRaceCancelsMissingEpisodeLookup(t *testing.T) {
 		t.Fatalf("cancelled lookup was used: %+v, streams=%d", result, streams.Load())
 	}
 }
+
+type malLookupTestProvider struct {
+	raceTestProvider
+	lookup func(context.Context, int, int, string) (provider.Episode, error)
+}
+
+func (p malLookupTestProvider) LookupMALEpisode(ctx context.Context, malID, number int, translation string) (provider.Episode, error) {
+	return p.lookup(ctx, malID, number, translation)
+}
+
+func TestProviderRaceUsesMALOnlyForAiredCatalogueMisses(t *testing.T) {
+	for _, test := range []struct {
+		name, reason      string
+		mal, aired        int
+		matched, playable bool
+		lookupEpisode     provider.Episode
+		lookupErr         error
+	}{
+		{name: "new season missing from catalogue", mal: 61967, aired: 1, playable: true},
+		{name: "existing catalogue match", mal: 61967, aired: 1, matched: true, playable: true},
+		{name: "missing MAL ID", aired: 1, reason: "match_failed"},
+		{name: "unaired season", mal: 61967, aired: 0, reason: "match_failed"},
+		{name: "unknown airing count", mal: 61967, aired: -1, reason: "match_failed"},
+		{name: "unavailable player", mal: 61967, aired: 1, lookupErr: errors.New("not available"), reason: "episode_unavailable"},
+		{name: "wrong episode", mal: 61967, aired: 1, lookupEpisode: provider.Episode{ShowID: "61967", Number: 2, Value: "2"}, reason: "episode_unavailable"},
+		{name: "missing show", mal: 61967, aired: 1, lookupEpisode: provider.Episode{Number: 1, Value: "1"}, reason: "episode_unavailable"},
+		{name: "missing value", mal: 61967, aired: 1, lookupEpisode: provider.Episode{ShowID: "61967", Number: 1}, reason: "episode_unavailable"},
+		{name: "unplayable stream", mal: 61967, aired: 1, reason: "streams_failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var lookups, streams atomic.Int32
+			selected := provider.Episode{ShowID: "61967", Number: 1, Value: "1"}
+			client := malLookupTestProvider{raceTestProvider: raceTestProvider{
+				match: func(context.Context, int, []string, string) (provider.Anime, error) {
+					if test.matched {
+						return provider.Anime{ID: "catalogue-id"}, nil
+					}
+					return provider.Anime{}, errors.New("no title match")
+				},
+				episodes: func(context.Context, provider.Anime, string) ([]provider.Episode, error) {
+					if !test.matched {
+						t.Error("MAL route was used as a catalogue ID")
+					}
+					return []provider.Episode{selected}, nil
+				},
+				streams: func(_ context.Context, episode provider.Episode, translation, quality string) ([]provider.Stream, error) {
+					streams.Add(1)
+					if episode != selected || translation != "sub" || quality != "best" {
+						t.Errorf("stream arguments: %+v/%s/%s", episode, translation, quality)
+					}
+					if !test.playable {
+						return nil, errors.New("no playable media")
+					}
+					return []provider.Stream{{URL: "https://video.test/premiere.m3u8"}}, nil
+				},
+			}, lookup: func(_ context.Context, malID, number int, translation string) (provider.Episode, error) {
+				lookups.Add(1)
+				if malID != 61967 || number != 1 || translation != "sub" {
+					t.Errorf("MAL lookup arguments: %d/%d/%s", malID, number, translation)
+				}
+				if test.lookupEpisode != (provider.Episode{}) {
+					return test.lookupEpisode, test.lookupErr
+				}
+				return selected, test.lookupErr
+			}}
+			config := DefaultConfig()
+			config.Providers = []string{"anipub"}
+			metadata := &cachingAniList{media: &anilist.Media{ID: 195604, IDMal: test.mal, Title: "Black Clover Season 2", AiredEpisodes: test.aired}}
+			state := newMemoryState()
+			service := NewServiceWithProviders(metadata, map[string]provider.Client{"anipub": client}, nil, state, nil, nil, config, nil)
+			t.Cleanup(service.Close)
+			stream, episode, err := service.resolveStream(t.Context(), Episode{MediaID: 195604, Number: 1})
+			service.Close()
+			if test.reason != "" {
+				if err == nil || !strings.Contains(err.Error(), "anipub: "+test.reason) || stream.URL != "" {
+					t.Fatalf("failure = %+v, %v", stream, err)
+				}
+			} else if err != nil || stream.URL == "" || episode.MediaID != 195604 || episode.Number != 1 || episode.ProviderID != "61967" {
+				t.Fatalf("resolution = %+v, %+v, %v", stream, episode, err)
+			}
+			wantLookups := int32(1)
+			if test.matched || test.mal <= 0 || test.aired < 1 {
+				wantLookups = 0
+			}
+			wantStreams := int32(0)
+			if test.playable || test.reason == "streams_failed" {
+				wantStreams = 1
+			}
+			if lookups.Load() != wantLookups || streams.Load() != wantStreams {
+				t.Fatalf("calls: lookups=%d streams=%d", lookups.Load(), streams.Load())
+			}
+			mapping, found, err := state.ProviderMapping(t.Context(), 195604, "anipub")
+			if err != nil || found != test.matched || (found && mapping != "catalogue-id") {
+				t.Fatalf("MAL fallback corrupted title mapping: %q, %t, %v", mapping, found, err)
+			}
+		})
+	}
+}

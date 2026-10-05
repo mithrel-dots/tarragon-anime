@@ -1350,6 +1350,29 @@ func (s *Service) resolveProvider(ctx context.Context, media anilist.Media, name
 func (s *Service) providerEpisode(ctx context.Context, media anilist.Media, name string, number int) (Episode, string, error) {
 	providerAnime, err := s.resolveProvider(ctx, media, name)
 	if err != nil {
+		// A new season may already have an ID-addressed player before its
+		// title reaches the catalogue. Only attempt confirmed aired episodes,
+		// using AniList's MAL ID rather than guessing a title or season offset.
+		lookup, ok := s.providers[name].(provider.MALEpisodeLookup)
+		if ctx.Err() == nil && ok && media.IDMal > 0 && number > 0 && number <= media.AiredEpisodes {
+			finish := streamlog.Start(ctx, "mal", "episode_lookup")
+			selected, lookupErr := lookup.LookupMALEpisode(ctx, media.IDMal, number, s.config.Translation)
+			if ctx.Err() != nil {
+				lookupErr = ctx.Err()
+			}
+			if lookupErr == nil && (selected.Number != number || selected.ShowID == "" || selected.Value == "") {
+				lookupErr = fmt.Errorf("provider MAL lookup returned an invalid episode")
+			}
+			finish(streamlog.Outcome(ctx, lookupErr))
+			if lookupErr != nil {
+				return Episode{}, "episode_unavailable", lookupErr
+			}
+			return Episode{
+				MediaID: media.ID, Number: number,
+				Title:    fmt.Sprintf("%s - Episode %d", media.Title, number),
+				Provider: name, ProviderID: selected.ShowID, Value: selected.Value,
+			}, "", nil
+		}
 		return Episode{}, "match_failed", err
 	}
 	if ctx.Err() != nil {
