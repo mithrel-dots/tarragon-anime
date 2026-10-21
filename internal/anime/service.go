@@ -1354,7 +1354,12 @@ func (s *Service) providerEpisode(ctx context.Context, media anilist.Media, name
 		// title reaches the catalogue. Only attempt confirmed aired episodes,
 		// using AniList's MAL ID rather than guessing a title or season offset.
 		lookup, ok := s.providers[name].(provider.MALEpisodeLookup)
-		if ctx.Err() == nil && ok && media.IDMal > 0 && number > 0 && number <= media.AiredEpisodes {
+		// The MAL player route is itself the authority on whether this episode
+		// exists. AniList's aired-episode count can be stale or unavailable (in
+		// particular for newly split seasons), so do not let that metadata block
+		// an exact-ID lookup; the provider confirms the route and Streams validates
+		// that it contains playable media before returning it.
+		if ctx.Err() == nil && ok && media.IDMal > 0 && number > 0 {
 			finish := streamlog.Start(ctx, "mal", "episode_lookup")
 			selected, lookupErr := lookup.LookupMALEpisode(ctx, media.IDMal, number, s.config.Translation)
 			if ctx.Err() != nil {

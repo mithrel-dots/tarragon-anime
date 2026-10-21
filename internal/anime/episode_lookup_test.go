@@ -159,8 +159,8 @@ func TestProviderRaceUsesMALOnlyForAiredCatalogueMisses(t *testing.T) {
 		{name: "new season missing from catalogue", mal: 61967, aired: 1, playable: true},
 		{name: "existing catalogue match", mal: 61967, aired: 1, matched: true, playable: true},
 		{name: "missing MAL ID", aired: 1, reason: "match_failed"},
-		{name: "unaired season", mal: 61967, aired: 0, reason: "match_failed"},
-		{name: "unknown airing count", mal: 61967, aired: -1, reason: "match_failed"},
+		{name: "stale unaired count", mal: 61967, aired: 0, playable: true},
+		{name: "unknown airing count", mal: 61967, aired: -1, playable: true},
 		{name: "unavailable player", mal: 61967, aired: 1, lookupErr: errors.New("not available"), reason: "episode_unavailable"},
 		{name: "wrong episode", mal: 61967, aired: 1, lookupEpisode: provider.Episode{ShowID: "61967", Number: 2, Value: "2"}, reason: "episode_unavailable"},
 		{name: "missing show", mal: 61967, aired: 1, lookupEpisode: provider.Episode{Number: 1, Value: "1"}, reason: "episode_unavailable"},
@@ -219,7 +219,7 @@ func TestProviderRaceUsesMALOnlyForAiredCatalogueMisses(t *testing.T) {
 				t.Fatalf("resolution = %+v, %+v, %v", stream, episode, err)
 			}
 			wantLookups := int32(1)
-			if test.matched || test.mal <= 0 || test.aired < 1 {
+			if test.matched || test.mal <= 0 {
 				wantLookups = 0
 			}
 			wantStreams := int32(0)
