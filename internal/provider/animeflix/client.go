@@ -25,7 +25,7 @@ const (
 	maxBody       = 4 << 20
 )
 
-var myStreamHost = regexp.MustCompile(`^as-cdn[0-9]+\.top$`)
+var myStreamHost = regexp.MustCompile(`^(?:as-cdn[0-9]+\.top|ravok\.buzz)$`)
 
 type Client struct {
 	http   *http.Client

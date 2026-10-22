@@ -59,7 +59,7 @@ func (t *rerouteTransport) records() []requestRecord {
 func TestStreamsResolvesRealMyStreamURLsWithScopedCookiesAndFallback(t *testing.T) {
 	const (
 		first  = "https://as-cdn1.top/video/0123456789abcdef0123456789abcdef?token=first-secret"
-		second = "https://as-cdn2.top/video/fedcba9876543210fedcba9876543210?token=second-secret"
+		second = "https://ravok.buzz/video/fedcba9876543210fedcba9876543210?token=second-secret"
 	)
 	var gotMu sync.Mutex
 	var requests []requestRecord
@@ -108,7 +108,7 @@ func TestStreamsResolvesRealMyStreamURLsWithScopedCookiesAndFallback(t *testing.
 	transport := &rerouteTransport{base: base}
 	httpClient := &http.Client{Transport: transport, Timeout: time.Second}
 	jar, _ := cookiejar.New(nil)
-	for _, host := range []string{"https://as-cdn1.top/", "https://as-cdn2.top/"} {
+	for _, host := range []string{"https://as-cdn1.top/", "https://ravok.buzz/"} {
 		u, _ := url.Parse(host)
 		jar.SetCookies(u, []*http.Cookie{{Name: "caller", Value: "must-not-leak"}})
 	}
@@ -200,7 +200,7 @@ func TestStreamsResolvesRealMyStreamURLsWithScopedCookiesAndFallback(t *testing.
 			}
 		}
 	}
-	for _, host := range []string{"https://as-cdn1.top/", "https://as-cdn2.top/"} {
+	for _, host := range []string{"https://as-cdn1.top/", "https://ravok.buzz/"} {
 		u, _ := url.Parse(host)
 		if cookies := httpClient.Jar.Cookies(u); len(cookies) != 1 || cookies[0].Name != "caller" {
 			t.Fatalf("caller jar changed for %s: %#v", host, cookies)

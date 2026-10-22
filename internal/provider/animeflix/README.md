@@ -4,6 +4,10 @@ The `animeflix` provider uses the AnimeSalt catalogue API and resolves its
 MyStream sources over HTTP. It is opt-in through the existing `providers` list;
 registration does not change the configured fallback order or enable it by default.
 
+The supported MyStream hosts are `as-cdn<number>.top` and `ravok.buzz` (the
+current player host as of 2026-10-22). Naruto Shippuden episode 1 and Slime
+season 4 episode 5 were verified with headless mpv in both sub and dub modes.
+
 - Matching is exact after case/punctuation normalization, with paginated search.
 - Episode IDs are preserved. Catalogues that reset numbering across seasons are
   rejected unless an individually verified AniList-to-provider season mapping

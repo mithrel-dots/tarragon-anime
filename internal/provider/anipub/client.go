@@ -33,7 +33,7 @@ type (
 )
 
 const (
-	defaultBaseURL = "https://anipub.xyz"
+	defaultBaseURL = "https://anipub.org"
 	// userAgent is sent on the metadata calls so they look like the site's own
 	// fetches. Playback headers are taken from the browser session instead.
 	userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"

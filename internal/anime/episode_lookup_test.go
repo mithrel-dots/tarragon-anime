@@ -148,7 +148,7 @@ func (p malLookupTestProvider) LookupMALEpisode(ctx context.Context, malID, numb
 	return p.lookup(ctx, malID, number, translation)
 }
 
-func TestProviderRaceUsesMALOnlyForAiredCatalogueMisses(t *testing.T) {
+func TestProviderRaceUsesMALForCatalogueMisses(t *testing.T) {
 	for _, test := range []struct {
 		name, reason      string
 		mal, aired        int

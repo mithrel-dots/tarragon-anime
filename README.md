@@ -69,9 +69,24 @@ selecting it. It never renumbers repeated links or guesses opaque `/video` IDs.
 **2026-10-05 update:** Black Clover season 2 episode 1 (AniList `195604`) was
 verified through AniPub without Chromium: 1,430 seconds of audio/video, English
 subtitles, and a decoded frame through mpv. When title matching fails, AniPub
-can now use AniList's MyAnimeList ID for a confirmed aired episode. The player
+can now use AniList's MyAnimeList ID for the requested episode, even when the
+airing count is stale or unknown. The player
 must retain that exact ID, episode and translation, and its media is validated
 before playback. This fallback does not save a MAL ID as a catalogue mapping.
+
+**2026-10-22 update:** AniPub moved to `anipub.org`; the old `.xyz` catalogue
+and player routes return 404. The provider now uses the new domain. Native
+sub/dub playback was verified for Slime season 4, Frieren, and Cowboy Bebop,
+plus the Black Clover season 2 premiere (sub), with full-episode audio/video
+probes and decoded mpv frames. Frieren sub needed a retry after one timeout.
+AnimeFlix's MyStream player moved to `ravok.buzz`; this host is now supported,
+and Naruto Shippuden episode 1 and Slime season 4 episode 5 decoded with
+Japanese audio/English subtitles and with English audio.
+AniNeko still returns a database connection error;
+AnimePahe still fails its Cloudflare challenge from this network.
+AllAnime's Frieren (after retry) and Steins;Gate streams passed full-episode
+audio/video probes; Cowboy Bebop still returned no matching media after all
+source fallbacks. These failures remain visible in the opt-in live tests.
 
 ## Checks
 

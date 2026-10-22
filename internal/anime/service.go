@@ -1351,8 +1351,8 @@ func (s *Service) providerEpisode(ctx context.Context, media anilist.Media, name
 	providerAnime, err := s.resolveProvider(ctx, media, name)
 	if err != nil {
 		// A new season may already have an ID-addressed player before its
-		// title reaches the catalogue. Only attempt confirmed aired episodes,
-		// using AniList's MAL ID rather than guessing a title or season offset.
+		// title reaches the catalogue. Use AniList's MAL ID rather than guessing
+		// a title or season offset.
 		lookup, ok := s.providers[name].(provider.MALEpisodeLookup)
 		// The MAL player route is itself the authority on whether this episode
 		// exists. AniList's aired-episode count can be stale or unavailable (in
