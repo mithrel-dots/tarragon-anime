@@ -90,6 +90,27 @@ source fallbacks. These failures remain visible in the opt-in live tests.
 
 ## Checks
 
+Smoke-test all five providers and print a Markdown results table:
+
+```sh
+just smoke-providers
+just smoke-providers -output results.md
+```
+
+Run from the repository root with `just`, Go, `mpv`, `ffprobe`, and Chromium installed.
+The command exercises live matching, episode listing, stream resolution, and
+media verification using representative titles, including sub/dub checks for
+the HTTP providers. AllAnime checks full-episode audio/video with `ffprobe`;
+the other providers also decode a frame with headless mpv. AllAnime may open a
+browser clearance window. No watch progress is written.
+
+The report includes pass/fail/skip counts, elapsed time, and failure details;
+signed URLs are omitted. Skipped or missing checks never count as a healthy
+provider. Exit status is nonzero for failed or incomplete runs, making this
+suitable for manual checks or CI. Upstream outages are reported as failures.
+Allow several minutes; `just smoke-providers -timeout 5m` adjusts the per-provider
+timeout (default 15 minutes). The optional output file is overwritten.
+
 ```sh
 make check
 make test-race
